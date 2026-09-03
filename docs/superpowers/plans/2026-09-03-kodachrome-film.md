@@ -1818,6 +1818,18 @@ class Artifacts:
                 f"(this build reads up to {PARAMS_VERSION})"
             )
 
+        # Structural checks before file I/O, so a malformed section is reported as
+        # such instead of being pre-empted by a missing-LUT error.
+        try:
+            normalize = NormalizeParams.from_dict(
+                _require_object(raw.get("normalize", {}), "normalize", params_path)
+            )
+            grain = GrainParams.from_dict(
+                _require_object(raw.get("grain", {}), "grain", params_path)
+            )
+        except ValueError as exc:
+            raise ArtifactsError(f"{params_path}: {exc}") from exc
+
         lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
         if not lut_path.is_file():
             raise ArtifactsError(f"LUT file {lut_path} not found (named in {params_path})")
@@ -1833,12 +1845,6 @@ class Artifacts:
                 f"{path}: lut_sha1 in params.json ({recorded}) does not match {lut_path.name} "
                 f"({actual}). The artifact is mixed; re-run training or restore it."
             )
-
-        try:
-            normalize = NormalizeParams.from_dict(_require_object(raw.get("normalize", {}), "normalize", params_path))
-            grain = GrainParams.from_dict(_require_object(raw.get("grain", {}), "grain", params_path))
-        except ValueError as exc:
-            raise ArtifactsError(f"{params_path}: {exc}") from exc
 
         return cls(
             lut=lut,
@@ -1927,6 +1933,8 @@ EOF
 ls -la kodachrome/data
 ```
 Expected: `kodachrome.cube` (about 1 MB), `params.json`, and the existing `.gitkeep`.
+
+These files are package data and must be committed. The repository's `.gitignore` anchors its download-directory rule as `/data/` precisely so it does not also swallow `kodachrome/data/`; if `git status` does not show the two new files, check that the rule has not lost its leading slash.
 
 - [ ] **Step 5: Run the whole suite**
 

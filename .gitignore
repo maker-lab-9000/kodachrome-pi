@@ -10,7 +10,7 @@ dist/
 .ruff_cache/
 
 # Data and generated output
-data/
+/data/
 artifacts/report/
 
 # Agent scratch space (plans' ledgers, briefs, review packages)
