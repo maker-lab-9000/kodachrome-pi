@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kodachrome-film"
+version = "0.1.0"
+description = "Kodachrome film look for a Raspberry Pi 400 + U20CAM camera, learned from real Kodachrome scans"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+train = ["scipy>=1.12", "requests>=2.31", "tqdm>=4.66"]
+dev = ["opencv-python>=4.8", "pytest>=7.4", "ruff>=0.4"]
+
+[project.scripts]
+kodachrome-fetch = "kodachrome.train.fetch:main"
+kodachrome-train = "kodachrome.train.fit:main"
+kodachrome-capture = "kodachrome.capture.app:main"
+kodachrome-process = "kodachrome.capture.batch:main"
+
+[tool.setuptools.packages.find]
+include = ["kodachrome*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
