@@ -620,6 +620,8 @@ Implements spec 5.3. Adds full validation and content hashing (F-12, F-14).
 
 `tests/test_lut.py`:
 ```python
+import re
+
 import numpy as np
 import pytest
 
@@ -701,14 +703,8 @@ def test_sha1_is_stable_and_content_sensitive():
 def test_cube_errors(tmp_path, text, message):
     path = tmp_path / "bad.cube"
     path.write_text(text)
-    with pytest.raises(CubeError, match=re_escape(message)):
+    with pytest.raises(CubeError, match=re.escape(message)):
         read_cube(path)
-
-
-def re_escape(s):
-    import re
-
-    return re.escape(s)
 
 
 @pytest.mark.parametrize(
@@ -721,7 +717,7 @@ def re_escape(s):
     ],
 )
 def test_table_validation(table, message):
-    with pytest.raises(ValueError, match=re_escape(message)):
+    with pytest.raises(ValueError, match=re.escape(message)):
         LUT3D(table)
 ```
 
