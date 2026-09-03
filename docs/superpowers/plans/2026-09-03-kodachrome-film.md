@@ -2868,6 +2868,12 @@ class FakeCapture:
     Without this, none of the raw-mode, fallback, negotiation or retry logic is
     executed by any test: a build where raw mode silently never engaged would
     pass the whole suite, and that logic is the project's headline promise.
+
+    Two things to know when writing tests against it. Constructing a
+    ``V4L2Camera`` consumes one buffer, because ``_enable_raw_mode`` reads a
+    frame to verify the mode really works — so a queue must include that
+    verification frame before the ones a test intends ``read()`` to return.
+    And format properties are reported, not stored (see ``set``).
     """
 
     def __init__(
@@ -2893,11 +2899,22 @@ class FakeCapture:
         }
         self.convert_rgb = 1
         self.released = False
+        self.requested = []
 
     def isOpened(self):
         return True
 
     def set(self, prop, val):
+        """Accept a request but do not pretend it was honoured.
+
+        A real camera reports the format it actually negotiated, which is the
+        entire reason ``_negotiated`` reads the properties back. Storing the
+        requested value here would make every negotiation check tautological:
+        the code would read back exactly what it just wrote and never warn.
+        So format writes are recorded and ignored; only CONVERT_RGB takes
+        effect, because that one genuinely changes what ``read`` returns.
+        """
+        self.requested.append((prop, val))
         if prop == cv2.CAP_PROP_CONVERT_RGB:
             if self.mutate_then_raise:
                 self.convert_rgb = val
@@ -2907,7 +2924,6 @@ class FakeCapture:
             if self.set_convert_fails:
                 return False
             self.convert_rgb = val
-        self.props[prop] = val
         return True
 
     def get(self, prop):
@@ -2944,6 +2960,7 @@ def fake_capture(monkeypatch):
 def test_raw_mode_engages_and_preserves_the_camera_bytes(fake_capture, capsys):
     rgb = synthetic_frame(48, 64)
     data = _jpeg_bytes(rgb)
+    # One buffer is consumed by _enable_raw_mode's verification read.
     cap = fake_capture(buffers=[data] * 4)
     cam = V4L2Camera(device=0, warmup_frames=0)
     assert cam.stream_info.raw_mjpeg is True
@@ -2959,7 +2976,11 @@ def test_raw_mode_engages_and_preserves_the_camera_bytes(fake_capture, capsys):
 def test_an_invalid_buffer_falls_back_once_and_stays_fallen_back(fake_capture, capsys):
     rgb = synthetic_frame(48, 64)
     data = _jpeg_bytes(rgb)
-    cap = fake_capture(buffers=[data, data[:-2]], decoded=np.zeros((48, 64, 3), np.uint8))
+    # First buffer is eaten by the constructor's verification read, second is
+    # the good frame the first read() returns, third is the truncated one.
+    cap = fake_capture(
+        buffers=[data, data, data[:-2]], decoded=np.zeros((48, 64, 3), np.uint8)
+    )
     cam = V4L2Camera(device=0, warmup_frames=0)
     assert cam.read().source == "raw-mjpeg"
 
