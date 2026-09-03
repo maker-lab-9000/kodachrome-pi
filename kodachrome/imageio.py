@@ -72,6 +72,11 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
         profile_error: str | None = None
 
         if raw_profile and colour_manage:
+            # Built outside the try on purpose: if the working-space profile
+            # itself cannot be created, that is an environment fault, not a bad
+            # source profile, and it should surface rather than be reported as
+            # "invalid" against the image.
+            destination = srgb_profile()
             try:
                 src = ImageCms.ImageCmsProfile(io.BytesIO(raw_profile))
                 profile_name = _describe(src)
@@ -80,7 +85,7 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
                 # image to RGB makes the transform unbuildable, and the fallback
                 # below would then silently mislabel a perfectly good profile.
                 im = ImageCms.profileToProfile(
-                    im, src, srgb_profile(), renderingIntent=0, outputMode="RGB"
+                    im, src, destination, renderingIntent=0, outputMode="RGB"
                 )
             except Exception as exc:  # noqa: BLE001 - any malformed profile falls back to sRGB
                 profile_name = "invalid"
