@@ -1719,6 +1719,38 @@ def test_publish_replaces_an_existing_artifact(tmp_path):
     assert Artifacts.load(dest).lut.size == 9
 
 
+def test_a_non_identity_artifact_survives_a_write_load_cycle(tmp_path):
+    """The integrity check must not fire on an artifact this code just wrote.
+
+    Every other test here uses an identity LUT, whose values are exact at the
+    six decimals a .cube stores. A fitted LUT is not: it loses about 5e-7 per
+    value on the way to disk. If the recorded hash came from the in-memory
+    table rather than the persisted file, this test would fail while all the
+    identity-based ones passed — and every trained artifact would be
+    unloadable.
+    """
+    lut = LUT3D(np.clip(LUT3D.identity(17).table ** 1.4, 0.0, 1.0))
+    write_artifact(tmp_path, lut, NormalizeParams(), GrainParams())
+
+    art = Artifacts.load(tmp_path)  # raises ArtifactsError on a hash mismatch
+    assert art.lut.size == 17
+    assert np.abs(art.lut.table - lut.table).max() < 1e-5
+    assert art.lut_sha1 == json.loads((tmp_path / "params.json").read_text())["lut_sha1"]
+
+
+def test_publish_accepts_a_non_identity_artifact(tmp_path):
+    """The same hazard, reached through the trainer's actual path."""
+    staging = tmp_path / "staging"
+    write_artifact(
+        staging,
+        LUT3D(np.clip(LUT3D.identity(9).table ** 0.8, 0.0, 1.0)),
+        NormalizeParams(),
+        GrainParams(),
+    )
+    dest = publish(staging, tmp_path / "live")
+    assert Artifacts.load(dest).lut.size == 9
+
+
 def test_committed_default_is_loadable(repo_root):
     art = Artifacts.load(repo_root / "kodachrome" / "data")
     assert art.lut.size in (2, 9, 33)
@@ -1878,10 +1910,15 @@ def write_artifact(
     path = Path(dir_path)
     path.mkdir(parents=True, exist_ok=True)
     write_cube(lut, path / lut_file, title="kodachrome")
+    # Hash what will actually be read back, not the in-memory table. The .cube
+    # format stores six decimals, so a fitted LUT loses about 5e-7 per value on
+    # the way to disk. Recording the pre-write hash would make every non-identity
+    # artifact fail its own integrity check on load — and an identity table would
+    # not reveal it, because its values are exact at six decimals.
     payload = {
         "version": PARAMS_VERSION,
         "lut_file": lut_file,
-        "lut_sha1": sha1_hex(lut),
+        "lut_sha1": sha1_hex(read_cube(path / lut_file)),
         "normalize": normalize.to_dict(),
         "grain": grain.to_dict(),
         "training": training or {},
