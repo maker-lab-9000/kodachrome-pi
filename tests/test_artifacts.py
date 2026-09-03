@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -114,6 +116,94 @@ def test_publish_replaces_an_existing_artifact(tmp_path):
     staging = tmp_path / "new"
     write_artifact(staging, LUT3D.identity(9), NormalizeParams(), GrainParams())
     publish(staging, dest)
+    assert Artifacts.load(dest).lut.size == 9
+
+
+def test_a_missing_lut_sha1_is_refused(tmp_path):
+    """Omitting the field must not silently disable the integrity check.
+
+    Demonstrated before this test existed: deleting `lut_sha1` and swapping in
+    a completely different table loaded without complaint.
+    """
+    write_artifact(tmp_path, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    params = tmp_path / "params.json"
+    data = json.loads(params.read_text())
+    del data["lut_sha1"]
+    params.write_text(json.dumps(data))
+    write_cube(LUT3D(np.clip(LUT3D.identity(9).table**1.7, 0, 1)), tmp_path / "kodachrome.cube")
+
+    with pytest.raises(ArtifactsError, match="lut_sha1"):
+        Artifacts.load(tmp_path)
+
+
+def test_a_field_level_type_error_is_wrapped(tmp_path):
+    """A bad value inside a well-formed section must not escape as TypeError."""
+    write_artifact(tmp_path, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    params = tmp_path / "params.json"
+    data = json.loads(params.read_text())
+    data["normalize"]["wb_gain_min"] = "oops"
+    params.write_text(json.dumps(data))
+
+    with pytest.raises(ArtifactsError):
+        Artifacts.load(tmp_path)
+
+
+def test_a_malformed_training_section_is_named(tmp_path):
+    """Reported as a bad training section, not as a missing LUT file."""
+    (tmp_path / "params.json").write_text(
+        json.dumps({"version": 2, "training": "not-an-object"})
+    )
+    with pytest.raises(ArtifactsError, match="training"):
+        Artifacts.load(tmp_path)
+
+
+def test_publish_reports_failure_as_an_artifacts_error(tmp_path, monkeypatch):
+    """Every failure out of this module is an ArtifactsError naming the paths."""
+    staging = tmp_path / "staging"
+    write_artifact(staging, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    dest = tmp_path / "live"
+
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        if Path(src) == staging:
+            raise OSError("simulated failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(ArtifactsError, match="could not publish"):
+        publish(staging, dest)
+
+
+def test_a_non_identity_artifact_survives_a_write_load_cycle(tmp_path):
+    """The integrity check must not fire on an artifact this code just wrote.
+
+    Every other test here uses an identity LUT, whose values are exact at the
+    six decimals a .cube stores. A fitted LUT is not: it loses about 5e-7 per
+    value on the way to disk. If the recorded hash came from the in-memory
+    table rather than the persisted file, this test would fail while all the
+    identity-based ones passed — and every trained artifact would be
+    unloadable.
+    """
+    lut = LUT3D(np.clip(LUT3D.identity(17).table ** 1.4, 0.0, 1.0))
+    write_artifact(tmp_path, lut, NormalizeParams(), GrainParams())
+
+    art = Artifacts.load(tmp_path)  # raises ArtifactsError on a hash mismatch
+    assert art.lut.size == 17
+    assert np.abs(art.lut.table - lut.table).max() < 1e-5
+    assert art.lut_sha1 == json.loads((tmp_path / "params.json").read_text())["lut_sha1"]
+
+
+def test_publish_accepts_a_non_identity_artifact(tmp_path):
+    """The same hazard, reached through the trainer's actual path."""
+    staging = tmp_path / "staging"
+    write_artifact(
+        staging,
+        LUT3D(np.clip(LUT3D.identity(9).table ** 0.8, 0.0, 1.0)),
+        NormalizeParams(),
+        GrainParams(),
+    )
+    dest = publish(staging, tmp_path / "live")
     assert Artifacts.load(dest).lut.size == 9
 
 

@@ -84,6 +84,9 @@ class Artifacts:
                 f"(this build reads up to {PARAMS_VERSION})"
             )
 
+        # Structural checks before file I/O, so a malformed section is reported as
+        # such instead of being pre-empted by a missing-LUT error.
+        training = _require_object(raw.get("training", {}), "training", params_path)
         try:
             normalize = NormalizeParams.from_dict(
                 _require_object(raw.get("normalize", {}), "normalize", params_path)
@@ -91,7 +94,10 @@ class Artifacts:
             grain = GrainParams.from_dict(
                 _require_object(raw.get("grain", {}), "grain", params_path)
             )
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
+            # TypeError too: a field-level type error such as
+            # {"wb_gain_min": "oops"} reaches math.isfinite and raises TypeError,
+            # which would otherwise escape unwrapped past this loader.
             raise ArtifactsError(f"{params_path}: {exc}") from exc
 
         lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
@@ -104,7 +110,16 @@ class Artifacts:
 
         actual = sha1_hex(lut)
         recorded = raw.get("lut_sha1")
-        if recorded is not None and recorded != actual:
+        # Required, not optional. Making it optional would let a params.json that
+        # simply omits the field load a LUT it was never paired with, which is the
+        # exact failure this check exists to catch. There is no earlier schema
+        # version to stay compatible with: PARAMS_VERSION starts at 2.
+        if not isinstance(recorded, str):
+            raise ArtifactsError(
+                f"{params_path}: 'lut_sha1' is required and must be a string, "
+                f"got {type(recorded).__name__}"
+            )
+        if recorded != actual:
             raise ArtifactsError(
                 f"{path}: lut_sha1 in params.json ({recorded}) does not match {lut_path.name} "
                 f"({actual}). The artifact is mixed; re-run training or restore it."
@@ -114,7 +129,7 @@ class Artifacts:
             lut=lut,
             normalize=normalize,
             grain=grain,
-            training=_require_object(raw.get("training", {}), "training", params_path),
+            training=training,
             path=path,
             lut_sha1=actual,
         )
@@ -142,10 +157,15 @@ def write_artifact(
     path = Path(dir_path)
     path.mkdir(parents=True, exist_ok=True)
     write_cube(lut, path / lut_file, title="kodachrome")
+    # Hash what will actually be read back, not the in-memory table. The .cube
+    # format stores six decimals, so a fitted LUT loses about 5e-7 per value on
+    # the way to disk. Recording the pre-write hash would make every non-identity
+    # artifact fail its own integrity check on load — and an identity table would
+    # not reveal it, because its values are exact at six decimals.
     payload = {
         "version": PARAMS_VERSION,
         "lut_file": lut_file,
-        "lut_sha1": sha1_hex(lut),
+        "lut_sha1": sha1_hex(read_cube(path / lut_file)),
         "normalize": normalize.to_dict(),
         "grain": grain.to_dict(),
         "training": training or {},
@@ -155,23 +175,36 @@ def write_artifact(
 
 
 def publish(staging_dir: str | Path, dest_dir: str | Path) -> Path:
-    """Validate ``staging_dir`` then replace ``dest_dir`` with it, atomically."""
+    """Validate ``staging_dir``, then swap it into ``dest_dir``.
+
+    The artifact is never published half-written: ``Artifacts.load`` runs
+    against the staging directory first, so an incomplete or inconsistent set
+    is rejected before anything moves.
+
+    On the swap itself, be precise about the guarantee. ``os.replace`` cannot
+    rename onto a non-empty directory, so replacing an existing artifact takes
+    two steps, and between them the destination briefly does not exist. A
+    reader in that window gets "not found" rather than a mixed artifact, which
+    is the failure mode that matters; it is two back-to-back metadata calls
+    with no work between them. Fully closing the window would need a symlink
+    indirection, which the design does not call for.
+    """
     staging = Path(staging_dir)
     dest = Path(dest_dir)
     Artifacts.load(staging)  # raises ArtifactsError before anything is moved
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     backup: Path | None = None
-    if dest.exists():
-        backup = Path(tempfile.mkdtemp(prefix=f".{dest.name}.old.", dir=dest.parent))
-        os.rmdir(backup)
-        os.replace(dest, backup)
     try:
+        if dest.exists():
+            backup = Path(tempfile.mkdtemp(prefix=f".{dest.name}.old.", dir=dest.parent))
+            os.rmdir(backup)
+            os.replace(dest, backup)
         os.replace(staging, dest)
-    except OSError:
-        if backup is not None:
+    except OSError as exc:
+        if backup is not None and not dest.exists():
             os.replace(backup, dest)
-        raise
+        raise ArtifactsError(f"could not publish {staging} to {dest}: {exc}") from exc
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
     return dest
