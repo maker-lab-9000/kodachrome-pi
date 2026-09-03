@@ -2876,11 +2876,13 @@ class FakeCapture:
     executed by any test: a build where raw mode silently never engaged would
     pass the whole suite, and that logic is the project's headline promise.
 
-    Two things to know when writing tests against it. Constructing a
+    Three things to know when writing tests against it. Constructing a
     ``V4L2Camera`` consumes one buffer, because ``_enable_raw_mode`` reads a
     frame to verify the mode really works — so a queue must include that
     verification frame before the ones a test intends ``read()`` to return.
-    And format properties are reported, not stored (see ``set``).
+    Format properties are reported, not stored (see ``set``). And ``grab``
+    consumes only when a test passes ``grab_consumes=True``, so that buffer
+    counts stay independent of ``_drain``'s internal grab limit.
     """
 
     def __init__(
@@ -2893,6 +2895,7 @@ class FakeCapture:
         mutate_then_raise=False,
         raise_on_restore=False,
         buffer_ndim=1,
+        grab_consumes=False,
         props=None,
     ):
         self.buffers = list(buffers or [])
@@ -2902,6 +2905,7 @@ class FakeCapture:
         self.mutate_then_raise = mutate_then_raise
         self.raise_on_restore = raise_on_restore
         self.buffer_ndim = buffer_ndim
+        self.grab_consumes = grab_consumes
         self.props = props or {
             cv2.CAP_PROP_FRAME_WIDTH: 1920,
             cv2.CAP_PROP_FRAME_HEIGHT: 1080,
@@ -2952,13 +2956,19 @@ class FakeCapture:
         return True, self.decoded
 
     def grab(self):
-        """Advance the queue without decoding, as a real grab does.
+        """Count every grab; consume a buffer only when a test asks it to.
 
-        An unconditional ``True`` here would make ``_drain`` untestable: it
-        would consume nothing, so a drain that grabbed the wrong number of
-        frames — or was deleted outright — would still pass every test.
+        An unconditional ``True`` that consumes nothing makes ``_drain``
+        untestable — a drain that grabbed the wrong number of frames, or was
+        deleted outright, would still pass. But consuming unconditionally
+        couples every fixture's buffer count to the literal ``4`` inside
+        ``_drain``: change that constant and unrelated tests fail for reasons
+        they do not assert on. So consumption is opt-in, and exactly one test
+        opts in to verify the drain.
         """
         self.grabs += 1
+        if not self.grab_consumes:
+            return True
         if not self.buffers:
             return False
         self.buffers.pop(0)
@@ -3056,11 +3066,13 @@ def test_negotiation_mismatch_warns_but_does_not_abort(fake_capture, capsys):
 def test_read_returns_the_newest_frame_not_a_stale_queued_one(fake_capture):
     """`_drain` must discard queued frames, or the preview lags behind reality."""
     buffers = [_jpeg_bytes(_tagged_frame(i)) for i in range(6)]
-    cap = fake_capture(buffers=list(buffers))
+    cap = fake_capture(buffers=list(buffers), grab_consumes=True)
     cam = V4L2Camera(device=0, warmup_frames=0)
 
     frame = cam.read()
     assert cap.grabs == 4, "the drain loop should grab up to four queued frames"
+    # Index 0 is eaten by the constructor's verification read, 1-4 by the drain,
+    # so a correct drain leaves index 5. Without the drain this would be index 1.
     assert frame.jpeg == buffers[5], "read returned a stale frame instead of the newest"
 
 
