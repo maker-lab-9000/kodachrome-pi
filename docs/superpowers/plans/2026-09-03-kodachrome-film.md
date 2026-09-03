@@ -116,7 +116,8 @@ def test_missing_cv2_names_both_remedies(monkeypatch):
         # The error text names the .so inside the cv2 package, so any check
         # that sniffs for "cv2" in the message misclassifies this one.
         ImportError(
-            "/usr/lib/python3/dist-packages/cv2/cv2.abi3.so: undefined symbol: _ZN2cv6String8allocateEm"
+            "/usr/lib/python3/dist-packages/cv2/cv2.abi3.so: "
+            "undefined symbol: _ZN2cv6String8allocateEm"
         ),
     ],
     ids=["missing-libGL", "abi-mismatch"],
@@ -3018,7 +3019,10 @@ class FakeCamera:
     ) -> None:
         self._jpegs = jpeg_bytes
         if jpeg_bytes is not None:
-            self._frames = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes]
+            decoded = [
+                cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes
+            ]
+            self._frames = decoded
             self._frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in self._frames]
         else:
             self._frames = frames if frames else [synthetic_frame()]
@@ -3132,7 +3136,10 @@ class V4L2Camera:
         if (actual_w, actual_h) != (width, height):
             print(f"warning: requested {width}x{height}, camera negotiated {actual_w}x{actual_h}")
         if fourcc != "MJPG":
-            print(f"warning: requested MJPG, camera negotiated {fourcc}; 1080p30 may be unavailable")
+            print(
+                f"warning: requested MJPG, camera negotiated {fourcc}; "
+                "1080p30 may be unavailable"
+            )
         if actual_fps and abs(actual_fps - fps) > 1.0:
             print(f"warning: requested {fps} fps, camera reports {actual_fps:g} fps")
         if not self._raw:
@@ -3424,7 +3431,9 @@ def test_main_headless_without_tty_exits_2(tmp_path, capsys, monkeypatch):
 
 
 def test_main_reports_bad_artifacts(tmp_path, capsys):
-    code = main(["--fake", "--no-preview", "--out", str(tmp_path), "--artifacts", str(tmp_path / "nope")])
+    code = main(
+        ["--fake", "--no-preview", "--out", str(tmp_path), "--artifacts", str(tmp_path / "nope")]
+    )
     assert code == 2
     assert "params.json" in capsys.readouterr().err
 ```
@@ -3679,7 +3688,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Capture Kodachrome-graded photos from the U20CAM.",
     )
     parser.add_argument("--device", default=None, help="index, /dev/videoN or /dev/v4l/by-id/...")
-    parser.add_argument("--artifacts", type=Path, default=None, help="artifact dir (default: bundled)")
+    parser.add_argument(
+        "--artifacts", type=Path, default=None, help="artifact dir (default: bundled)"
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--no-preview", action="store_true", help="never open a window")
     parser.add_argument("--fake", action="store_true", help="synthetic camera, no hardware")
@@ -3995,7 +4006,16 @@ def test_validate_image_accepts_photos_and_rejects_junk():
 
 
 def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
-    info = FileInfo("File:T LCCN2017000001.jpg", 1, 2, "https://upload/1.jpg", 1200, 900, "Public domain", "2017000001")
+    info = FileInfo(
+        "File:T LCCN2017000001.jpg",
+        1,
+        2,
+        "https://upload/1.jpg",
+        1200,
+        900,
+        "Public domain",
+        "2017000001",
+    )
     session = FakeSession(_handler, files={"https://upload/1.jpg": _photo_bytes()})
     path = download(session, info, tmp_path)
     assert path is not None and path.name == "2017000001.jpg"
@@ -4003,7 +4023,16 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
     assert download(session, info, tmp_path) == path      # resumed, not re-fetched
     assert len(session.calls) == calls
 
-    bad = FileInfo("File:U LCCN2017000002.jpg", 1, 2, "https://upload/bad.jpg", 1, 1, "Public domain", "2017000002")
+    bad = FileInfo(
+        "File:U LCCN2017000002.jpg",
+        1,
+        2,
+        "https://upload/bad.jpg",
+        1,
+        1,
+        "Public domain",
+        "2017000002",
+    )
     failing = FakeSession(_handler, fail_urls={"https://upload/bad.jpg"})
     assert download(failing, bad, tmp_path, retries=1) is None
     assert list(tmp_path.glob("*.part")) == [], "no partial files may remain"
@@ -4011,7 +4040,16 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
 
 
 def test_download_rejects_undecodable_content(tmp_path):
-    info = FileInfo("File:V LCCN2017000003.jpg", 1, 2, "https://upload/x.jpg", 1200, 900, "Public domain", "2017000003")
+    info = FileInfo(
+        "File:V LCCN2017000003.jpg",
+        1,
+        2,
+        "https://upload/x.jpg",
+        1200,
+        900,
+        "Public domain",
+        "2017000003",
+    )
     session = FakeSession(_handler, files={"https://upload/x.jpg": b"garbage"})
     assert download(session, info, tmp_path) is None
     assert not (tmp_path / "2017000003.jpg").exists()
@@ -4036,7 +4074,9 @@ def test_resume_revalidates_against_the_manifest_hash(tmp_path):
     victim = tmp_path / "2017000001.jpg"
     victim.write_bytes(_photo_bytes(seed=99))  # same name, different content
     report = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, width=1024)
-    assert victim.read_bytes() == files["https://upload/thumb/0.jpg"], "corrupt file must be refetched"
+    assert victim.read_bytes() == files["https://upload/thumb/0.jpg"], (
+        "corrupt file must be refetched"
+    )
     assert report.repaired == 1
 
 
@@ -4226,7 +4266,9 @@ def select_titles(entries: list[dict]) -> tuple[list[str], list[dict]]:
     return accepted + without, rejected
 
 
-def fetch_imageinfo(session: Any, titles: list[str], width: int) -> tuple[list[FileInfo], list[dict]]:
+def fetch_imageinfo(
+    session: Any, titles: list[str], width: int
+) -> tuple[list[FileInfo], list[dict]]:
     infos: list[FileInfo] = []
     rejected: list[dict] = []
     for start in range(0, len(titles), 50):
@@ -4575,7 +4617,9 @@ def test_sample_pixels_respects_bounds_and_count():
     assert sample_pixels(img, 30, 0.02, 0.98, rng).shape == (30, 3)
 
 
-@pytest.mark.parametrize("n, frac, expected_val", [(10, 0.2, 2), (5, 0.2, 1), (3, 0.5, 1), (1, 0.2, 0)])
+@pytest.mark.parametrize(
+    "n, frac, expected_val", [(10, 0.2, 2), (5, 0.2, 1), (3, 0.5, 1), (1, 0.2, 0)]
+)
 def test_split_sizes(n, frac, expected_val):
     paths = [f"{i}.jpg" for i in range(n)]
     train, val = split_paths(paths, frac, seed=0)
@@ -4623,7 +4667,9 @@ def test_corpus_too_small_names_the_escape_hatch(tmp_path):
     cfg = SampleConfig(crop_frac=0.0, max_side=60, pixels_per_image=100)
     with pytest.raises(CorpusTooSmall, match="--allow-small"):
         build_corpus(paths, NormalizeParams(), cfg, minimum=30, label="source")
-    split = build_corpus(paths, NormalizeParams(), cfg, minimum=30, label="source", allow_small=True)
+    split = build_corpus(
+        paths, NormalizeParams(), cfg, minimum=30, label="source", allow_small=True
+    )
     assert split.train_pool.n_images >= 1
 
 
@@ -5008,7 +5054,8 @@ def test_idt_moves_source_onto_target_distribution():
 def test_sliced_wasserstein_zero_for_identical_and_positive_for_shift():
     rng = np.random.default_rng(6)
     a = rng.normal(size=(5000, 3))
-    assert sliced_wasserstein(a, a.copy(), rng=np.random.default_rng(0)) == pytest.approx(0.0, abs=1e-9)
+    identical = sliced_wasserstein(a, a.copy(), rng=np.random.default_rng(0))
+    assert identical == pytest.approx(0.0, abs=1e-9)
     assert sliced_wasserstein(a, a + 1.0, rng=np.random.default_rng(0)) > 0.3
 ```
 
@@ -5526,7 +5573,8 @@ def test_a_real_improvement_beats_the_seed_spread():
     """A LUT that genuinely moves the source toward the target must clear the noise floor."""
     rng = np.random.default_rng(4)
     src = PixelPool(rng.random((6000, 3), dtype=np.float32).astype(np.float32), 5)
-    tgt = PixelPool(np.clip(src.srgb**1.5 + rng.normal(0, 0.01, src.srgb.shape), 0, 1).astype(np.float32), 5)
+    noisy = np.clip(src.srgb**1.5 + rng.normal(0, 0.01, src.srgb.shape), 0, 1)
+    tgt = PixelPool(noisy.astype(np.float32), 5)
     weights = np.ones(len(tgt.srgb))
     ev = Evaluator.build(src, tgt, weights, seed=0)
     before = ev.distance(src.lab)
@@ -5593,7 +5641,9 @@ def test_hue_hist_residual_is_zero_when_reweighting_is_exact():
 
     rng = np.random.default_rng(8)
     src_lab = lch_to_oklab(
-        np.stack([rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, 2 * np.pi, 8000)], 1)
+        np.stack(
+            [rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, 2 * np.pi, 8000)], 1
+        )
     )
     tgt_lab = lch_to_oklab(
         np.stack([rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, np.pi, 8000)], 1)
@@ -5738,7 +5788,9 @@ class Evaluator:
         directions /= np.linalg.norm(directions, axis=1, keepdims=True)
         return cls(
             src_idx=src_idx,
-            tgt_points=np.sort(np.asarray(tgt_pool.lab, dtype=np.float64)[tgt_idx] @ directions.T, axis=0),
+            tgt_points=np.sort(
+                np.asarray(tgt_pool.lab, dtype=np.float64)[tgt_idx] @ directions.T, axis=0
+            ),
             directions=directions,
         )
 
@@ -6296,7 +6348,11 @@ def render_diagnostics(
 
     for col, (name, pool) in enumerate((("source", source_pool), ("target", target_pool))):
         x = 8 + col * 380
-        draw.text((x, 30), f"{name}: {pool.n_images} images, clamp rate {pool.clamp_rate:.0%}", fill=_FG)
+        draw.text(
+            (x, 30),
+            f"{name}: {pool.n_images} images, clamp rate {pool.clamp_rate:.0%}",
+            fill=_FG,
+        )
         wb = [g for gains in pool.wb_gains for g in gains]
         _histogram_bars(draw, wb, x, 50, 340, 120, "white balance gains")
         _histogram_bars(draw, pool.exposure_gains, x, 200, 340, 120, "exposure gains")
@@ -6333,7 +6389,9 @@ def write_report(
         out_dir / "contact_sheet.png",
     )
     render_ramps(lut, out_dir / "ramps.png")
-    render_diagnostics(source_split.train_pool, target_split.train_pool, out_dir / "diagnostics.png")
+    render_diagnostics(
+        source_split.train_pool, target_split.train_pool, out_dir / "diagnostics.png"
+    )
 
     payload = {**metrics, "gates": [vars(g) for g in gates]}
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2) + "\n")
@@ -6421,8 +6479,10 @@ def test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation():
     """The spec claims this capability, so it is tested directly."""
     rng = np.random.default_rng(0)
     src = _pool(rng)
-    tgt = np.clip(oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng)))), 0, 1).astype(np.float32)
-    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), FitConfig(lut_size=17, iterations=30, seed=0))
+    transformed = oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng))))
+    tgt = np.clip(transformed, 0, 1).astype(np.float32)
+    cfg = FitConfig(lut_size=17, iterations=30, seed=0)
+    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), cfg)
 
     held = _pool(rng, 3000)
     expected = _curve_and_rotation(srgb_to_oklab(held))
@@ -6435,10 +6495,13 @@ def test_a_large_hue_rotation_is_only_partly_recovered():
     rng = np.random.default_rng(1)
     src = _pool(rng)
     tgt = np.clip(
-        oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng)), gamma=1.0, chroma=1.0, degrees=90.0)),
+        oklab_to_srgb(
+            _curve_and_rotation(srgb_to_oklab(_pool(rng)), gamma=1.0, chroma=1.0, degrees=90.0)
+        ),
         0, 1,
     ).astype(np.float32)
-    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), FitConfig(lut_size=17, iterations=30, seed=0))
+    cfg = FitConfig(lut_size=17, iterations=30, seed=0)
+    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), cfg)
 
     held = _pool(rng, 3000)
     before = oklab_to_lch(srgb_to_oklab(held))[:, 2]
