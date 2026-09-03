@@ -1,427 +1,214 @@
-# Kodachrome Film Look Implementation Plan
+# Kodachrome Film Look Implementation Plan (revision 2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A Raspberry Pi 400 with an Innomaker U20CAM-1080P-WDR saves every capture twice, original and Kodachrome-graded, where the grade is a 3D LUT learned on a Mac from real Kodachrome scans.
+**Goal:** A Raspberry Pi 400 with an Innomaker U20CAM-1080P-WDR saves every capture twice, the camera's own JPEG bytes and a Kodachrome-graded version, where the grade is a 3D LUT learned from public-domain Kodachrome scans.
 
-**Architecture:** One Python package `kodachrome` with shared colour, normalisation, LUT and grain modules. A Mac-side trainer downloads public-domain Kodachrome scans from Wikimedia Commons, transports the colour distribution of camera samples onto the Kodachrome distribution in Oklab (hue-reweighted iterative distribution transfer), then fits a smooth 33³ LUT to the resulting pairs by regularised sparse least squares. The Pi runtime normalises each frame (white balance and exposure as three `cv2.LUT` tables), applies the LUT via Pillow's C `Color3DLUT`, adds luminance grain, and saves.
+**Architecture:** One Python package `kodachrome`. Shared colour, normalisation, LUT, grain, image-IO and artifact modules serve both runtimes. A Mac-side trainer downloads and validates Kodachrome scans, splits both corpora by image, transports the source colour distribution onto the target in Oklab (hue-reweighted iterative distribution transfer), fits a smooth 33³ LUT by regularised sparse least squares, evaluates on held-out images with a paired evaluator, and publishes the artifact atomically. The Pi runtime acquires a raw MJPEG frame, saves those bytes verbatim, and grades the decode of the same buffer.
 
-**Tech Stack:** Python 3.11+, NumPy, Pillow, OpenCV (apt `python3-opencv` on the Pi, `opencv-python` wheel on the Mac), SciPy and requests for the trainer only, pytest.
+**Tech Stack:** Python 3.11+, NumPy, Pillow, OpenCV (apt `python3-opencv` on the Pi, `[opencv]` extra elsewhere), SciPy and requests for the trainer, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-09-03-kodachrome-film-design.md` — read it first; every task below cites the section it implements.
+**Spec:** `docs/superpowers/specs/2026-09-03-kodachrome-film-design.md` (revision 2) — read it first; every task cites the section it implements.
+
+**Status:** Tasks 1 and 2 were completed against revision 1 of this plan and remain valid. Task 3 retrofits the two things revision 2 changes about Task 1. Execution resumes at Task 3.
 
 ## Global Constraints
 
-- `requires-python = ">=3.11"`. Develop on the Mac with `/usr/local/bin/python3.12` in `.venv`.
-- Base pip dependencies are only `numpy` and `Pillow`. OpenCV is imported at runtime but is **not** a pip dependency of the package (spec 7.4). `[train]` adds `scipy>=1.12`, `requests`, `tqdm`. `[dev]` adds `opencv-python`, `pytest`, `ruff`.
-- Image arrays are **RGB**, `uint8` at boundaries, `float32` in `[0, 1]` inside algorithms. BGR appears only inside `camera.py` at the OpenCV boundary (spec 4, "Channel and value conventions").
-- LUT tables are indexed `table[r, g, b, channel]` in memory; `.cube` and Pillow flat order is red-fastest (spec 4).
-- All perceptual statistics are in Oklab; the exported LUT maps sRGB to sRGB (spec 4).
+- `requires-python = ">=3.11"`. Develop on the Mac with `.venv` (already created from `/usr/local/bin/python3.12`).
+- Base pip dependencies are only `numpy` and `Pillow`. OpenCV is **not** a base dependency, but every documented install must work: an `[opencv]` extra exists and both `[train]` and `[dev]` include it (spec 7.4).
+- Image arrays are **RGB**, `uint8` at boundaries, `float32` in `[0, 1]` inside algorithms. BGR appears only inside `camera.py`.
+- All file reads go through `imageio.load_rgb`, which applies EXIF orientation and converts embedded ICC profiles to sRGB (spec 5.5). No module may call `Image.open` directly for pixel data.
+- LUT tables are indexed `table[r, g, b, channel]`; `.cube` and Pillow flat order is red-fastest.
+- Perceptual statistics are in Oklab; the exported LUT maps sRGB to sRGB.
+- Every dataclass with numeric bounds validates in `__post_init__` and raises `ValueError` naming the offending field (spec 5.2-5.4).
 - Tests never touch the network or camera hardware. Use `FakeCamera` and fake HTTP sessions.
-- Documentation is updated in the same task as the code: README, `docs/decisions.md`, module docstrings that explain the *why*. The user asked for this explicitly.
+- `PARAMS_VERSION = 2`. The schema is spec 5.8.
+- Documentation is updated in the same task as the code: README, `docs/decisions.md`, module docstrings explaining the *why*.
+- Run tests with `.venv/bin/pytest -q` from the repo root; lint with `.venv/bin/ruff check kodachrome tests` before every commit.
 - Commit after every task. Commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
-- Run tests with `.venv/bin/pytest -q` from the repo root. Run `.venv/bin/ruff check kodachrome tests` before each commit.
 
 ## File Structure
 
 | File | Responsibility | Task |
 |---|---|---|
-| `pyproject.toml` | package metadata, extras, CLI entry points | 1 |
-| `kodachrome/color.py` | sRGB/linear/Oklab/LCh conversions | 2 |
-| `kodachrome/normalize.py` | white balance + exposure, float and `cv2.LUT` paths | 3 |
-| `kodachrome/lut.py` | `LUT3D`, `.cube` I/O, NumPy trilinear, Pillow path | 4 |
-| `kodachrome/grain.py` | luminance film grain | 5 |
-| `kodachrome/pipeline.py` | `Artifacts` load/write, `Pipeline.process` | 6 |
-| `artifacts/kodachrome.cube`, `artifacts/params.json` | committed artifact (identity first, trained in Task 15) | 6, 15 |
-| `kodachrome/imageio.py` | load/save images, list image files | 7 |
-| `kodachrome/capture/camera.py` | `Camera` protocol, `V4L2Camera`, `FakeCamera` | 8 |
-| `kodachrome/capture/batch.py` | `kodachrome-process` | 9 |
-| `kodachrome/capture/app.py` | `kodachrome-capture` session, preview, headless | 10 |
-| `kodachrome/train/fetch.py` | `kodachrome-fetch` Commons downloader | 11 |
-| `kodachrome/train/dataset.py` | crop/resize/normalise/sample into pixel pools | 12 |
-| `kodachrome/train/transport.py` | hue reweighting, IDT, sliced Wasserstein | 13 |
-| `kodachrome/train/lutfit.py` | trilinear design matrix, smoothness operator, CG solve | 14 |
-| `kodachrome/train/report.py` | contact sheet, ramps, metrics | 15 |
-| `kodachrome/train/fit.py` | `kodachrome-train` orchestration and params writing | 16 |
-| `README.md`, `docs/decisions.md` | living documentation | every task |
-
-The spec's file tree named a single `train/fit.py`; this plan splits the maths into `transport.py` and `lutfit.py` so each file holds one algorithm and its tests, with `fit.py` as the thin orchestrator. Task 16 updates the spec tree accordingly.
-
----
-
-### Task 1: Project scaffold and virtual environment
-
-**Files:**
-- Create: `pyproject.toml`, `kodachrome/__init__.py`, `kodachrome/train/__init__.py`, `kodachrome/capture/__init__.py`, `tests/conftest.py`, `tests/test_package.py`, `README.md`
-
-**Interfaces:**
-- Produces: importable package `kodachrome` with `__version__ = "0.1.0"`; pytest fixture `repo_root` (Path to the repository root) used by later tests.
-
-- [ ] **Step 1: Write pyproject.toml**
-
-```toml
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "kodachrome-film"
-version = "0.1.0"
-description = "Kodachrome film look for a Raspberry Pi 400 + U20CAM camera, learned from real Kodachrome scans"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-  "numpy>=1.24",
-  "Pillow>=10.0",
-]
-
-[project.optional-dependencies]
-train = ["scipy>=1.12", "requests>=2.31", "tqdm>=4.66"]
-dev = ["opencv-python>=4.8", "pytest>=7.4", "ruff>=0.4"]
-
-[project.scripts]
-kodachrome-fetch = "kodachrome.train.fetch:main"
-kodachrome-train = "kodachrome.train.fit:main"
-kodachrome-capture = "kodachrome.capture.app:main"
-kodachrome-process = "kodachrome.capture.batch:main"
-
-[tool.setuptools.packages.find]
-include = ["kodachrome*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
-```
-
-- [ ] **Step 2: Create package files**
-
-`kodachrome/__init__.py`:
-```python
-"""Kodachrome film look for Raspberry Pi 400 + Innomaker U20CAM-1080P-WDR.
-
-The package has two halves that share code:
-
-* ``kodachrome.color``, ``normalize``, ``lut``, ``grain``, ``pipeline`` are the
-  processing core used on the Pi. They depend only on NumPy, Pillow and OpenCV.
-* ``kodachrome.train`` fits the LUT on a Mac from real Kodachrome scans and
-  needs SciPy and requests (``pip install -e ".[train]"``).
-
-See ``docs/superpowers/specs/2026-09-03-kodachrome-film-design.md`` for the design.
-"""
-
-__version__ = "0.1.0"
-```
-
-`kodachrome/train/__init__.py`:
-```python
-"""Mac-side trainer: fetch Kodachrome scans, transport colour distributions, fit the LUT."""
-```
-
-`kodachrome/capture/__init__.py`:
-```python
-"""Pi-side capture: camera access, keypress capture app, batch reprocessing."""
-```
-
-`tests/conftest.py`:
-```python
-from pathlib import Path
-
-import pytest
-
-
-@pytest.fixture(scope="session")
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-```
-
-`tests/test_package.py`:
-```python
-import kodachrome
-
-
-def test_version():
-    assert kodachrome.__version__ == "0.1.0"
-```
-
-- [ ] **Step 3: Write the README skeleton**
-
-`README.md`:
-````markdown
-# kodachrome-film
-
-Kodachrome film look for a Raspberry Pi 400 with an Innomaker U20CAM-1080P-WDR
-USB camera. Every capture is saved twice: the camera's original and a version
-graded to match real Kodachrome, using a 3D LUT learned from public-domain
-Kodachrome scans.
-
-Status: under construction. See `docs/superpowers/specs/` for the design and
-`docs/decisions.md` for why things are the way they are.
-
-## Mac setup (development and training)
-
-```bash
-/usr/local/bin/python3.12 -m venv .venv
-.venv/bin/pip install -e ".[train,dev]"
-.venv/bin/pytest -q
-```
-
-## Pi setup
-
-Written in a later step.
-
-## Commands
-
-| Command | Where | What |
-|---|---|---|
-| `kodachrome-fetch` | Mac | download Kodachrome scans from Wikimedia Commons |
-| `kodachrome-train` | Mac | fit the LUT and write `artifacts/` |
-| `kodachrome-capture` | Pi | live preview, SPACE to capture |
-| `kodachrome-process` | either | regrade a folder of originals |
-````
-
-- [ ] **Step 4: Create the venv and install**
-
-```bash
-/usr/local/bin/python3.12 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install -e ".[train,dev]"
-```
-Expected: installs numpy, Pillow, scipy, requests, tqdm, opencv-python, pytest, ruff without error. If `opencv-python` has no wheel for this platform, install `opencv-python-headless` instead and note in README that preview is unavailable on the Mac.
-
-- [ ] **Step 5: Run tests and lint**
-
-Run: `.venv/bin/pytest -q && .venv/bin/ruff check kodachrome tests`
-Expected: `1 passed`, ruff reports no errors.
-
-- [ ] **Step 6: Set git identity if missing, commit**
-
-```bash
-git config user.email >/dev/null || git config user.email "george.babanau@localhost"
-git config user.name  >/dev/null || git config user.name  "george.babanau"
-git add pyproject.toml kodachrome tests README.md
-git commit -m "chore: scaffold kodachrome package, venv, pytest
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-```
+| `pyproject.toml` | metadata, extras, entry points, package data | 1, 3 |
+| `kodachrome/color.py` | sRGB/linear/Oklab/LCh conversions | 2 ✅ |
+| `kodachrome/_cv2.py` | one import guard with an actionable message | 3 |
+| `kodachrome/normalize.py` | white balance + exposure, validation, clamp flags | 4 |
+| `kodachrome/lut.py` | `LUT3D`, `.cube` I/O, validation, `sha1_hex` | 5 |
+| `kodachrome/grain.py` | luminance film grain | 6 |
+| `kodachrome/imageio.py` | load/save with EXIF orientation and ICC → sRGB | 7 |
+| `kodachrome/artifacts.py` | load, validate, packaged default, atomic publish | 8 |
+| `kodachrome/data/` | packaged default artifact (identity until Task 21) | 8, 21 |
+| `kodachrome/pipeline.py` | normalise → LUT → grain | 9 |
+| `kodachrome/capture/batch.py` | `kodachrome-process`, with clobber and double-grade safety | 10 |
+| `kodachrome/capture/camera.py` | raw-MJPEG `V4L2Camera`, negotiation checks, `FakeCamera` | 11 |
+| `kodachrome/capture/app.py` | `kodachrome-capture`, guarded loops, audit log | 12 |
+| `kodachrome/train/fetch.py` | `kodachrome-fetch`, licence and media validation | 13 |
+| `kodachrome/train/dataset.py` | corpora → pools, split by image, corpus hashing | 14 |
+| `kodachrome/train/transport.py` | hue reweighting, IDT, sliced Wasserstein | 15 |
+| `kodachrome/train/lutfit.py` | design matrix, smoothness, CG solve | 16 |
+| `kodachrome/train/evaluate.py` | paired evaluator, held-out metrics, safety gates | 17 |
+| `kodachrome/train/report.py` | contact sheet, ramps, diagnostics | 18 |
+| `kodachrome/train/fit.py` | `kodachrome-train` orchestration | 19 |
+| `tests/test_packaging.py` | wheel install, run from another directory | 20 |
+| — | fetch corpora, train and promote the default artifact | 21 |
+| `README.md` | Pi setup, measured performance, limitations | 22 |
 
 ---
 
-### Task 2: Colour conversions (`color.py`)
+### Task 3: Dependency extras and the OpenCV import guard
 
-Implements spec 5.1.
+Implements spec 4 and 7.4. Fixes F-04. Also creates the package-data directory Task 8 fills.
 
 **Files:**
-- Create: `kodachrome/color.py`, `tests/test_color.py`
+- Modify: `pyproject.toml`
+- Create: `kodachrome/_cv2.py`, `kodachrome/data/.gitkeep`, `tests/test_cv2_guard.py`
+- Modify: `README.md`
 
 **Interfaces:**
-- Produces:
-  - `srgb_to_linear(x) -> np.float32 array`, `linear_to_srgb(x)`, both clip to `[0, 1]`
-  - `linear_to_oklab(rgb)`, `oklab_to_linear(lab)`, `srgb_to_oklab(rgb)`, `oklab_to_srgb(lab)`
-  - `oklab_to_lch(lab)` → `(L, C, h_radians)`, `lch_to_oklab(lch)`
-  - `LUMA_709` constant `np.array([0.2126, 0.7152, 0.0722], float32)` and `luminance(rgb_linear) -> array`
-  - All accept shape `(..., 3)`.
+- Produces: `kodachrome._cv2.require_cv2() -> module` — returns the imported `cv2`, or raises `ImportError` with a message naming both remedies. Every module that needs OpenCV does `from ._cv2 import require_cv2` then `cv2 = require_cv2()` at module scope.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing test**
 
-`tests/test_color.py`:
+`tests/test_cv2_guard.py`:
 ```python
-import numpy as np
+import builtins
+
 import pytest
 
-from kodachrome import color
+from kodachrome._cv2 import require_cv2
 
 
-def test_srgb_linear_roundtrip():
-    x = np.random.default_rng(0).random((100, 3), dtype=np.float32)
-    back = color.linear_to_srgb(color.srgb_to_linear(x))
-    assert back.dtype == np.float32
-    assert np.allclose(back, x, atol=1e-4)
+def test_require_cv2_returns_the_module():
+    cv2 = require_cv2()
+    assert hasattr(cv2, "LUT")
 
 
-def test_srgb_to_linear_known_points():
-    assert color.srgb_to_linear(np.array([0.0, 1.0]))[1] == pytest.approx(1.0)
-    # 18% grey card is about sRGB 0.461
-    assert color.srgb_to_linear(np.array([0.4613]))[0] == pytest.approx(0.18, abs=1e-3)
+def test_missing_cv2_names_both_remedies(monkeypatch):
+    real_import = builtins.__import__
 
+    def fake_import(name, *args, **kwargs):
+        if name == "cv2":
+            raise ImportError("No module named 'cv2'")
+        return real_import(name, *args, **kwargs)
 
-@pytest.mark.parametrize(
-    "rgb, expected",
-    [
-        ((1.0, 1.0, 1.0), (1.0, 0.0, 0.0)),
-        ((1.0, 0.0, 0.0), (0.627955, 0.224863, 0.125846)),
-        ((0.0, 1.0, 0.0), (0.866440, -0.233888, 0.179498)),
-        ((0.0, 0.0, 1.0), (0.452014, -0.032457, -0.311528)),
-    ],
-)
-def test_oklab_reference_values(rgb, expected):
-    # Reference values from Björn Ottosson's Oklab article (linear sRGB inputs).
-    lab = color.linear_to_oklab(np.array(rgb, dtype=np.float32))
-    assert np.allclose(lab, expected, atol=1e-3)
-
-
-def test_oklab_roundtrip():
-    rgb = np.random.default_rng(1).random((500, 3), dtype=np.float32)
-    back = color.oklab_to_srgb(color.srgb_to_oklab(rgb))
-    assert np.allclose(back, rgb, atol=1e-4)
-
-
-def test_lch_roundtrip_and_hue_range():
-    lab = color.srgb_to_oklab(np.random.default_rng(2).random((200, 3), dtype=np.float32))
-    lch = color.oklab_to_lch(lab)
-    assert lch[..., 1].min() >= 0
-    assert np.all(np.abs(lch[..., 2]) <= np.pi + 1e-6)
-    assert np.allclose(color.lch_to_oklab(lch), lab, atol=1e-5)
-
-
-def test_luminance_weights_sum_to_one():
-    assert color.LUMA_709.sum() == pytest.approx(1.0, abs=1e-4)
-    assert color.luminance(np.ones(3, dtype=np.float32)) == pytest.approx(1.0, abs=1e-4)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ImportError) as exc:
+        require_cv2()
+    message = str(exc.value)
+    assert "python3-opencv" in message      # the Pi remedy
+    assert "[opencv]" in message            # the pip remedy
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run it and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_color.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'kodachrome.color'`
+Run: `.venv/bin/pytest tests/test_cv2_guard.py -q`
+Expected: FAIL, `ModuleNotFoundError: No module named 'kodachrome._cv2'`
 
-- [ ] **Step 3: Implement color.py**
+- [ ] **Step 3: Write `kodachrome/_cv2.py`**
 
 ```python
-"""Colour-space conversions shared by the trainer and the Pi runtime.
+"""One place that imports OpenCV, so one place explains how to install it.
 
-Why these spaces
-----------------
-* **sRGB** is what the camera delivers and what JPEGs store. Its transfer
-  curve is roughly gamma 2.2, so arithmetic on sRGB values does not model
-  light. Every function here expects sRGB in ``[0, 1]``.
-* **Linear RGB** is sRGB with the transfer curve removed. White balance and
-  exposure are multiplications of light, so ``normalize.py`` works here.
-* **Oklab** (Björn Ottosson, 2020) is a perceptual space: Euclidean distance
-  approximates perceived difference and hue angles are far more uniform
-  than in CIELAB, which bends visibly in the blues. The trainer computes
-  hue histograms, distribution transport and metrics in Oklab so that
-  "match the distribution" means "match what the eye sees".
-* **Oklch** is Oklab in polar form: lightness L, chroma C, hue h (radians,
-  from ``arctan2``, so in ``[-pi, pi]``).
+OpenCV is deliberately not a base dependency. On Raspberry Pi OS it comes
+from apt (`python3-opencv`), which is built with GTK so the preview window
+works; pip's `opencv-python-headless` wheel silently has no GUI. Everywhere
+else it arrives through the `[opencv]` extra, which `[train]` and `[dev]`
+both include.
 
-All functions accept arrays of shape ``(..., 3)`` and return ``float32``.
+A bare `ModuleNotFoundError: No module named 'cv2'` does not tell a user
+which of those two paths they are missing, so this guard does.
 """
 
 from __future__ import annotations
 
-import numpy as np
+from types import ModuleType
 
-# Oklab matrices from https://bottosson.github.io/posts/oklab/ (linear sRGB -> LMS -> Lab).
-_M1 = np.array(
-    [
-        [0.4122214708, 0.5363325363, 0.0514459929],
-        [0.2119034982, 0.6806995451, 0.1073969566],
-        [0.0883024619, 0.2817188376, 0.6299787005],
-    ],
-    dtype=np.float64,
+_MESSAGE = (
+    "OpenCV (cv2) is required but not installed.\n"
+    "  On Raspberry Pi OS:  sudo apt install python3-opencv\n"
+    "                       (then create the venv with --system-site-packages)\n"
+    "  Anywhere else:       pip install 'kodachrome-film[opencv]'\n"
+    "                       (already included by the [train] and [dev] extras)"
 )
-_M2 = np.array(
-    [
-        [0.2104542553, 0.7936177850, -0.0040720468],
-        [1.9779984951, -2.4285922050, 0.4505937099],
-        [0.0259040371, 0.7827717662, -0.8086757660],
-    ],
-    dtype=np.float64,
-)
-_M1_INV = np.linalg.inv(_M1)
-_M2_INV = np.linalg.inv(_M2)
-
-# Rec. 709 / sRGB luminance weights for linear RGB.
-LUMA_709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
-def srgb_to_linear(x: np.ndarray) -> np.ndarray:
-    """Remove the sRGB transfer curve. Input is clipped to [0, 1]."""
-    x = np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
-    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4).astype(np.float32)
-
-
-def linear_to_srgb(x: np.ndarray) -> np.ndarray:
-    """Apply the sRGB transfer curve. Input is clipped to [0, 1]."""
-    x = np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
-    return np.where(
-        x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055
-    ).astype(np.float32)
-
-
-def linear_to_oklab(rgb: np.ndarray) -> np.ndarray:
-    rgb = np.asarray(rgb, dtype=np.float64)
-    lms = np.cbrt(rgb @ _M1.T)
-    return (lms @ _M2.T).astype(np.float32)
-
-
-def oklab_to_linear(lab: np.ndarray) -> np.ndarray:
-    lab = np.asarray(lab, dtype=np.float64)
-    lms = (lab @ _M2_INV.T) ** 3
-    return (lms @ _M1_INV.T).astype(np.float32)
-
-
-def srgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
-    return linear_to_oklab(srgb_to_linear(rgb))
-
-
-def oklab_to_srgb(lab: np.ndarray) -> np.ndarray:
-    return linear_to_srgb(oklab_to_linear(lab))
-
-
-def oklab_to_lch(lab: np.ndarray) -> np.ndarray:
-    """Polar Oklab: (L, chroma, hue in radians)."""
-    lab = np.asarray(lab, dtype=np.float32)
-    a, b = lab[..., 1], lab[..., 2]
-    return np.stack([lab[..., 0], np.hypot(a, b), np.arctan2(b, a)], axis=-1).astype(np.float32)
-
-
-def lch_to_oklab(lch: np.ndarray) -> np.ndarray:
-    lch = np.asarray(lch, dtype=np.float32)
-    lum, chroma, hue = lch[..., 0], lch[..., 1], lch[..., 2]
-    return np.stack([lum, chroma * np.cos(hue), chroma * np.sin(hue)], axis=-1).astype(np.float32)
-
-
-def luminance(rgb_linear: np.ndarray) -> np.ndarray:
-    """Rec. 709 luminance of linear RGB."""
-    return np.asarray(rgb_linear, dtype=np.float32) @ LUMA_709
+def require_cv2() -> ModuleType:
+    """Import and return ``cv2``, or raise ``ImportError`` explaining both fixes."""
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - exercised via monkeypatch in tests
+        raise ImportError(_MESSAGE) from exc
+    return cv2
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Update `pyproject.toml`**
 
-Run: `.venv/bin/pytest tests/test_color.py -q`
-Expected: all pass. If `test_oklab_reference_values` fails by more than 1e-3, check the matrix transcription digit by digit against the article; do not loosen the tolerance.
+Replace the `[project.optional-dependencies]` block with:
 
-- [ ] **Step 5: Commit**
+```toml
+[project.optional-dependencies]
+opencv = ["opencv-python>=4.8"]
+train = ["scipy>=1.12", "requests>=2.31", "tqdm>=4.66", "opencv-python>=4.8"]
+dev = ["opencv-python>=4.8", "pytest>=7.4", "ruff>=0.4", "build>=1.0"]
+```
+
+and add package-data configuration after `[tool.setuptools.packages.find]`:
+
+```toml
+[tool.setuptools.package-data]
+kodachrome = ["data/*.cube", "data/*.json"]
+```
+
+- [ ] **Step 5: Create the package-data directory**
+
+```bash
+mkdir -p kodachrome/data && touch kodachrome/data/.gitkeep
+```
+
+- [ ] **Step 6: Run tests and lint**
+
+Run: `.venv/bin/pytest -q && .venv/bin/ruff check kodachrome tests`
+Expected: 12 passed (10 existing + 2 new), ruff clean.
+
+- [ ] **Step 7: Document and commit**
+
+In `README.md`, under Mac setup, add:
+
+````markdown
+OpenCV is not a base dependency: on the Pi it comes from apt, everywhere else
+from an extra. `pip install -e ".[train,dev]"` includes it. Installing the
+bare package and then importing a module that needs OpenCV raises an error
+naming both remedies.
+````
 
 ```bash
 .venv/bin/ruff check kodachrome tests
-git add kodachrome/color.py tests/test_color.py
-git commit -m "feat: sRGB, linear and Oklab colour conversions
+git add pyproject.toml kodachrome/_cv2.py kodachrome/data/.gitkeep tests/test_cv2_guard.py README.md
+git commit -m "fix: make [train] install a working trainer; add cv2 import guard
+
+pip install .[train] previously omitted OpenCV while five modules import it
+at module scope. Adds an [opencv] extra included by [train] and [dev], plus
+a single guarded import that names both the apt and pip remedies.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 3: Normalisation (`normalize.py`)
+### Task 4: Normalisation (`normalize.py`)
 
-Implements spec 5.2. This is the "dynamic" per-shot step.
+Implements spec 5.2. Adds validation and clamp reporting (F-12, F-16).
 
 **Files:**
 - Create: `kodachrome/normalize.py`, `tests/test_normalize.py`
 
 **Interfaces:**
-- Consumes: `color.srgb_to_linear`, `color.linear_to_srgb`, `color.LUMA_709`
+- Consumes: `color.srgb_to_linear`, `color.linear_to_srgb`, `color.LUMA_709`, `_cv2.require_cv2`
 - Produces:
-  - `@dataclass NormalizeParams` with fields exactly as spec 5.2, plus `from_dict(d)` (ignores unknown keys) and `to_dict()`
-  - `@dataclass Gains(wb: np.ndarray(3,), exposure: float)` with `.combined` property and `.to_dict()`
+  - `@dataclass NormalizeParams` with the spec 5.2 fields, validating `__post_init__`, `from_dict` (ignores unknown keys), `to_dict`
+  - `@dataclass Gains(wb: np.ndarray, exposure: float, clamped: dict[str, bool])` with `.combined` and `.to_dict()`
   - `compute_gains(rgb_float, params) -> Gains`
   - `apply_gains_float(rgb_float, gains) -> rgb_float`
   - `normalize_float(rgb_float, params) -> (rgb_float, Gains)`
@@ -447,11 +234,9 @@ from kodachrome.normalize import (
 
 
 def _gradient_image(h=48, w=64, cast=(1.0, 0.9, 0.75)):
-    """A smooth scene-like image with a warm cast, sRGB float32."""
     ramp = np.linspace(0.1, 0.9, w, dtype=np.float32)[None, :, None]
     rows = np.linspace(0.8, 1.2, h, dtype=np.float32)[:, None, None]
-    img = np.clip(ramp * rows * np.array(cast, dtype=np.float32), 0, 1)
-    return img.astype(np.float32)
+    return np.clip(ramp * rows * np.array(cast, dtype=np.float32), 0, 1).astype(np.float32)
 
 
 def test_params_from_dict_ignores_unknown_and_roundtrips():
@@ -461,23 +246,44 @@ def test_params_from_dict_ignores_unknown_and_roundtrips():
     assert NormalizeParams.from_dict(p.to_dict()) == p
 
 
+@pytest.mark.parametrize(
+    "kwargs, field",
+    [
+        ({"wb_gain_min": 2.0}, "wb_gain_min"),           # min above max
+        ({"exposure_gain_min": 0.0}, "exposure_gain_min"),  # not positive
+        ({"exposure_target_median": 1.5}, "exposure_target_median"),
+        ({"stats_lum_min": 0.95}, "stats_lum_min"),      # min above max
+        ({"wb_gain_max": float("nan")}, "wb_gain_max"),
+    ],
+)
+def test_invalid_params_name_the_field(kwargs, field):
+    with pytest.raises(ValueError, match=field):
+        NormalizeParams(**kwargs)
+
+
 def test_gains_combined_and_dict():
-    g = Gains(wb=np.array([1.0, 1.1, 1.2], dtype=np.float32), exposure=2.0)
+    g = Gains(
+        wb=np.array([1.0, 1.1, 1.2], dtype=np.float32),
+        exposure=2.0,
+        clamped={"wb": False, "exposure": True},
+    )
     assert np.allclose(g.combined, [2.0, 2.2, 2.4])
-    assert g.to_dict() == {"wb": [1.0, 1.1, 1.2], "exposure": 2.0}
+    assert g.to_dict() == {
+        "wb": [1.0, 1.1, 1.2],
+        "exposure": 2.0,
+        "clamped": {"wb": False, "exposure": True},
+    }
 
 
-def test_grey_world_neutralises_a_cast():
-    # Mild cast: the implied gains (about 0.83, 1.04, 1.33) stay inside the clamps,
-    # so grey-world can fully neutralise it. A stronger cast would clamp and stay tinted.
+def test_grey_world_neutralises_a_mild_cast():
+    # gains land near 0.83/1.04/1.33, inside the clamps, so the cast fully clears
     img = np.full((32, 32, 3), (0.5, 0.45, 0.4), dtype=np.float32)
     out, gains = normalize_float(img, NormalizeParams())
     assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)
     assert np.allclose(out[..., 1], out[..., 2], atol=1 / 255)
-    # median linear luminance lands on the 18% target
-    lin = color.srgb_to_linear(out)
-    assert np.median(color.luminance(lin)) == pytest.approx(0.18, abs=0.005)
+    assert np.median(color.luminance(color.srgb_to_linear(out))) == pytest.approx(0.18, abs=0.005)
     assert gains.wb[0] < 1.0 < gains.wb[2]
+    assert gains.clamped == {"wb": False, "exposure": False}
 
 
 def test_white_balance_can_be_disabled():
@@ -487,17 +293,19 @@ def test_white_balance_can_be_disabled():
     assert gains.exposure > 1.0
 
 
-def test_gains_are_clamped():
+def test_gains_are_clamped_and_report_it():
     p = NormalizeParams()
     dark = np.full((8, 8, 3), 0.02, dtype=np.float32)
-    assert compute_gains(dark, p).exposure == pytest.approx(p.exposure_gain_max)
+    g = compute_gains(dark, p)
+    assert g.exposure == pytest.approx(p.exposure_gain_max)
+    assert g.clamped["exposure"] is True
     bright = np.full((8, 8, 3), 0.95, dtype=np.float32)
-    # sRGB 0.95 is linear 0.89; the exposure gain would be 0.2, clamped to the minimum
     assert compute_gains(bright, p).exposure == pytest.approx(p.exposure_gain_min)
     red = np.full((8, 8, 3), (0.9, 0.1, 0.1), dtype=np.float32)
     g = compute_gains(red, p)
-    assert g.wb[1] == pytest.approx(p.wb_gain_max)
     assert g.wb[0] == pytest.approx(p.wb_gain_min)
+    assert g.wb[1] == pytest.approx(p.wb_gain_max)
+    assert g.clamped["wb"] is True
 
 
 def test_normalising_twice_is_stable():
@@ -516,58 +324,76 @@ def test_float_and_u8_paths_agree():
     out_u8, gains_u8 = normalize_u8(img_u8, p)
     assert out_u8.dtype == np.uint8 and out_u8.shape == img_u8.shape
     assert np.allclose(gains_f.combined, gains_u8.combined, atol=1e-6)
-    diff = np.abs(out_u8.astype(int) - np.round(out_f * 255).astype(int))
-    assert diff.max() <= 1
+    assert np.abs(out_u8.astype(int) - np.round(out_f * 255).astype(int)).max() <= 1
 
 
 def test_luts_are_monotone():
-    luts = gains_to_luts(Gains(wb=np.array([0.8, 1.0, 1.5], dtype=np.float32), exposure=1.3))
+    luts = gains_to_luts(
+        Gains(wb=np.array([0.8, 1.0, 1.5], dtype=np.float32), exposure=1.3,
+              clamped={"wb": False, "exposure": False})
+    )
     assert luts.shape == (3, 256) and luts.dtype == np.uint8
     assert np.all(np.diff(luts.astype(int), axis=1) >= 0)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_normalize.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'kodachrome.normalize'`
+Run: `.venv/bin/pytest tests/test_normalize.py -q` → FAIL, no module `kodachrome.normalize`.
 
-- [ ] **Step 3: Implement normalize.py**
+- [ ] **Step 3: Implement `normalize.py`**
 
 ```python
 """Per-image white balance and exposure normalisation.
 
 This is the "dynamic" half of the Kodachrome pipeline. The LUT fitted by the
-trainer expects input that has been brought to a neutral white point and a
-fixed exposure. Doing the same to every capture means the grade does not
-fight the scene lighting: a tungsten-lit room and a cloudy street both hit
-the LUT looking like the images it was fitted on. The trainer applies this
-exact code to the source corpus (``normalize_float``); the Pi applies the
-same maths through three 256-entry lookup tables (``normalize_u8``).
+trainer expects input at a neutral white point and a fixed exposure, so the
+same normalisation runs on every capture: a tungsten-lit room and a cloudy
+street both reach the LUT looking like the images it was fitted on. The
+trainer applies this exact code to the corpora (``normalize_float``); the Pi
+applies the same maths through three 256-entry lookup tables
+(``normalize_u8``).
 
-Why it can be three 1D tables
------------------------------
-White balance is a per-channel gain in linear light. Exposure is a scalar
-gain in linear light. Their product is one gain per channel, so the whole
-sRGB -> linear -> gain -> sRGB map is three independent monotone functions of
-one byte each. ``cv2.LUT`` applies that in milliseconds on a Pi 400.
+Why three 1D tables suffice
+---------------------------
+White balance is a per-channel gain in linear light and exposure is a scalar
+gain in linear light, so their composite sRGB-to-sRGB map is three
+independent monotone functions of one byte. ``cv2.LUT`` applies that in
+milliseconds on a Pi 400.
 
-Targets vs sources
-------------------
+Targets versus sources
+----------------------
 Kodachrome scans are normalised with ``white_balance=False``: the film's
 daylight balance and warm cast are part of the look being learned. Only the
 per-slide exposure lottery is removed.
+
+Reporting clamps
+----------------
+Both gains are clamped to sane ranges so a night shot is not amplified into
+daylight. When a clamp bites, the resulting image is *not* fully normalised,
+and the LUT then sees input it was not fitted on. ``Gains.clamped`` records
+that so the trainer can publish a clamp rate per corpus and the capture log
+can explain a shot that came out wrong, instead of the limit acting
+silently.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+import math
+from dataclasses import asdict, dataclass, field, fields
 
-import cv2
 import numpy as np
 
+from ._cv2 import require_cv2
 from .color import LUMA_709, linear_to_srgb, srgb_to_linear
 
+cv2 = require_cv2()
+
 _EPS = 1e-6
+
+
+def _check_finite(name: str, value: float) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
 
 
 @dataclass
@@ -580,6 +406,33 @@ class NormalizeParams:
     exposure_gain_max: float = 3.0
     stats_lum_min: float = 0.02
     stats_lum_max: float = 0.90
+
+    def __post_init__(self) -> None:
+        for f in fields(self):
+            if f.name != "white_balance":
+                _check_finite(f.name, getattr(self, f.name))
+        if self.wb_gain_min <= 0:
+            raise ValueError(f"wb_gain_min must be positive, got {self.wb_gain_min}")
+        if self.exposure_gain_min <= 0:
+            raise ValueError(f"exposure_gain_min must be positive, got {self.exposure_gain_min}")
+        if self.wb_gain_min >= self.wb_gain_max:
+            raise ValueError(
+                f"wb_gain_min ({self.wb_gain_min}) must be below wb_gain_max ({self.wb_gain_max})"
+            )
+        if self.exposure_gain_min >= self.exposure_gain_max:
+            raise ValueError(
+                f"exposure_gain_min ({self.exposure_gain_min}) must be below "
+                f"exposure_gain_max ({self.exposure_gain_max})"
+            )
+        if not 0.0 < self.exposure_target_median < 1.0:
+            raise ValueError(
+                f"exposure_target_median must be in (0, 1), got {self.exposure_target_median}"
+            )
+        if not 0.0 <= self.stats_lum_min < self.stats_lum_max <= 1.0:
+            raise ValueError(
+                f"stats_lum_min ({self.stats_lum_min}) must be below "
+                f"stats_lum_max ({self.stats_lum_max}), both within [0, 1]"
+            )
 
     @classmethod
     def from_dict(cls, d: dict) -> NormalizeParams:
@@ -596,15 +449,19 @@ class Gains:
 
     wb: np.ndarray
     exposure: float
+    clamped: dict = field(default_factory=lambda: {"wb": False, "exposure": False})
 
     @property
     def combined(self) -> np.ndarray:
-        return (np.asarray(self.wb, dtype=np.float32) * np.float32(self.exposure)).astype(np.float32)
+        return (np.asarray(self.wb, dtype=np.float32) * np.float32(self.exposure)).astype(
+            np.float32
+        )
 
     def to_dict(self) -> dict:
         return {
             "wb": [round(float(g), 4) for g in self.wb],
             "exposure": round(float(self.exposure), 4),
+            "clamped": dict(self.clamped),
         }
 
 
@@ -617,27 +474,27 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
         mask = np.ones_like(mask)
     sel = lin[mask]
 
+    wb_clamped = False
     if params.white_balance:
         means = np.maximum(sel.mean(axis=0), _EPS)
-        mean_lum = float(means @ LUMA_709)
-        wb = np.clip(mean_lum / means, params.wb_gain_min, params.wb_gain_max).astype(np.float32)
+        raw = float(means @ LUMA_709) / means
+        wb = np.clip(raw, params.wb_gain_min, params.wb_gain_max).astype(np.float32)
+        wb_clamped = bool(np.any(raw != wb))
     else:
         wb = np.ones(3, dtype=np.float32)
 
     median_lum = float(np.median((sel * wb) @ LUMA_709))
-    exposure = float(
-        np.clip(
-            params.exposure_target_median / max(median_lum, _EPS),
-            params.exposure_gain_min,
-            params.exposure_gain_max,
-        )
+    raw_exposure = params.exposure_target_median / max(median_lum, _EPS)
+    exposure = float(np.clip(raw_exposure, params.exposure_gain_min, params.exposure_gain_max))
+    return Gains(
+        wb=wb,
+        exposure=exposure,
+        clamped={"wb": wb_clamped, "exposure": raw_exposure != exposure},
     )
-    return Gains(wb=wb, exposure=exposure)
 
 
 def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
-    lin = srgb_to_linear(rgb) * gains.combined
-    return linear_to_srgb(np.clip(lin, 0.0, 1.0))
+    return linear_to_srgb(np.clip(srgb_to_linear(rgb) * gains.combined, 0.0, 1.0))
 
 
 def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
@@ -648,8 +505,7 @@ def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarra
 
 def gains_to_luts(gains: Gains) -> np.ndarray:
     """Bake the gains into three 256-entry uint8 tables, one per channel."""
-    ramp = np.arange(256, dtype=np.float32) / 255.0
-    lin = srgb_to_linear(ramp)
+    lin = srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
     luts = np.empty((3, 256), dtype=np.uint8)
     for c in range(3):
         out = linear_to_srgb(np.clip(lin * gains.combined[c], 0.0, 1.0))
@@ -660,41 +516,33 @@ def gains_to_luts(gains: Gains) -> np.ndarray:
 def normalize_u8(
     rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
 ) -> tuple[np.ndarray, Gains]:
-    """Fast path for the Pi. Statistics come from a strided subsample; the
-    tables are applied to every pixel with ``cv2.LUT``."""
+    """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
     h, w = rgb_u8.shape[:2]
     step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
-    small = rgb_u8[::step, ::step].astype(np.float32) / 255.0
-    gains = compute_gains(small, params)
-    luts = gains_to_luts(gains)
-    # A (256, 1, 3) array is a 256-entry, 3-channel table for cv2.LUT.
-    table = np.ascontiguousarray(luts.T).reshape(256, 1, 3)
-    out = cv2.LUT(np.ascontiguousarray(rgb_u8), table)
-    return out, gains
+    gains = compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)
+    table = np.ascontiguousarray(gains_to_luts(gains).T).reshape(256, 1, 3)
+    return cv2.LUT(np.ascontiguousarray(rgb_u8), table), gains
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_normalize.py -q`
-Expected: all pass. If `test_float_and_u8_paths_agree` shows a max diff of 2 or more, the cause is almost always the `cv2.LUT` table shape; check that `table.shape == (256, 1, 3)`.
+Run: `.venv/bin/pytest tests/test_normalize.py -q` → all pass. A max diff of 2 in `test_float_and_u8_paths_agree` almost always means the `cv2.LUT` table shape is wrong; it must be `(256, 1, 3)`.
 
-- [ ] **Step 5: Document the decision and commit**
-
-Append to `docs/decisions.md` nothing new (the 1D-lookup decision is already recorded). Commit:
+- [ ] **Step 5: Commit**
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/normalize.py tests/test_normalize.py
-git commit -m "feat: grey-world white balance and exposure normalisation with cv2.LUT fast path
+git commit -m "feat: white balance and exposure normalisation with validation and clamp reporting
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 4: 3D LUT (`lut.py`)
+### Task 5: 3D LUT (`lut.py`)
 
-Implements spec 5.3.
+Implements spec 5.3. Adds full validation and content hashing (F-12, F-14).
 
 **Files:**
 - Create: `kodachrome/lut.py`, `tests/test_lut.py`
@@ -702,7 +550,8 @@ Implements spec 5.3.
 **Interfaces:**
 - Produces:
   - `class CubeError(ValueError)`
-  - `@dataclass LUT3D(table: np.ndarray)` with `.size`, `LUT3D.identity(size=33)`, `.to_flat() -> (N³, 3)` red-fastest, `LUT3D.from_flat(flat, size)`, `.apply_numpy(rgb_float) -> rgb_float`, `.to_pillow() -> ImageFilter.Color3DLUT`, `.apply_pillow(rgb_u8, filt=None) -> rgb_u8`
+  - `@dataclass LUT3D(table)` with `.size`, `identity(size=33)`, `to_flat()`, `from_flat(flat, size)`, `apply_numpy(rgb_float)`, `to_pillow()`, `apply_pillow(rgb_u8, filt=None)`
+  - `sha1_hex(lut) -> str`
   - `read_cube(path) -> LUT3D`, `write_cube(lut, path, title="kodachrome")`
 
 - [ ] **Step 1: Write the failing tests**
@@ -712,7 +561,7 @@ Implements spec 5.3.
 import numpy as np
 import pytest
 
-from kodachrome.lut import LUT3D, CubeError, read_cube, write_cube
+from kodachrome.lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
 
 
 def _smooth_test_lut(n=17):
@@ -730,7 +579,7 @@ def test_identity_leaves_image_unchanged():
     rgb = np.random.default_rng(0).random((20, 30, 3), dtype=np.float32)
     assert np.allclose(lut.apply_numpy(rgb), rgb, atol=1e-6)
     u8 = (rgb * 255).round().astype(np.uint8)
-    # Pillow works in 16-bit fixed point, so allow one 8-bit level of rounding.
+    # Pillow stores the table in 16-bit fixed point, so allow one 8-bit level
     assert np.abs(lut.apply_pillow(u8).astype(int) - u8.astype(int)).max() <= 1
 
 
@@ -744,7 +593,7 @@ def test_flat_order_is_red_fastest():
     assert np.array_equal(LUT3D.from_flat(flat, 2).table, LUT3D.identity(2).table)
 
 
-def test_cube_roundtrip(tmp_path):
+def test_cube_roundtrip_and_domain_written(tmp_path):
     lut = _smooth_test_lut(9)
     path = tmp_path / "t.cube"
     write_cube(lut, path, title="test")
@@ -753,16 +602,25 @@ def test_cube_roundtrip(tmp_path):
     assert np.allclose(back.table, lut.table, atol=1e-6)
     text = path.read_text()
     assert text.startswith('TITLE "test"\nLUT_3D_SIZE 9\n')
+    assert "DOMAIN_MIN 0.0 0.0 0.0" in text and "DOMAIN_MAX 1.0 1.0 1.0" in text
 
 
 def test_numpy_and_pillow_agree():
     lut = _smooth_test_lut(17)
     u8 = np.random.default_rng(3).integers(0, 256, (40, 50, 3), dtype=np.uint8)
     ref = np.round(lut.apply_numpy(u8.astype(np.float32) / 255.0) * 255).astype(int)
-    got = lut.apply_pillow(u8).astype(int)
-    diff = np.abs(ref - got)
+    diff = np.abs(ref - lut.apply_pillow(u8).astype(int))
     assert diff.max() <= 1
     assert diff.mean() < 0.3
+
+
+def test_sha1_is_stable_and_content_sensitive():
+    a = sha1_hex(LUT3D.identity(9))
+    assert a == sha1_hex(LUT3D.identity(9))
+    assert len(a) == 40
+    tweaked = LUT3D.identity(9).table.copy()
+    tweaked[4, 4, 4, 0] += 0.01
+    assert sha1_hex(LUT3D(tweaked)) != a
 
 
 @pytest.mark.parametrize(
@@ -773,51 +631,77 @@ def test_numpy_and_pillow_agree():
         ("LUT_3D_SIZE 2\n" + "0 0 x\n" * 8, "line 2"),
         ("LUT_1D_SIZE 4\n", "1D"),
         ("0 0 0\n", "LUT_3D_SIZE"),
+        ("LUT_3D_SIZE 2\n" + "0 0 nan\n" * 8, "finite"),
+        ("LUT_3D_SIZE 2\n" + "0 0 2.0\n" * 8, "[0, 1]"),
+        ("LUT_3D_SIZE 2\nDOMAIN_MAX 2.0 2.0 2.0\n" + "0 0 0\n" * 8, "DOMAIN"),
     ],
 )
 def test_cube_errors(tmp_path, text, message):
     path = tmp_path / "bad.cube"
     path.write_text(text)
-    with pytest.raises(CubeError, match=message):
+    with pytest.raises(CubeError, match=re_escape(message)):
         read_cube(path)
 
 
-def test_table_validation():
-    with pytest.raises(ValueError):
-        LUT3D(np.zeros((3, 3, 2, 3), dtype=np.float32))
-    with pytest.raises(ValueError):
-        LUT3D(np.zeros((66, 66, 66, 3), dtype=np.float32))
+def re_escape(s):
+    import re
+
+    return re.escape(s)
+
+
+@pytest.mark.parametrize(
+    "table, message",
+    [
+        (np.zeros((3, 3, 2, 3), dtype=np.float32), "shape"),
+        (np.zeros((66, 66, 66, 3), dtype=np.float32), "2..65"),
+        (np.full((4, 4, 4, 3), np.nan, dtype=np.float32), "finite"),
+        (np.full((4, 4, 4, 3), 1.5, dtype=np.float32), "[0, 1]"),
+    ],
+)
+def test_table_validation(table, message):
+    with pytest.raises(ValueError, match=re_escape(message)):
+        LUT3D(table)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_lut.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'kodachrome.lut'`
+Run: `.venv/bin/pytest tests/test_lut.py -q` → FAIL, no module `kodachrome.lut`.
 
-- [ ] **Step 3: Implement lut.py**
+- [ ] **Step 3: Implement `lut.py`**
 
 ```python
 """3D colour lookup tables: the exported form of the Kodachrome look.
 
-A 3D LUT is a grid of N x N x N output colours indexed by the input colour.
-Colours between grid nodes are trilinearly interpolated. This module keeps
-the table in memory as ``table[r, g, b, channel]`` and knows two external
-conventions that both order the flat file **red fastest**:
+A 3D LUT is a grid of N x N x N output colours indexed by the input colour,
+with trilinear interpolation between nodes. The table is held in memory as
+``table[r, g, b, channel]``. Two external conventions both order the flat
+file **red fastest**:
 
-* The ``.cube`` format (Adobe / Resolve / everyone): ``LUT_3D_SIZE N`` then
-  N^3 lines ``r g b``; the first line is input (0,0,0), the second is input
-  (1/(N-1), 0, 0), and so on.
+* ``.cube`` (Adobe, Resolve, everyone): ``LUT_3D_SIZE N`` then N^3 lines
+  ``r g b``, the first being the output for input (0, 0, 0).
 * Pillow's ``ImageFilter.Color3DLUT``: "channels are changed first, then
-  first dimension, then second, then third", which is the same order.
+  first dimension, then second, then third" - the same order.
 
-``apply_numpy`` is the readable reference used in tests and the trainer.
-``apply_pillow`` is the C-implemented path used on the Pi (about 150 ms for a
-1080p frame on a Pi 400). Pillow stores the table in 16-bit fixed point, so
-the two paths can differ by one 8-bit level; tests allow exactly that.
+``apply_numpy`` is the readable reference used in tests and the trainer;
+``apply_pillow`` is the C path used on the Pi. Pillow stores the table in
+16-bit fixed point, so the two can differ by one 8-bit level.
+
+Validation
+----------
+Every invariant the rest of the code assumes is checked here rather than
+trusted: cubic shape, size 2..65 (Pillow's limits), all values finite and
+inside [0, 1]. ``read_cube`` also refuses a domain other than the unit cube,
+because the in-memory contract has no domain field - silently ignoring
+``DOMAIN_MIN``/``DOMAIN_MAX`` would misapply such a file.
+
+``sha1_hex`` identifies a LUT by content. ``params.json`` records it and
+``Artifacts.load`` verifies it, so a half-written artifact pair cannot load
+(see ``artifacts.py``).
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -839,6 +723,10 @@ class LUT3D:
             raise ValueError(f"LUT table must have shape (N, N, N, 3), got {t.shape}")
         if not 2 <= t.shape[0] <= 65:
             raise ValueError(f"LUT size must be in 2..65, got {t.shape[0]}")
+        if not np.isfinite(t).all():
+            raise ValueError("LUT table must be finite; found NaN or infinity")
+        if t.min() < 0.0 or t.max() > 1.0:
+            raise ValueError(f"LUT values must lie in [0, 1], got [{t.min()}, {t.max()}]")
         self.table = t
 
     @property
@@ -884,11 +772,18 @@ class LUT3D:
         flat = np.ascontiguousarray(self.to_flat().ravel(), dtype=np.float32)
         return ImageFilter.Color3DLUT(self.size, flat, channels=3)
 
-    def apply_pillow(self, rgb_u8: np.ndarray, filt: ImageFilter.Color3DLUT | None = None) -> np.ndarray:
+    def apply_pillow(
+        self, rgb_u8: np.ndarray, filt: ImageFilter.Color3DLUT | None = None
+    ) -> np.ndarray:
         """Fast path. Build ``filt`` once with ``to_pillow()`` when processing many frames."""
         filt = filt if filt is not None else self.to_pillow()
         im = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
         return np.asarray(im.filter(filt))
+
+
+def sha1_hex(lut: LUT3D) -> str:
+    """Content hash of the canonical flat table, used to identify an artifact."""
+    return hashlib.sha1(np.ascontiguousarray(lut.to_flat(), dtype=np.float32).tobytes()).hexdigest()
 
 
 def write_cube(lut: LUT3D, path: str | Path, title: str = "kodachrome") -> None:
@@ -902,9 +797,18 @@ def write_cube(lut: LUT3D, path: str | Path, title: str = "kodachrome") -> None:
     Path(path).write_text("\n".join(lines) + "\n")
 
 
+def _parse_triplet(parts: list[str], path: Path, lineno: int, key: str) -> tuple[float, ...]:
+    try:
+        return tuple(float(p) for p in parts)
+    except ValueError as exc:
+        raise CubeError(f"{path}: non-numeric {key} on line {lineno}") from exc
+
+
 def read_cube(path: str | Path) -> LUT3D:
     path = Path(path)
     size: int | None = None
+    domain_min = (0.0, 0.0, 0.0)
+    domain_max = (1.0, 1.0, 1.0)
     rows: list[list[float]] = []
     for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
         line = raw.strip()
@@ -923,7 +827,11 @@ def read_cube(path: str | Path) -> LUT3D:
             if not 2 <= size <= 65:
                 raise CubeError(f"{path}: LUT_3D_SIZE must be in 2..65, got {size} (line {lineno})")
             continue
-        if key in ("DOMAIN_MIN", "DOMAIN_MAX"):
+        if key == "DOMAIN_MIN":
+            domain_min = _parse_triplet(line.split()[1:], path, lineno, "DOMAIN_MIN")
+            continue
+        if key == "DOMAIN_MAX":
+            domain_max = _parse_triplet(line.split()[1:], path, lineno, "DOMAIN_MAX")
             continue
         parts = line.split()
         if len(parts) != 3:
@@ -936,27 +844,35 @@ def read_cube(path: str | Path) -> LUT3D:
         raise CubeError(f"{path}: missing LUT_3D_SIZE")
     if len(rows) != size**3:
         raise CubeError(f"{path}: expected {size**3} rows for LUT_3D_SIZE {size}, got {len(rows)}")
-    return LUT3D.from_flat(np.array(rows, dtype=np.float32), size)
+    if domain_min != (0.0, 0.0, 0.0) or domain_max != (1.0, 1.0, 1.0):
+        raise CubeError(
+            f"{path}: only the unit DOMAIN is supported, got MIN {domain_min} MAX {domain_max}"
+        )
+    table = np.array(rows, dtype=np.float32)
+    if not np.isfinite(table).all():
+        raise CubeError(f"{path}: table must be finite; found NaN or infinity")
+    if table.min() < 0.0 or table.max() > 1.0:
+        raise CubeError(f"{path}: values must lie in [0, 1], got [{table.min()}, {table.max()}]")
+    return LUT3D.from_flat(table, size)
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_lut.py -q`
-Expected: all pass. If Pillow raises `TypeError` about the table in `to_pillow`, replace `flat` with `flat.tolist()` and re-run; note the Pillow version in `docs/decisions.md`. If `test_numpy_and_pillow_agree` fails with a max diff of 2, inspect where: a single pixel at a grid boundary may be Pillow rounding; then loosen only `diff.max() <= 2` and record why in `docs/decisions.md`.
+Run: `.venv/bin/pytest tests/test_lut.py -q` → all pass. If `to_pillow` raises `TypeError` about the table, the installed Pillow wants a list: use `flat.tolist()` and note the Pillow version in `docs/decisions.md`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/lut.py tests/test_lut.py
-git commit -m "feat: LUT3D with .cube I/O, NumPy trilinear reference and Pillow fast path
+git commit -m "feat: LUT3D with .cube I/O, full validation and content hashing
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 5: Film grain (`grain.py`)
+### Task 6: Film grain (`grain.py`)
 
 Implements spec 5.4.
 
@@ -964,9 +880,7 @@ Implements spec 5.4.
 - Create: `kodachrome/grain.py`, `tests/test_grain.py`
 
 **Interfaces:**
-- Produces:
-  - `@dataclass GrainParams(strength=0.025, blur_sigma=0.7, enabled=True)` with `from_dict`, `to_dict`
-  - `add_grain(rgb_u8, params, rng: np.random.Generator | None = None) -> rgb_u8`
+- Produces: `@dataclass GrainParams(strength=0.025, blur_sigma=0.7, enabled=True)` with validating `__post_init__`, `from_dict`, `to_dict`; `add_grain(rgb_u8, params, rng=None) -> rgb_u8`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -985,20 +899,31 @@ def test_disabled_is_identity():
     assert out is not img
 
 
+@pytest.mark.parametrize(
+    "kwargs, field",
+    [
+        ({"strength": -0.1}, "strength"),
+        ({"blur_sigma": -1.0}, "blur_sigma"),
+        ({"strength": float("inf")}, "strength"),
+    ],
+)
+def test_invalid_params_name_the_field(kwargs, field):
+    with pytest.raises(ValueError, match=field):
+        GrainParams(**kwargs)
+
+
 def test_preserves_mean_luminance_and_adds_no_colour_bias():
     img = np.full((256, 256, 3), 128, dtype=np.uint8)
     out = add_grain(img, GrainParams(strength=0.05), rng=np.random.default_rng(1))
     assert out.dtype == np.uint8 and out.shape == img.shape
-    means = out.reshape(-1, 3).mean(axis=0)
-    assert np.allclose(means, 128, atol=0.5)
-    assert out.std() > 5  # grain is actually there
+    assert np.allclose(out.reshape(-1, 3).mean(axis=0), 128, atol=0.5)
+    assert out.std() > 5
 
 
 def test_strength_scales_noise():
     img = np.full((256, 256, 3), 128, dtype=np.uint8)
     lo = add_grain(img, GrainParams(strength=0.02), rng=np.random.default_rng(2))
     hi = add_grain(img, GrainParams(strength=0.06), rng=np.random.default_rng(2))
-    # mid-grey has envelope 1, so std in 8-bit units is about strength * 255
     assert lo[..., 1].std() == pytest.approx(0.02 * 255, rel=0.25)
     assert hi[..., 1].std() == pytest.approx(0.06 * 255, rel=0.25)
 
@@ -1022,39 +947,45 @@ def test_params_dict_roundtrip():
     assert GrainParams.from_dict({**p.to_dict(), "extra": 1}) == p
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_grain.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'kodachrome.grain'`
+Run: `.venv/bin/pytest tests/test_grain.py -q` → FAIL, no module `kodachrome.grain`.
 
-- [ ] **Step 3: Implement grain.py**
+- [ ] **Step 3: Implement `grain.py`**
 
 ```python
-"""Fine film grain added after the LUT.
+"""Fine film grain, added after the LUT.
 
 Kodachrome 25 and 64 were among the finest-grained colour films made, so the
 default here is subtle. The model is deliberately simple:
 
-* Noise is added to **luminance only** (the Y of YCrCb). Film grain is a
-  density variation of the dye layers seen together; chroma noise reads as a
-  digital sensor artefact, not grain.
-* The noise field is Gaussian-blurred by ``blur_sigma`` pixels and then
-  rescaled back to unit variance. Pixel-independent noise looks like ISO
-  noise; slightly correlated noise looks like grain clumps.
-* An envelope ``4 * Y * (1 - Y)`` scales the noise: zero at black and at
-  white, one at mid-grey. Real grain is least visible in the deepest shadows
-  and in fully exposed highlights.
+* Noise goes on **luminance only**. Film grain is a density variation of the
+  dye layers seen together; chroma noise reads as a digital sensor artefact.
+* The noise field is Gaussian-blurred by ``blur_sigma`` and renormalised to
+  unit variance. Pixel-independent noise looks like high-ISO noise;
+  slightly correlated noise looks like grain clumps.
+* An envelope ``4Y(1 - Y)`` scales it: zero at black and white, one at
+  mid-grey, because real grain is least visible in deep shadow and in fully
+  exposed highlights.
 
-``strength`` is the noise standard deviation in luminance units (0..1) at
-the mid-grey peak; 0.025 is about six 8-bit levels.
+``strength`` is the noise standard deviation in luminance units at the
+mid-grey peak; 0.025 is about six 8-bit levels.
+
+Reproducibility: ``add_grain`` takes an explicit generator. The capture app
+draws a seed per shot and records it, so a graded file can be regenerated
+from its original (spec 7.2).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, fields
 
-import cv2
 import numpy as np
+
+from ._cv2 import require_cv2
+
+cv2 = require_cv2()
 
 
 @dataclass
@@ -1062,6 +993,14 @@ class GrainParams:
     strength: float = 0.025
     blur_sigma: float = 0.7
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("strength", "blur_sigma"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if value < 0:
+                raise ValueError(f"{name} must not be negative, got {value}")
 
     @classmethod
     def from_dict(cls, d: dict) -> GrainParams:
@@ -1088,164 +1027,485 @@ def add_grain(
         noise /= max(float(noise.std()), 1e-6)
 
     envelope = 4.0 * luma * (1.0 - luma)
-    luma = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0)
-    ycc[..., 0] = luma * 255.0
-    ycc_u8 = np.clip(np.round(ycc), 0, 255).astype(np.uint8)
-    return cv2.cvtColor(ycc_u8, cv2.COLOR_YCrCb2RGB)
+    ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
+    return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8), cv2.COLOR_YCrCb2RGB)
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run and commit**
 
-Run: `.venv/bin/pytest tests/test_grain.py -q`
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
+Run: `.venv/bin/pytest tests/test_grain.py -q` → all pass.
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/grain.py tests/test_grain.py
-git commit -m "feat: luminance film grain with midtone envelope
+git commit -m "feat: luminance film grain with midtone envelope and validation
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 6: Pipeline, artifacts and the committed identity artifact
+### Task 7: Image I/O with colour management (`imageio.py`)
 
-Implements spec 5.5 and 5.6. After this task the Pi runtime has everything it needs except a camera; the LUT is identity until Task 16 trains it.
+Implements spec 5.5. Fixes F-10.
 
 **Files:**
-- Create: `kodachrome/pipeline.py`, `tests/test_pipeline.py`, `artifacts/kodachrome.cube`, `artifacts/params.json`
-- Modify: `README.md` (add "How it works")
+- Create: `kodachrome/imageio.py`, `tests/test_imageio.py`
 
 **Interfaces:**
-- Consumes: `LUT3D`, `read_cube`, `write_cube`, `NormalizeParams`, `normalize_u8`, `GrainParams`, `add_grain`
 - Produces:
-  - `PARAMS_VERSION = 1`, `class ArtifactsError(Exception)`
-  - `@dataclass Artifacts(lut, normalize, grain, training: dict, path: Path)` with `Artifacts.load(dir_path)`
-  - `write_params(dir_path, normalize, grain, lut_file="kodachrome.cube", training=None) -> Path`
-  - `class Pipeline(artifacts)` with `process(rgb_u8, *, grain=True, rng=None) -> (rgb_u8, info)` where `info == {"wb_gains": [r, g, b], "exposure_gain": float}`
+  - `IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}`
+  - `@dataclass ImageMeta(profile: str, oriented: bool, profile_error: str | None, width: int, height: int)`
+  - `load_rgb(path, *, colour_manage=True) -> (np.ndarray uint8, ImageMeta)`
+  - `save_jpeg(rgb_u8, path, quality=95, embed_srgb=True) -> Path`
+  - `list_images(dir_path) -> list[Path]`
+  - `srgb_profile() -> PIL.ImageCms.ImageCmsProfile` (cached)
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/test_pipeline.py`:
+`tests/test_imageio.py`:
+```python
+import numpy as np
+import pytest
+from PIL import Image, ImageCms
+
+from kodachrome.imageio import ImageMeta, list_images, load_rgb, save_jpeg, srgb_profile
+
+
+def test_save_and_load_roundtrip(tmp_path):
+    img = np.zeros((10, 20, 3), dtype=np.uint8)
+    img[..., 0] = 200  # red-dominant: proves channel order survives
+    out = save_jpeg(img, tmp_path / "nested" / "a.jpg", quality=100)
+    assert out.exists()
+    back, meta = load_rgb(out)
+    assert back.shape == (10, 20, 3) and back.dtype == np.uint8
+    assert back[..., 0].mean() > 150 and back[..., 2].mean() < 30
+    assert isinstance(meta, ImageMeta) and meta.width == 20 and meta.height == 10
+
+
+def test_saved_jpeg_carries_an_srgb_profile(tmp_path):
+    out = save_jpeg(np.full((8, 8, 3), 120, dtype=np.uint8), tmp_path / "p.jpg")
+    with Image.open(out) as im:
+        assert im.info.get("icc_profile")
+    _, meta = load_rgb(out)
+    assert "sRGB" in meta.profile or "embedded" in meta.profile
+
+
+def test_exif_orientation_is_applied(tmp_path):
+    # A 4x2 image tagged orientation=6 (rotate 90 CW on display) must come back 2x4.
+    base = Image.new("RGB", (4, 2), (10, 20, 30))
+    exif = base.getexif()
+    exif[274] = 6  # Orientation
+    path = tmp_path / "rot.jpg"
+    base.save(path, exif=exif)
+    arr, meta = load_rgb(path)
+    assert arr.shape[:2] == (4, 2)  # height, width swapped
+    assert meta.oriented is True
+
+
+def test_icc_profile_is_converted_not_ignored(tmp_path):
+    pixels = np.full((8, 8, 3), (200, 60, 60), dtype=np.uint8)
+    srgb_path = tmp_path / "srgb.jpg"
+    adobe_path = tmp_path / "adobe.jpg"
+    Image.fromarray(pixels).save(
+        srgb_path, icc_profile=ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
+    )
+    adobe = ImageCms.createProfile("sRGB")  # stand-in profile object
+    # Build a genuinely different profile: a wide-gamut synthetic one.
+    wide = ImageCms.createProfile("LAB")
+    Image.fromarray(pixels).save(adobe_path, icc_profile=ImageCms.ImageCmsProfile(wide).tobytes())
+
+    srgb_arr, srgb_meta = load_rgb(srgb_path)
+    wide_arr, wide_meta = load_rgb(adobe_path)
+    assert not np.array_equal(srgb_arr, wide_arr), "a non-sRGB profile must change the pixels"
+    assert wide_meta.profile_error is None
+    assert adobe is not None  # keep the import meaningful
+
+
+def test_malformed_profile_falls_back_and_reports(tmp_path):
+    path = tmp_path / "bad.jpg"
+    Image.fromarray(np.full((8, 8, 3), 90, dtype=np.uint8)).save(path, icc_profile=b"not-a-profile")
+    arr, meta = load_rgb(path)
+    assert arr.shape == (8, 8, 3)
+    assert meta.profile == "invalid"
+    assert meta.profile_error
+
+
+def test_colour_manage_can_be_disabled(tmp_path):
+    path = tmp_path / "x.jpg"
+    Image.fromarray(np.full((8, 8, 3), 90, dtype=np.uint8)).save(path)
+    arr, meta = load_rgb(path, colour_manage=False)
+    assert arr.shape == (8, 8, 3)
+    assert "assumed" in meta.profile
+
+
+def test_load_converts_modes(tmp_path):
+    Image.new("L", (8, 8), 77).save(tmp_path / "grey.png")
+    Image.new("RGBA", (8, 8), (1, 2, 3, 255)).save(tmp_path / "rgba.png")
+    assert load_rgb(tmp_path / "grey.png")[0].shape == (8, 8, 3)
+    assert load_rgb(tmp_path / "rgba.png")[0].shape == (8, 8, 3)
+
+
+def test_list_images_filters_and_sorts(tmp_path):
+    for name in ["b.JPG", "a.jpeg", "c.png", "notes.txt", "d.tif"]:
+        (tmp_path / name).write_bytes(b"")
+    assert [p.name for p in list_images(tmp_path)] == ["a.jpeg", "b.JPG", "c.png", "d.tif"]
+
+
+def test_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_rgb(tmp_path / "nope.jpg")
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `.venv/bin/pytest tests/test_imageio.py -q` → FAIL, no module `kodachrome.imageio`.
+
+- [ ] **Step 3: Implement `imageio.py`**
+
+```python
+"""Image file I/O, and the one place colour management happens.
+
+Every pixel that enters this project comes through ``load_rgb``, which does
+two things no other module should have to remember:
+
+**EXIF orientation.** A camera that was held sideways records the rotation
+as a tag rather than rotating the pixels. The trainer crops a fixed 6% from
+each edge, so an unoriented image gets the wrong edges cropped, and a
+portrait frame would be sampled as landscape. ``ImageOps.exif_transpose``
+resolves the tag into real pixel order.
+
+**ICC profiles.** The whole project is a colour measurement, so treating an
+Adobe RGB or ProPhoto scan as if it were sRGB would bake a systematic error
+into the learned look - the more so because the target corpus is archival
+scans whose colour management is part of what we are matching. When a
+profile is embedded, the image is converted to sRGB with ``ImageCms``. When
+none is present, sRGB is assumed, which is the web convention and correct
+for Commons JPEGs. When one is present but unreadable, sRGB is assumed and
+the failure is recorded rather than swallowed, so the report can count it.
+
+``ImageMeta`` travels with the pixels so the trainer can publish profile
+statistics: a corpus that is secretly half Adobe RGB should be visible, not
+silently averaged in.
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageCms, ImageOps
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+_EXIF_ORIENTATION_TAG = 274
+
+
+@dataclass
+class ImageMeta:
+    profile: str
+    oriented: bool
+    profile_error: str | None
+    width: int
+    height: int
+
+
+@lru_cache(maxsize=1)
+def srgb_profile():
+    """The sRGB profile used as the working space, built once."""
+    return ImageCms.createProfile("sRGB")
+
+
+def _describe(profile: ImageCms.ImageCmsProfile) -> str:
+    try:
+        return ImageCms.getProfileDescription(profile).strip() or "unnamed profile"
+    except Exception:  # noqa: BLE001 - a profile can be readable but have no description
+        return "unnamed profile"
+
+
+def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarray, ImageMeta]:
+    """Load an image as sRGB RGB uint8, applying EXIF orientation and ICC conversion."""
+    path = Path(path)
+    with Image.open(path) as im:
+        exif = im.getexif()
+        oriented = bool(exif.get(_EXIF_ORIENTATION_TAG, 1) not in (1, None))
+        im = ImageOps.exif_transpose(im)
+
+        raw_profile = im.info.get("icc_profile")
+        profile_name = "sRGB (assumed)"
+        profile_error: str | None = None
+
+        if raw_profile and colour_manage:
+            try:
+                src = ImageCms.ImageCmsProfile(io.BytesIO(raw_profile))
+                profile_name = _describe(src)
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im = ImageCms.profileToProfile(
+                    im, src, srgb_profile(), renderingIntent=0, outputMode="RGB"
+                )
+            except Exception as exc:  # noqa: BLE001 - any malformed profile falls back to sRGB
+                profile_name = "invalid"
+                profile_error = f"{type(exc).__name__}: {exc}"
+        elif raw_profile:
+            profile_name = "sRGB (assumed, colour management off)"
+
+        rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+    return rgb, ImageMeta(
+        profile=profile_name,
+        oriented=oriented,
+        profile_error=profile_error,
+        width=int(rgb.shape[1]),
+        height=int(rgb.shape[0]),
+    )
+
+
+def save_jpeg(
+    rgb_u8: np.ndarray, path: str | Path, quality: int = 95, embed_srgb: bool = True
+) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
+    kwargs = {}
+    if embed_srgb:
+        kwargs["icc_profile"] = ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
+    image.save(path, "JPEG", quality=quality, **kwargs)
+    return path
+
+
+def list_images(dir_path: str | Path) -> list[Path]:
+    return sorted(
+        p for p in Path(dir_path).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `.venv/bin/pytest tests/test_imageio.py -q` → all pass.
+
+If `test_icc_profile_is_converted_not_ignored` fails because the LAB stand-in profile is rejected by `profileToProfile`, replace the wide-gamut fixture with a synthetic RGB profile built by `ImageCms.createProfile("sRGB")` whose gamma differs, or load a real Adobe RGB profile if one exists on the machine. What the test must prove is that pixels tagged with a non-sRGB profile come out **different** from the same pixels tagged sRGB. Do not weaken it to merely asserting no exception. Record any fixture change in `docs/decisions.md`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+.venv/bin/ruff check kodachrome tests
+git add kodachrome/imageio.py tests/test_imageio.py
+git commit -m "feat: image I/O applying EXIF orientation and converting ICC profiles to sRGB
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: Artifacts: validation, packaged default, atomic publish (`artifacts.py`)
+
+Implements spec 5.6 and 5.8. Fixes F-03, F-07, F-12, F-17.
+
+**Files:**
+- Create: `kodachrome/artifacts.py`, `tests/test_artifacts.py`
+- Create: `kodachrome/data/kodachrome.cube`, `kodachrome/data/params.json` (identity placeholder)
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes: `LUT3D`, `read_cube`, `write_cube`, `sha1_hex`, `CubeError`, `NormalizeParams`, `GrainParams`
+- Produces:
+  - `PARAMS_VERSION = 2`, `class ArtifactsError(Exception)`
+  - `@dataclass Artifacts(lut, normalize, grain, training: dict, path: Path, lut_sha1: str)`
+  - `Artifacts.load(dir_path)`, `Artifacts.default()`, `Artifacts.resolve(dir_path | None)`
+  - `write_artifact(dir_path, lut, normalize, grain, training=None, lut_file="kodachrome.cube") -> Path`
+  - `publish(staging_dir, dest_dir) -> Path`
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_artifacts.py`:
 ```python
 import json
 
 import numpy as np
 import pytest
 
+from kodachrome.artifacts import (
+    PARAMS_VERSION,
+    Artifacts,
+    ArtifactsError,
+    publish,
+    write_artifact,
+)
 from kodachrome.grain import GrainParams
-from kodachrome.lut import LUT3D, write_cube
+from kodachrome.lut import LUT3D, sha1_hex, write_cube
 from kodachrome.normalize import NormalizeParams
-from kodachrome.pipeline import Artifacts, ArtifactsError, Pipeline, write_params
 
 
 @pytest.fixture
-def identity_artifacts(tmp_path):
-    write_cube(LUT3D.identity(9), tmp_path / "kodachrome.cube")
-    write_params(tmp_path, NormalizeParams(), GrainParams(), training={"note": "test"})
-    return tmp_path
+def staged(tmp_path):
+    d = tmp_path / "staging"
+    write_artifact(d, LUT3D.identity(9), NormalizeParams(), GrainParams(), training={"note": "t"})
+    return d
 
 
-def test_write_and_load_params(identity_artifacts):
-    data = json.loads((identity_artifacts / "params.json").read_text())
-    assert data["version"] == 1
-    assert data["lut_file"] == "kodachrome.cube"
-    art = Artifacts.load(identity_artifacts)
+def test_write_then_load(staged):
+    data = json.loads((staged / "params.json").read_text())
+    assert data["version"] == PARAMS_VERSION
+    assert data["lut_sha1"] == sha1_hex(LUT3D.identity(9))
+    art = Artifacts.load(staged)
     assert art.lut.size == 9
     assert art.normalize == NormalizeParams()
     assert art.grain == GrainParams()
-    assert art.training == {"note": "test"}
+    assert art.training == {"note": "t"}
+    assert art.lut_sha1 == data["lut_sha1"]
 
 
-def test_missing_params_is_clear_error(tmp_path):
+def test_missing_params_is_clear(tmp_path):
     with pytest.raises(ArtifactsError, match="params.json"):
         Artifacts.load(tmp_path)
 
 
-def test_bad_version_and_bad_json(tmp_path):
-    (tmp_path / "params.json").write_text('{"version": 99}')
-    with pytest.raises(ArtifactsError, match="version"):
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ("{not json", "JSON"),
+        ('{"version": 99}', "version"),
+        ('{"lut_file": "k.cube"}', "version"),
+        ('[1, 2, 3]', "object"),
+        ('{"version": 2, "normalize": 5}', "normalize"),
+        ('{"version": 2, "grain": "x"}', "grain"),
+    ],
+)
+def test_schema_rejections(tmp_path, payload, message):
+    (tmp_path / "params.json").write_text(payload)
+    with pytest.raises(ArtifactsError, match=message):
         Artifacts.load(tmp_path)
-    (tmp_path / "params.json").write_text("{not json")
-    with pytest.raises(ArtifactsError, match="JSON"):
+
+
+def test_missing_cube_is_clear(tmp_path):
+    (tmp_path / "params.json").write_text(json.dumps({"version": 2, "lut_file": "k.cube"}))
+    with pytest.raises(ArtifactsError, match="k.cube"):
         Artifacts.load(tmp_path)
 
 
-def test_missing_cube_is_clear_error(tmp_path):
-    write_params(tmp_path, NormalizeParams(), GrainParams())
-    with pytest.raises(ArtifactsError, match="kodachrome.cube"):
-        Artifacts.load(tmp_path)
+def test_lut_hash_mismatch_is_refused(staged):
+    data = json.loads((staged / "params.json").read_text())
+    data["lut_sha1"] = "0" * 40
+    (staged / "params.json").write_text(json.dumps(data))
+    with pytest.raises(ArtifactsError, match="sha1"):
+        Artifacts.load(staged)
 
 
-def test_process_shapes_and_info(identity_artifacts):
-    pipe = Pipeline(Artifacts.load(identity_artifacts))
-    frame = np.random.default_rng(0).integers(0, 256, (36, 64, 3), dtype=np.uint8)
-    out, info = pipe.process(frame, rng=np.random.default_rng(0))
-    assert out.shape == frame.shape and out.dtype == np.uint8
-    assert set(info) == {"wb_gains", "exposure_gain"}
-    assert len(info["wb_gains"]) == 3
+def test_packaged_default_loads_from_any_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    art = Artifacts.default()
+    assert art.lut.size >= 2
+    assert art.lut_sha1 == sha1_hex(art.lut)
 
 
-def test_grain_can_be_skipped(identity_artifacts):
-    pipe = Pipeline(Artifacts.load(identity_artifacts))
-    frame = np.full((36, 64, 3), 128, dtype=np.uint8)
-    no_grain, _ = pipe.process(frame, grain=False)
-    with_grain, _ = pipe.process(frame, grain=True, rng=np.random.default_rng(0))
-    assert no_grain.std() < with_grain.std()
+def test_resolve_prefers_the_override(staged, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert Artifacts.resolve(staged).lut.size == 9
+    assert Artifacts.resolve(None).path != staged
 
 
-def test_process_rejects_wrong_input(identity_artifacts):
-    pipe = Pipeline(Artifacts.load(identity_artifacts))
-    with pytest.raises(ValueError):
-        pipe.process(np.zeros((4, 4, 3), dtype=np.float32))
+def test_publish_moves_only_after_validation(staged, tmp_path):
+    dest = tmp_path / "live"
+    published = publish(staged, dest)
+    assert published == dest
+    assert (dest / "kodachrome.cube").exists() and (dest / "params.json").exists()
+    assert Artifacts.load(dest).lut.size == 9
+    assert not staged.exists()
 
 
-def test_committed_artifacts_load(repo_root):
-    art = Artifacts.load(repo_root / "artifacts")
-    assert art.lut.size == 33
+def test_publish_refuses_an_invalid_staging_dir_and_leaves_dest_untouched(tmp_path):
+    dest = tmp_path / "live"
+    write_artifact(dest, LUT3D.identity(5), NormalizeParams(), GrainParams())
+    before = (dest / "params.json").read_text()
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    write_cube(LUT3D.identity(9), bad / "kodachrome.cube")
+    (bad / "params.json").write_text(json.dumps({"version": 2, "lut_file": "kodachrome.cube",
+                                                 "lut_sha1": "0" * 40}))
+    with pytest.raises(ArtifactsError):
+        publish(bad, dest)
+    assert (dest / "params.json").read_text() == before
+    assert Artifacts.load(dest).lut.size == 5
+
+
+def test_publish_replaces_an_existing_artifact(tmp_path):
+    dest = tmp_path / "live"
+    write_artifact(dest, LUT3D.identity(5), NormalizeParams(), GrainParams())
+    staging = tmp_path / "new"
+    write_artifact(staging, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    publish(staging, dest)
+    assert Artifacts.load(dest).lut.size == 9
+
+
+def test_committed_default_is_loadable(repo_root):
+    art = Artifacts.load(repo_root / "kodachrome" / "data")
+    assert art.lut.size in (2, 9, 33)
+    assert np.isfinite(art.lut.table).all()
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_pipeline.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'kodachrome.pipeline'`
+Run: `.venv/bin/pytest tests/test_artifacts.py -q` → FAIL, no module `kodachrome.artifacts`.
 
-- [ ] **Step 3: Implement pipeline.py**
+- [ ] **Step 3: Implement `artifacts.py`**
 
 ```python
-"""The Kodachrome pipeline: normalise, apply the LUT, add grain.
+"""Loading, validating and publishing the trained artifact.
 
-``Artifacts`` is everything the trainer produced: the ``.cube`` LUT and
-``params.json`` holding the normalisation the LUT was fitted against, the
-grain settings and training provenance. ``Pipeline`` applies them in a
-fixed order to an RGB uint8 frame. The order matters: the LUT was fitted on
-normalised input, and grain is a property of the developed film so it goes
-on last.
+An artifact is a `.cube` LUT plus `params.json` holding the normalisation the
+LUT was fitted against, the grain settings, and training provenance. Three
+concerns live here.
 
-The same ``Pipeline`` serves the capture app (full frames), the live
-preview (small frames, ``grain=False``) and batch reprocessing.
+**Where the default comes from.** The shipped look is package data at
+``kodachrome/data/``, found with ``importlib.resources``. That makes every
+command work from any working directory and puts the look inside a built
+wheel. ``--artifacts DIR`` overrides it with a directory on disk.
+
+**Validating rather than trusting.** The JSON root must be an object with a
+known version; each section must be an object; the LUT file must exist,
+parse, and hash to the ``lut_sha1`` recorded beside it. That last check is
+what makes a mixed artifact impossible to load: if a training run wrote a
+new LUT and then failed before rewriting ``params.json``, the hashes
+disagree and loading fails loudly instead of grading with mismatched
+parameters.
+
+**Publishing atomically.** The trainer writes everything into a staging
+directory, this module loads and validates that directory, and only then is
+it moved into place with ``os.replace`` on the directory. A capture process
+reading concurrently sees either the whole old artifact or the whole new
+one.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
-import numpy as np
+from .grain import GrainParams
+from .lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
+from .normalize import NormalizeParams
 
-from .grain import GrainParams, add_grain
-from .lut import LUT3D, CubeError, read_cube
-from .normalize import NormalizeParams, normalize_u8
-
-PARAMS_VERSION = 1
+PARAMS_VERSION = 2
+DEFAULT_LUT_FILE = "kodachrome.cube"
 
 
 class ArtifactsError(Exception):
-    """Artifacts directory missing or invalid."""
+    """Artifact directory missing, incomplete or invalid."""
+
+
+def _require_object(value: object, name: str, path: Path) -> dict:
+    if not isinstance(value, dict):
+        raise ArtifactsError(f"{path}: '{name}' must be a JSON object, got {type(value).__name__}")
+    return value
 
 
 @dataclass
@@ -1255,6 +1515,7 @@ class Artifacts:
     grain: GrainParams
     training: dict
     path: Path
+    lut_sha1: str
 
     @classmethod
     def load(cls, dir_path: str | Path) -> Artifacts:
@@ -1262,54 +1523,261 @@ class Artifacts:
         params_path = path / "params.json"
         if not params_path.is_file():
             raise ArtifactsError(
-                f"{params_path} not found. Run kodachrome-train, or restore the committed "
-                "artifacts/ directory from git."
+                f"{params_path} not found. Run kodachrome-train, pass --artifacts DIR, "
+                "or reinstall the package to restore the bundled default."
             )
         try:
-            data = json.loads(params_path.read_text())
+            raw = json.loads(params_path.read_text())
         except json.JSONDecodeError as exc:
             raise ArtifactsError(f"{params_path} is not valid JSON: {exc}") from exc
-        version = data.get("version")
-        if version is None or version > PARAMS_VERSION:
+        if not isinstance(raw, dict):
+            raise ArtifactsError(f"{params_path}: top level must be a JSON object")
+
+        version = raw.get("version")
+        if not isinstance(version, int) or version > PARAMS_VERSION:
             raise ArtifactsError(
                 f"{params_path}: unsupported params version {version!r} "
                 f"(this build reads up to {PARAMS_VERSION})"
             )
-        lut_path = path / data.get("lut_file", "kodachrome.cube")
+
+        lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
         if not lut_path.is_file():
             raise ArtifactsError(f"LUT file {lut_path} not found (named in {params_path})")
         try:
             lut = read_cube(lut_path)
         except CubeError as exc:
             raise ArtifactsError(str(exc)) from exc
+
+        actual = sha1_hex(lut)
+        recorded = raw.get("lut_sha1")
+        if recorded is not None and recorded != actual:
+            raise ArtifactsError(
+                f"{path}: lut_sha1 in params.json ({recorded}) does not match {lut_path.name} "
+                f"({actual}). The artifact is mixed; re-run training or restore it."
+            )
+
+        try:
+            normalize = NormalizeParams.from_dict(_require_object(raw.get("normalize", {}), "normalize", params_path))
+            grain = GrainParams.from_dict(_require_object(raw.get("grain", {}), "grain", params_path))
+        except ValueError as exc:
+            raise ArtifactsError(f"{params_path}: {exc}") from exc
+
         return cls(
             lut=lut,
-            normalize=NormalizeParams.from_dict(data.get("normalize", {})),
-            grain=GrainParams.from_dict(data.get("grain", {})),
-            training=data.get("training", {}),
+            normalize=normalize,
+            grain=grain,
+            training=_require_object(raw.get("training", {}), "training", params_path),
             path=path,
+            lut_sha1=actual,
         )
 
+    @classmethod
+    def default(cls) -> Artifacts:
+        """The artifact shipped inside the package."""
+        with resources.as_file(resources.files("kodachrome.data")) as data_dir:
+            return cls.load(data_dir)
 
-def write_params(
+    @classmethod
+    def resolve(cls, dir_path: str | Path | None) -> Artifacts:
+        return cls.load(dir_path) if dir_path is not None else cls.default()
+
+
+def write_artifact(
     dir_path: str | Path,
+    lut: LUT3D,
     normalize: NormalizeParams,
     grain: GrainParams,
-    lut_file: str = "kodachrome.cube",
     training: dict | None = None,
+    lut_file: str = DEFAULT_LUT_FILE,
 ) -> Path:
+    """Write a complete artifact into ``dir_path`` (creating it) and return the directory."""
     path = Path(dir_path)
     path.mkdir(parents=True, exist_ok=True)
-    data = {
+    write_cube(lut, path / lut_file, title="kodachrome")
+    payload = {
         "version": PARAMS_VERSION,
         "lut_file": lut_file,
+        "lut_sha1": sha1_hex(lut),
         "normalize": normalize.to_dict(),
         "grain": grain.to_dict(),
         "training": training or {},
     }
-    out = path / "params.json"
-    out.write_text(json.dumps(data, indent=2) + "\n")
-    return out
+    (path / "params.json").write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
+def publish(staging_dir: str | Path, dest_dir: str | Path) -> Path:
+    """Validate ``staging_dir`` then replace ``dest_dir`` with it, atomically."""
+    staging = Path(staging_dir)
+    dest = Path(dest_dir)
+    Artifacts.load(staging)  # raises ArtifactsError before anything is moved
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if dest.exists():
+        backup = Path(tempfile.mkdtemp(prefix=f".{dest.name}.old.", dir=dest.parent))
+        os.rmdir(backup)
+        os.replace(dest, backup)
+    try:
+        os.replace(staging, dest)
+    except OSError:
+        if backup is not None:
+            os.replace(backup, dest)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+    return dest
+```
+
+- [ ] **Step 4: Create the packaged identity placeholder**
+
+```bash
+.venv/bin/python - <<'EOF'
+from kodachrome.artifacts import write_artifact
+from kodachrome.grain import GrainParams
+from kodachrome.lut import LUT3D
+from kodachrome.normalize import NormalizeParams
+
+write_artifact(
+    "kodachrome/data",
+    LUT3D.identity(33),
+    NormalizeParams(),
+    GrainParams(),
+    training={"note": "identity placeholder; replaced by Task 21", "proxy_source": True},
+)
+EOF
+ls -la kodachrome/data
+```
+Expected: `kodachrome.cube` (about 1 MB), `params.json`, and the existing `.gitkeep`.
+
+- [ ] **Step 5: Run the whole suite**
+
+Run: `.venv/bin/pytest -q` → all pass, including `test_committed_default_is_loadable`.
+
+- [ ] **Step 6: Document and commit**
+
+In `README.md`, add under "How it works":
+
+````markdown
+The look ships inside the package at `kodachrome/data/`, so every command
+works from any directory and a built wheel carries it. `--artifacts DIR`
+points at a directory instead, which is how you use a LUT you trained
+yourself. `params.json` records the normalisation, the grain settings, the
+LUT's SHA-1 and full training provenance; a LUT whose hash disagrees with
+its `params.json` is refused rather than silently graded with the wrong
+parameters.
+
+Until training has run, the bundled LUT is an identity placeholder and its
+`training.note` says so.
+````
+
+```bash
+.venv/bin/ruff check kodachrome tests
+git add kodachrome/artifacts.py tests/test_artifacts.py kodachrome/data README.md
+git commit -m "feat: artifact loading with schema and hash validation, packaged default, atomic publish
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: Pipeline (`pipeline.py`)
+
+Implements spec 5.7.
+
+**Files:**
+- Create: `kodachrome/pipeline.py`, `tests/test_pipeline.py`
+
+**Interfaces:**
+- Consumes: `Artifacts`, `normalize_u8`, `add_grain`
+- Produces: `class Pipeline(artifacts)` with `process(rgb_u8, *, grain=True, rng=None) -> (rgb_u8, info)` where `info` has keys `wb_gains`, `exposure_gain`, `clamped`, `lut_sha1`
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_pipeline.py`:
+```python
+import numpy as np
+import pytest
+
+from kodachrome.artifacts import Artifacts, write_artifact
+from kodachrome.grain import GrainParams
+from kodachrome.lut import LUT3D, sha1_hex
+from kodachrome.normalize import NormalizeParams
+from kodachrome.pipeline import Pipeline
+
+
+@pytest.fixture
+def pipeline(tmp_path):
+    write_artifact(tmp_path, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    return Pipeline(Artifacts.load(tmp_path))
+
+
+def test_process_shapes_and_info(pipeline):
+    frame = np.random.default_rng(0).integers(0, 256, (36, 64, 3), dtype=np.uint8)
+    out, info = pipeline.process(frame, rng=np.random.default_rng(0))
+    assert out.shape == frame.shape and out.dtype == np.uint8
+    assert set(info) == {"wb_gains", "exposure_gain", "clamped", "lut_sha1"}
+    assert len(info["wb_gains"]) == 3
+    assert info["lut_sha1"] == sha1_hex(LUT3D.identity(9))
+    assert set(info["clamped"]) == {"wb", "exposure"}
+
+
+def test_grain_can_be_skipped(pipeline):
+    frame = np.full((36, 64, 3), 128, dtype=np.uint8)
+    no_grain, _ = pipeline.process(frame, grain=False)
+    with_grain, _ = pipeline.process(frame, grain=True, rng=np.random.default_rng(0))
+    assert no_grain.std() < with_grain.std()
+
+
+def test_same_seed_reproduces_the_output(pipeline):
+    frame = np.full((32, 32, 3), 100, dtype=np.uint8)
+    a, _ = pipeline.process(frame, rng=np.random.default_rng(11))
+    b, _ = pipeline.process(frame, rng=np.random.default_rng(11))
+    assert np.array_equal(a, b)
+
+
+def test_process_rejects_wrong_input(pipeline):
+    with pytest.raises(ValueError):
+        pipeline.process(np.zeros((4, 4, 3), dtype=np.float32))
+    with pytest.raises(ValueError):
+        pipeline.process(np.zeros((4, 4), dtype=np.uint8))
+
+
+def test_disabled_grain_in_artifact_wins(tmp_path):
+    write_artifact(tmp_path, LUT3D.identity(9), NormalizeParams(), GrainParams(enabled=False))
+    pipe = Pipeline(Artifacts.load(tmp_path))
+    frame = np.full((32, 32, 3), 128, dtype=np.uint8)
+    out, _ = pipe.process(frame, grain=True, rng=np.random.default_rng(0))
+    assert out.std() < 1.0
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `.venv/bin/pytest tests/test_pipeline.py -q` → FAIL, no module `kodachrome.pipeline`.
+
+- [ ] **Step 3: Implement `pipeline.py`**
+
+```python
+"""The Kodachrome pipeline: normalise, apply the LUT, add grain.
+
+The order is fixed and matters. The LUT was fitted on normalised input, so
+normalisation comes first; grain is a property of the developed film, so it
+goes on last. The same ``Pipeline`` serves full-resolution captures, the
+low-resolution live preview (``grain=False``) and batch reprocessing, which
+is what guarantees the preview shows the grade the capture will get.
+
+``info`` returns the gains that were applied, whether either gain hit its
+clamp, and the LUT's content hash. The capture app writes all of it to its
+log so a surprising frame can be explained after the fact.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from .artifacts import Artifacts
+from .grain import add_grain
+from .normalize import normalize_u8
 
 
 class Pipeline:
@@ -1321,174 +1789,369 @@ class Pipeline:
         self, rgb_u8: np.ndarray, *, grain: bool = True, rng: np.random.Generator | None = None
     ) -> tuple[np.ndarray, dict]:
         if rgb_u8.dtype != np.uint8 or rgb_u8.ndim != 3 or rgb_u8.shape[2] != 3:
-            raise ValueError("process() expects an RGB uint8 array of shape (H, W, 3)")
+            raise ValueError(
+                f"process() expects an RGB uint8 array of shape (H, W, 3); "
+                f"got dtype {rgb_u8.dtype} shape {rgb_u8.shape}"
+            )
         normalised, gains = normalize_u8(rgb_u8, self.artifacts.normalize)
         graded = self.artifacts.lut.apply_pillow(normalised, self._filter)
         if grain and self.artifacts.grain.enabled:
             graded = add_grain(graded, self.artifacts.grain, rng)
-        info = {
+        return graded, {
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),
+            "clamped": dict(gains.clamped),
+            "lut_sha1": self.artifacts.lut_sha1,
         }
-        return graded, info
 ```
 
-- [ ] **Step 4: Generate the identity artifact**
+- [ ] **Step 4: Run and commit**
 
-```bash
-.venv/bin/python - <<'EOF'
-from kodachrome.grain import GrainParams
-from kodachrome.lut import LUT3D, write_cube
-from kodachrome.normalize import NormalizeParams
-from kodachrome.pipeline import write_params
-write_cube(LUT3D.identity(33), "artifacts/kodachrome.cube", title="identity placeholder")
-write_params("artifacts", NormalizeParams(), GrainParams(),
-             training={"note": "identity placeholder; not trained yet", "proxy_source": True})
-EOF
-ls -la artifacts
-```
-Expected: `kodachrome.cube` about 1 MB and `params.json`.
-
-- [ ] **Step 5: Run tests**
-
-Run: `.venv/bin/pytest -q`
-Expected: all pass, including `test_committed_artifacts_load`.
-
-- [ ] **Step 6: Document "How it works" in the README**
-
-Replace the `Status:` paragraph in `README.md` with:
-
-````markdown
-## How it works
-
-1. **Normalise.** Grey-world white balance and exposure-to-middle-grey,
-   computed in linear light and applied as three 256-entry lookups. Every
-   capture reaches the LUT with the same white point and exposure the LUT was
-   fitted on, so scene lighting does not fight the grade.
-2. **LUT.** A 33x33x33 colour lookup table (`artifacts/kodachrome.cube`)
-   learned from real Kodachrome scans, applied with Pillow's C implementation.
-3. **Grain.** Subtle luminance-only grain with a midtone envelope.
-
-`artifacts/params.json` records the normalisation targets, grain strength and
-how the LUT was trained. Until training has run, the committed LUT is an
-identity placeholder and its `training.note` says so.
-````
-
-- [ ] **Step 7: Commit**
+Run: `.venv/bin/pytest tests/test_pipeline.py -q` → all pass.
 
 ```bash
 .venv/bin/ruff check kodachrome tests
-git add kodachrome/pipeline.py tests/test_pipeline.py artifacts README.md
-git commit -m "feat: Artifacts loader, Pipeline, identity placeholder artifact
+git add kodachrome/pipeline.py tests/test_pipeline.py
+git commit -m "feat: Pipeline applying normalise, LUT and grain with audit info
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 7: Image file I/O (`imageio.py`)
+### Task 10: Batch reprocessing (`capture/batch.py`)
 
-Small shared helpers so RGB/BGR confusion cannot creep in: all file I/O goes through Pillow, which is RGB.
+Implements spec 7.3. Fixes F-11.
 
 **Files:**
-- Create: `kodachrome/imageio.py`, `tests/test_imageio.py`
+- Create: `kodachrome/capture/batch.py`, `tests/test_batch.py`
+- Modify: `README.md`
 
 **Interfaces:**
+- Consumes: `Artifacts`, `Pipeline`, `load_rgb`, `save_jpeg`, `list_images`
 - Produces:
-  - `IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}`
-  - `load_rgb(path) -> np.ndarray uint8 (H, W, 3)`
-  - `save_jpeg(rgb_u8, path, quality=95) -> Path` (creates parent dirs)
-  - `list_images(dir_path) -> list[Path]` sorted, matching extensions case-insensitively
+  - `GRADED_SUFFIXES = ("_kodachrome",)`, `SOURCE_SUFFIXES = ("_original", "_ungraded")`
+  - `select_inputs(paths, all_files=False) -> list[Path]`
+  - `output_path(src, out_dir, disambiguate: bool) -> Path`
+  - `process_dir(in_dir, out_dir, artifacts_dir=None, grain=True, all_files=False, overwrite=False) -> BatchResult`
+  - `@dataclass BatchResult(written: list[Path], skipped_graded: int, skipped_existing: int)`
+  - `main(argv=None) -> int`
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/test_imageio.py`:
+`tests/test_batch.py`:
 ```python
 import numpy as np
+import pytest
 
-from kodachrome.imageio import list_images, load_rgb, save_jpeg
-
-
-def test_save_and_load_roundtrip(tmp_path):
-    img = np.zeros((10, 20, 3), dtype=np.uint8)
-    img[..., 0] = 200  # red-dominant: proves channel order survives
-    out = save_jpeg(img, tmp_path / "nested" / "a.jpg", quality=100)
-    assert out.exists()
-    back = load_rgb(out)
-    assert back.shape == (10, 20, 3) and back.dtype == np.uint8
-    assert back[..., 0].mean() > 150 and back[..., 2].mean() < 30
+from kodachrome.capture.batch import main, output_path, process_dir, select_inputs
+from kodachrome.imageio import save_jpeg
 
 
-def test_load_converts_modes(tmp_path):
+def _img(seed=0):
+    return np.random.default_rng(seed).integers(0, 256, (24, 32, 3), dtype=np.uint8)
+
+
+def _capture_dir(tmp_path):
+    """Looks like a real capture folder: originals plus already-graded siblings."""
+    d = tmp_path / "shots"
+    d.mkdir()
+    for stem in ("120001", "120002"):
+        save_jpeg(_img(1), d / f"{stem}_original.jpg")
+        save_jpeg(_img(2), d / f"{stem}_kodachrome.jpg")
+    (d / "captures.jsonl").write_text("{}\n")
+    return d
+
+
+def test_select_inputs_prefers_originals_and_always_skips_graded(tmp_path):
+    d = _capture_dir(tmp_path)
+    chosen = [p.name for p in select_inputs(sorted(d.glob("*.jpg")))]
+    assert chosen == ["120001_original.jpg", "120002_original.jpg"]
+
+
+def test_select_inputs_all_still_skips_graded(tmp_path):
+    d = _capture_dir(tmp_path)
+    save_jpeg(_img(3), d / "loose.jpg")
+    chosen = [p.name for p in select_inputs(sorted(d.glob("*.jpg")), all_files=True)]
+    assert "loose.jpg" in chosen
+    assert not any("_kodachrome" in n for n in chosen)
+
+
+def test_plain_folder_processes_everything(tmp_path):
+    d = tmp_path / "plain"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
+    save_jpeg(_img(2), d / "b.jpg")
+    assert len(select_inputs(sorted(d.glob("*.jpg")))) == 2
+
+
+def test_capture_dir_is_not_double_graded(tmp_path):
+    d = _capture_dir(tmp_path)
+    result = process_dir(d, tmp_path / "out")
+    assert [p.name for p in result.written] == [
+        "120001_original_kodachrome.jpg",
+        "120002_original_kodachrome.jpg",
+    ]
+    assert result.skipped_graded == 2
+
+
+def test_same_stem_different_extensions_do_not_collide(tmp_path):
+    d = tmp_path / "in"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
     from PIL import Image
 
-    Image.new("L", (8, 8), 77).save(tmp_path / "grey.png")
-    Image.new("RGBA", (8, 8), (1, 2, 3, 255)).save(tmp_path / "rgba.png")
-    assert load_rgb(tmp_path / "grey.png").shape == (8, 8, 3)
-    assert load_rgb(tmp_path / "rgba.png").shape == (8, 8, 3)
+    Image.fromarray(_img(2)).save(d / "a.png")
+    written = {p.name for p in process_dir(d, tmp_path / "out").written}
+    assert written == {"a_jpg_kodachrome.jpg", "a_png_kodachrome.jpg"}
 
 
-def test_list_images_filters_and_sorts(tmp_path):
-    for name in ["b.JPG", "a.jpeg", "c.png", "notes.txt", "d.tif"]:
-        (tmp_path / name).write_bytes(b"")
-    assert [p.name for p in list_images(tmp_path)] == ["a.jpeg", "b.JPG", "c.png", "d.tif"]
+def test_output_path_without_disambiguation():
+    from pathlib import Path
+
+    assert output_path(Path("x/a.jpg"), Path("out"), False).name == "a_kodachrome.jpg"
+    assert output_path(Path("x/a.jpg"), Path("out"), True).name == "a_jpg_kodachrome.jpg"
+
+
+def test_existing_outputs_are_skipped_then_overwritten(tmp_path):
+    d = tmp_path / "in"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
+    out = tmp_path / "out"
+    first = process_dir(d, out)
+    assert len(first.written) == 1
+    second = process_dir(d, out)
+    assert second.written == [] and second.skipped_existing == 1
+    third = process_dir(d, out, overwrite=True)
+    assert len(third.written) == 1
+
+
+def test_nested_or_identical_output_is_refused(tmp_path):
+    d = tmp_path / "in"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
+    with pytest.raises(ValueError, match="inside"):
+        process_dir(d, d)
+    with pytest.raises(ValueError, match="inside"):
+        process_dir(d, d / "sub")
+
+
+def test_main_uses_the_packaged_default_from_any_cwd(tmp_path, monkeypatch, capsys):
+    d = tmp_path / "in"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
+    monkeypatch.chdir(tmp_path)
+    assert main([str(d), str(tmp_path / "out")]) == 0
+    assert "1 image" in capsys.readouterr().out
+
+
+def test_main_reports_empty_input(tmp_path, capsys):
+    (tmp_path / "in").mkdir()
+    assert main([str(tmp_path / "in"), str(tmp_path / "out")]) == 1
+    assert "no images" in capsys.readouterr().err.lower()
+
+
+def test_main_reports_bad_artifacts(tmp_path, capsys):
+    d = tmp_path / "in"
+    d.mkdir()
+    save_jpeg(_img(1), d / "a.jpg")
+    assert main([str(d), str(tmp_path / "out"), "--artifacts", str(tmp_path / "none")]) == 2
+    assert "params.json" in capsys.readouterr().err
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_imageio.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_batch.py -q` → FAIL, no module `kodachrome.capture.batch`.
 
-- [ ] **Step 3: Implement imageio.py**
+- [ ] **Step 3: Implement `batch.py`**
 
 ```python
-"""Image file I/O through Pillow so arrays are always RGB uint8."""
+"""``kodachrome-process``: regrade a folder of images with the current artifact.
+
+Two hazards make this more than a loop, and both come from the shape of a
+real capture folder, which holds ``<time>_original.jpg`` next to
+``<time>_kodachrome.jpg``:
+
+* **Double grading.** Feeding that folder to a naive globber grades the
+  already-graded files a second time. Files matching ``*_kodachrome.*`` are
+  therefore always skipped, and when a folder contains any ``_original`` or
+  ``_ungraded`` files, only those are processed unless ``--all`` is given.
+* **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
+  name, and re-running would silently overwrite. Same-stem inputs get their
+  extension folded into the output name, existing outputs are skipped unless
+  ``--overwrite``, and an output directory equal to or inside the input is
+  refused outright.
+"""
 
 from __future__ import annotations
 
+import argparse
+import sys
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
+from ..artifacts import Artifacts, ArtifactsError
+from ..imageio import list_images, load_rgb, save_jpeg
+from ..pipeline import Pipeline
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-
-
-def load_rgb(path: str | Path) -> np.ndarray:
-    with Image.open(path) as im:
-        return np.asarray(im.convert("RGB"), dtype=np.uint8)
+GRADED_SUFFIXES = ("_kodachrome",)
+SOURCE_SUFFIXES = ("_original", "_ungraded")
 
 
-def save_jpeg(rgb_u8: np.ndarray, path: str | Path, quality: int = 95) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB").save(path, "JPEG", quality=quality)
-    return path
+@dataclass
+class BatchResult:
+    written: list[Path] = field(default_factory=list)
+    skipped_graded: int = 0
+    skipped_existing: int = 0
 
 
-def list_images(dir_path: str | Path) -> list[Path]:
-    return sorted(
-        p for p in Path(dir_path).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+def _is_graded(path: Path) -> bool:
+    return any(path.stem.endswith(s) for s in GRADED_SUFFIXES)
+
+
+def _is_source(path: Path) -> bool:
+    return any(path.stem.endswith(s) for s in SOURCE_SUFFIXES)
+
+
+def select_inputs(paths: Sequence[Path], all_files: bool = False) -> list[Path]:
+    """Graded outputs are never inputs; capture folders default to their originals."""
+    candidates = [p for p in paths if not _is_graded(p)]
+    if all_files:
+        return candidates
+    sources = [p for p in candidates if _is_source(p)]
+    return sources if sources else candidates
+
+
+def output_path(src: Path, out_dir: Path, disambiguate: bool) -> Path:
+    stem = f"{src.stem}_{src.suffix.lstrip('.').lower()}" if disambiguate else src.stem
+    return Path(out_dir) / f"{stem}_kodachrome.jpg"
+
+
+def _check_directories(in_dir: Path, out_dir: Path) -> None:
+    in_res, out_res = in_dir.resolve(), out_dir.resolve()
+    if out_res == in_res or in_res in out_res.parents:
+        raise ValueError(
+            f"output directory {out_dir} is the same as, or inside, the input directory "
+            f"{in_dir}; choose a separate destination"
+        )
+
+
+def process_dir(
+    in_dir: str | Path,
+    out_dir: str | Path,
+    artifacts_dir: str | Path | None = None,
+    grain: bool = True,
+    all_files: bool = False,
+    overwrite: bool = False,
+) -> BatchResult:
+    in_dir, out_dir = Path(in_dir), Path(out_dir)
+    _check_directories(in_dir, out_dir)
+
+    every = list_images(in_dir)
+    chosen = select_inputs(every, all_files=all_files)
+    stems = [p.stem for p in chosen]
+    ambiguous = {s for s in stems if stems.count(s) > 1}
+
+    pipeline = Pipeline(Artifacts.resolve(artifacts_dir))
+    result = BatchResult(skipped_graded=sum(1 for p in every if _is_graded(p)))
+    for src in chosen:
+        dest = output_path(src, out_dir, disambiguate=src.stem in ambiguous)
+        if dest.exists() and not overwrite:
+            result.skipped_existing += 1
+            continue
+        rgb, _meta = load_rgb(src)
+        graded, _info = pipeline.process(rgb, grain=grain)
+        result.written.append(save_jpeg(graded, dest))
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="kodachrome-process",
+        description="Regrade a folder of images with the Kodachrome LUT.",
     )
+    parser.add_argument("in_dir", type=Path)
+    parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--artifacts", type=Path, default=None, help="artifact dir (default: bundled)")
+    parser.add_argument("--no-grain", action="store_true", help="skip film grain")
+    parser.add_argument("--all", action="store_true", help="process every image, not just originals")
+    parser.add_argument("--overwrite", action="store_true", help="replace existing outputs")
+    args = parser.parse_args(argv)
+
+    if not args.in_dir.is_dir() or not list_images(args.in_dir):
+        print(f"error: no images found in {args.in_dir}", file=sys.stderr)
+        return 1
+    t0 = time.perf_counter()
+    try:
+        result = process_dir(
+            args.in_dir,
+            args.out_dir,
+            args.artifacts,
+            grain=not args.no_grain,
+            all_files=args.all,
+            overwrite=args.overwrite,
+        )
+    except ArtifactsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    notes = []
+    if result.skipped_graded:
+        notes.append(f"{result.skipped_graded} already-graded skipped")
+    if result.skipped_existing:
+        notes.append(f"{result.skipped_existing} existing outputs kept (use --overwrite)")
+    suffix = f" ({', '.join(notes)})" if notes else ""
+    print(
+        f"Processed {len(result.written)} image(s) into {args.out_dir} "
+        f"in {time.perf_counter() - t0:.1f}s{suffix}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_imageio.py -q` → all pass.
+Run: `.venv/bin/pytest tests/test_batch.py -q` → all pass.
+
+- [ ] **Step 5: Document and commit**
+
+In `README.md` add:
+
+````markdown
+### Regrade a folder
+
+```bash
+kodachrome-process ~/Pictures/kodachrome/2026-09-03 /tmp/regraded
+```
+
+Pointed at a capture folder, it grades only the `*_original.jpg` files and
+skips the `*_kodachrome.jpg` siblings, so running it twice cannot
+double-grade. Pointed at any other folder it grades everything. Existing
+outputs are kept unless `--overwrite`; an output directory inside the input
+is refused. `--all` overrides the originals-only default.
+````
 
 ```bash
 .venv/bin/ruff check kodachrome tests
-git add kodachrome/imageio.py tests/test_imageio.py
-git commit -m "feat: RGB image file helpers
+git add kodachrome/capture/batch.py tests/test_batch.py README.md
+git commit -m "feat: kodachrome-process with double-grade and clobber safety
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 8: Camera access (`capture/camera.py`)
+### Task 11: Camera with byte-exact MJPEG (`capture/camera.py`)
 
-Implements spec 7.1. The real camera cannot be tested on the Mac; the fake must be a faithful stand-in and the real one must fail loudly and helpfully.
+Implements spec 7.1. Fixes F-02 and the acquisition half of F-08.
 
 **Files:**
 - Create: `kodachrome/capture/camera.py`, `tests/test_camera.py`
@@ -1496,51 +2159,99 @@ Implements spec 7.1. The real camera cannot be tested on the Mac; the fake must 
 **Interfaces:**
 - Produces:
   - `class CameraError(Exception)`
-  - `class Camera(Protocol)`: `read() -> np.ndarray` RGB uint8, `close() -> None`
-  - `synthetic_frame(height=1080, width=1920) -> np.ndarray` gradient plus colour patches
-  - `class FakeCamera(frames: list[np.ndarray] | None = None)` cycling through frames
-  - `parse_device(device: int | str | None) -> int | None` (`"/dev/video2"` → 2)
-  - `class V4L2Camera(device=None, width=1920, height=1080, fps=30, warmup_frames=15)` with `.width`, `.height`
+  - `@dataclass Frame(rgb: np.ndarray, jpeg: bytes | None, source: str)` where `source` is `"raw-mjpeg"` or `"decoded"`
+  - `@dataclass StreamInfo(width, height, fps, fourcc, raw_mjpeg: bool)` with `.to_dict()`
+  - `class Camera(Protocol)`: `read() -> Frame`, `.stream_info -> StreamInfo`, `close()`
+  - `is_valid_jpeg(buf: bytes) -> bool` — SOI/EOI marker check
+  - `synthetic_frame(height=1080, width=1920) -> np.ndarray`
+  - `class FakeCamera(frames=None, jpeg_bytes=None, source="decoded", stream_info=None)`
+  - `parse_device(device) -> int | str | None`
   - `list_video_devices() -> list[str]`
+  - `class V4L2Camera(device=None, width=1920, height=1080, fps=30, warmup_frames=15, prefer_raw=True)`
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_camera.py`:
 ```python
+import io
+
 import numpy as np
 import pytest
+from PIL import Image
 
 from kodachrome.capture.camera import (
     CameraError,
     FakeCamera,
+    Frame,
+    StreamInfo,
     V4L2Camera,
+    is_valid_jpeg,
     parse_device,
     synthetic_frame,
 )
 
 
-def test_synthetic_frame_shape_and_content():
+def _jpeg_bytes(rgb):
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, "JPEG", quality=95)
+    return buf.getvalue()
+
+
+def test_synthetic_frame_shape_and_colour():
     f = synthetic_frame(90, 160)
     assert f.shape == (90, 160, 3) and f.dtype == np.uint8
-    assert f[..., 0].mean() != f[..., 2].mean()  # has colour, not just grey
+    assert f[..., 0].mean() != f[..., 2].mean()
 
 
-def test_fake_camera_defaults_and_cycles():
+def test_is_valid_jpeg_markers():
+    good = _jpeg_bytes(synthetic_frame(16, 16))
+    assert is_valid_jpeg(good)
+    assert not is_valid_jpeg(good[:-2])        # truncated: no EOI
+    assert not is_valid_jpeg(b"\x00\x01" + good[2:])  # no SOI
+    assert not is_valid_jpeg(b"")
+    assert not is_valid_jpeg(b"\xff\xd8\xff\xd9")     # too short to be a frame
+
+
+def test_fake_camera_defaults_to_decoded_mode():
     cam = FakeCamera()
-    a = cam.read()
-    assert a.shape == (1080, 1920, 3) and a.dtype == np.uint8
-    frames = [np.zeros((4, 4, 3), np.uint8), np.ones((4, 4, 3), np.uint8)]
-    cam = FakeCamera(frames)
-    assert cam.read().max() == 0
-    assert cam.read().max() == 1
-    assert cam.read().max() == 0
-    cam.read()[0, 0, 0] = 99  # copies, so the stored frame is untouched
-    assert frames[0].max() == 0
+    frame = cam.read()
+    assert isinstance(frame, Frame)
+    assert frame.rgb.shape == (1080, 1920, 3) and frame.rgb.dtype == np.uint8
+    assert frame.jpeg is None and frame.source == "decoded"
+    assert isinstance(cam.stream_info, StreamInfo)
     cam.close()
 
 
+def test_fake_camera_raw_mode_returns_bytes_that_decode_to_the_frame():
+    rgb = synthetic_frame(48, 64)
+    data = _jpeg_bytes(rgb)
+    cam = FakeCamera(jpeg_bytes=[data], source="raw-mjpeg")
+    frame = cam.read()
+    assert frame.source == "raw-mjpeg"
+    assert frame.jpeg == data
+    decoded = np.asarray(Image.open(io.BytesIO(frame.jpeg)).convert("RGB"))
+    assert np.array_equal(frame.rgb, decoded), "rgb must be the decode of the same buffer"
+
+
+def test_fake_camera_cycles_and_copies():
+    frames = [np.zeros((4, 4, 3), np.uint8), np.ones((4, 4, 3), np.uint8)]
+    cam = FakeCamera(frames)
+    assert cam.read().rgb.max() == 0
+    assert cam.read().rgb.max() == 1
+    assert cam.read().rgb.max() == 0
+    cam.read().rgb[0, 0, 0] = 99
+    assert frames[0].max() == 0
+
+
 @pytest.mark.parametrize(
-    "value, expected", [(None, None), (3, 3), ("3", 3), ("/dev/video7", 7)]
+    "value, expected",
+    [
+        (None, None),
+        (3, 3),
+        ("3", 3),
+        ("/dev/video7", 7),
+        ("/dev/v4l/by-id/usb-Innomaker-video-index0", "/dev/v4l/by-id/usb-Innomaker-video-index0"),
+    ],
 )
 def test_parse_device(value, expected):
     assert parse_device(value) == expected
@@ -1554,50 +2265,129 @@ def test_parse_device_rejects_garbage():
 def test_v4l2_camera_reports_missing_device():
     with pytest.raises(CameraError, match="video"):
         V4L2Camera(device=99, warmup_frames=0)
+
+
+def test_stream_info_to_dict():
+    info = StreamInfo(width=1920, height=1080, fps=30.0, fourcc="MJPG", raw_mjpeg=True)
+    assert info.to_dict() == {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30.0,
+        "fourcc": "MJPG",
+        "raw_mjpeg": True,
+    }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_camera.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_camera.py -q` → FAIL, no module `kodachrome.capture.camera`.
 
-- [ ] **Step 3: Implement camera.py**
+- [ ] **Step 3: Implement `camera.py`**
 
 ```python
-"""Camera access for the Innomaker U20CAM-1080P-WDR (and a fake for tests).
+"""Camera access for the Innomaker U20CAM-1080P-WDR, plus a fake for tests.
 
 Facts from the vendor manual that shaped this module:
 
-* The camera is a standard UVC device; OpenCV's V4L2 backend drives it.
-* 1920x1080 at 30 fps is only available in MJPEG. YUY2 drops to 5 fps at
-  1080p, so the FOURCC is forced to ``MJPG``.
-* The camera runs its own auto exposure and white balance. They need a few
-  frames to settle after opening, hence ``warmup_frames``.
-* V4L2 queues frames. A single ``read()`` may return a stale frame, so
-  ``read()`` grabs twice and decodes the third.
+* Standard UVC device, driven through OpenCV's V4L2 backend.
+* 1920x1080 at 30 fps exists only in MJPEG; YUY2 falls to 5 fps at 1080p, so
+  the FOURCC is forced to ``MJPG``.
+* The camera runs its own auto exposure and white balance, which need a few
+  frames to settle after opening (``warmup_frames``). Version 1 records
+  those controls rather than locking them; see spec 7.5.
 
-Frames are returned as **RGB** uint8; the BGR->RGB swap happens here and
-nowhere else.
+Byte-exact originals
+--------------------
+The headline promise is that the camera's own JPEG is saved. ``read()``
+normally decodes MJPEG into BGR pixels, which would mean re-encoding a
+second lossy JPEG and calling it the original. Instead the camera asks the
+V4L2 backend for the compressed buffer with ``CAP_PROP_CONVERT_RGB = 0``,
+and then:
+
+* validates the buffer really is a complete JPEG (SOI at the front, EOI at
+  the end, and it decodes) - OpenCV issue #23311 shows the backend can hand
+  back truncated data on some devices;
+* returns those exact bytes as ``Frame.jpeg`` and the decode of *that same
+  buffer* as ``Frame.rgb``, so the saved original and the graded image
+  provably come from one acquisition.
+
+If raw mode is unsupported, or a buffer fails validation, the camera says so
+once and falls back to decoded mode for the rest of the session. The app
+then names its second file ``_ungraded.jpg`` rather than ``_original.jpg``,
+so a filename never claims more than the bytes deliver.
+
+Negotiation is verified, not assumed: FOURCC, size and rate are read back
+after being set, a mismatch is warned about naming both values, and the
+result is recorded in ``StreamInfo`` for the capture log.
 """
 
 from __future__ import annotations
 
 import glob
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
-import cv2
 import numpy as np
+
+from .._cv2 import require_cv2
+
+cv2 = require_cv2()
+
+_SOI = b"\xff\xd8"
+_EOI = b"\xff\xd9"
+_MIN_JPEG_BYTES = 128
 
 
 class CameraError(Exception):
     """Camera could not be opened or read."""
 
 
+@dataclass
+class StreamInfo:
+    width: int
+    height: int
+    fps: float
+    fourcc: str
+    raw_mjpeg: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "width": int(self.width),
+            "height": int(self.height),
+            "fps": round(float(self.fps), 2),
+            "fourcc": self.fourcc,
+            "raw_mjpeg": bool(self.raw_mjpeg),
+        }
+
+
+@dataclass
+class Frame:
+    rgb: np.ndarray
+    jpeg: bytes | None
+    source: str  # "raw-mjpeg" when jpeg holds the camera's own bytes, else "decoded"
+
+
 class Camera(Protocol):
-    def read(self) -> np.ndarray: ...
+    @property
+    def stream_info(self) -> StreamInfo: ...
+
+    def read(self) -> Frame: ...
 
     def close(self) -> None: ...
+
+
+def is_valid_jpeg(buf: bytes) -> bool:
+    """A complete JPEG: start-of-image marker, end-of-image marker, plausible length."""
+    return (
+        len(buf) >= _MIN_JPEG_BYTES and buf[:2] == _SOI and buf[-2:] == _EOI
+    )
+
+
+def _fourcc_to_str(value: float) -> str:
+    code = int(value)
+    return "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4)) if code else "----"
 
 
 def synthetic_frame(height: int = 1080, width: int = 1920) -> np.ndarray:
@@ -1620,32 +2410,60 @@ def synthetic_frame(height: int = 1080, width: int = 1920) -> np.ndarray:
 
 
 class FakeCamera:
-    def __init__(self, frames: list[np.ndarray] | None = None) -> None:
-        self._frames = frames if frames else [synthetic_frame()]
+    """Stands in for the hardware. Give it ``jpeg_bytes`` to exercise raw mode."""
+
+    def __init__(
+        self,
+        frames: list[np.ndarray] | None = None,
+        jpeg_bytes: list[bytes] | None = None,
+        source: str = "decoded",
+        stream_info: StreamInfo | None = None,
+    ) -> None:
+        self._jpegs = jpeg_bytes
+        if jpeg_bytes is not None:
+            self._frames = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes]
+            self._frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in self._frames]
+        else:
+            self._frames = frames if frames else [synthetic_frame()]
+        self._source = source
+        h, w = self._frames[0].shape[:2]
+        self._info = stream_info or StreamInfo(
+            width=w, height=h, fps=30.0, fourcc="MJPG", raw_mjpeg=source == "raw-mjpeg"
+        )
         self._i = 0
 
-    def read(self) -> np.ndarray:
-        frame = self._frames[self._i % len(self._frames)]
+    @property
+    def stream_info(self) -> StreamInfo:
+        return self._info
+
+    def read(self) -> Frame:
+        idx = self._i % len(self._frames)
         self._i += 1
-        return frame.copy()
+        jpeg = self._jpegs[idx % len(self._jpegs)] if self._jpegs else None
+        return Frame(rgb=self._frames[idx].copy(), jpeg=jpeg, source=self._source)
 
     def close(self) -> None:
         return None
 
 
-def parse_device(device: int | str | None) -> int | None:
-    if device is None:
-        return None
-    if isinstance(device, int):
+def parse_device(device: int | str | None) -> int | str | None:
+    """Accept an index, ``/dev/videoN``, or a stable ``/dev/v4l/by-id/...`` path."""
+    if device is None or isinstance(device, int):
         return device
-    m = re.fullmatch(r"(?:/dev/video)?(\d+)", device.strip())
+    text = device.strip()
+    if text.startswith("/dev/v4l/by-id/") or text.startswith("/dev/v4l/by-path/"):
+        return text
+    m = re.fullmatch(r"(?:/dev/video)?(\d+)", text)
     if not m:
-        raise CameraError(f"Cannot parse camera device {device!r}; use an index or /dev/videoN")
+        raise CameraError(
+            f"Cannot parse camera device {device!r}; use an index, /dev/videoN, "
+            "or a /dev/v4l/by-id/... path"
+        )
     return int(m.group(1))
 
 
 def list_video_devices() -> list[str]:
-    return sorted(glob.glob("/dev/video*"))
+    return sorted(glob.glob("/dev/video*")) + sorted(glob.glob("/dev/v4l/by-id/*"))
 
 
 class V4L2Camera:
@@ -1656,12 +2474,14 @@ class V4L2Camera:
         height: int = 1080,
         fps: int = 30,
         warmup_frames: int = 15,
+        prefer_raw: bool = True,
     ) -> None:
-        index = parse_device(device)
-        candidates = [index] if index is not None else list(range(10))
-        self.cap: cv2.VideoCapture | None = None
-        for idx in candidates:
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        target = parse_device(device)
+        candidates: list[int | str] = [target] if target is not None else list(range(10))
+        self.cap = None
+        chosen: int | str | None = None
+        for candidate in candidates:
+            cap = cv2.VideoCapture(candidate, cv2.CAP_V4L2)
             if not cap.isOpened():
                 cap.release()
                 continue
@@ -1672,31 +2492,87 @@ class V4L2Camera:
             ok, _ = cap.read()
             if ok:
                 self.cap = cap
+                chosen = candidate
                 break
             cap.release()
         if self.cap is None:
             found = list_video_devices()
             hint = f"found {', '.join(found)}" if found else "no /dev/video* devices exist"
             raise CameraError(
-                f"No camera delivered a frame (tried index {candidates[0]}"
+                f"No camera delivered a frame (tried {candidates[0]}"
                 + (f"..{candidates[-1]}" if len(candidates) > 1 else "")
-                + f"); {hint}. Pass --device N or /dev/videoN."
+                + f"); {hint}. Pass --device N, /dev/videoN or a /dev/v4l/by-id/ path."
             )
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if (self.width, self.height) != (width, height):
-            print(f"warning: camera negotiated {self.width}x{self.height}, not {width}x{height}")
+        print(f"Using camera {chosen}")
+
+        self._raw = self._enable_raw_mode() if prefer_raw else False
+        self.stream_info = self._negotiated(width, height, fps)
+        self._warned_fallback = False
         for _ in range(warmup_frames):
             self.cap.read()
 
-    def read(self) -> np.ndarray:
-        assert self.cap is not None
+    def _enable_raw_mode(self) -> bool:
+        """Ask the backend for the compressed buffer; verify by reading one frame."""
+        try:
+            if not self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0):
+                return False
+        except cv2.error:
+            return False
+        ok, buf = self.cap.read()
+        if not ok or buf is None or buf.ndim != 2 and buf.ndim != 1:
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            return False
+        if not is_valid_jpeg(np.asarray(buf, dtype=np.uint8).tobytes()):
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            return False
+        return True
+
+    def _negotiated(self, width: int, height: int, fps: int) -> StreamInfo:
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        fourcc = _fourcc_to_str(self.cap.get(cv2.CAP_PROP_FOURCC))
+        if (actual_w, actual_h) != (width, height):
+            print(f"warning: requested {width}x{height}, camera negotiated {actual_w}x{actual_h}")
+        if fourcc != "MJPG":
+            print(f"warning: requested MJPG, camera negotiated {fourcc}; 1080p30 may be unavailable")
+        if actual_fps and abs(actual_fps - fps) > 1.0:
+            print(f"warning: requested {fps} fps, camera reports {actual_fps:g} fps")
+        if not self._raw:
+            print("note: raw MJPEG unavailable; captures will be saved as re-encoded _ungraded.jpg")
+        return StreamInfo(actual_w, actual_h, actual_fps, fourcc, self._raw)
+
+    def _drain(self) -> None:
+        """Discard queued frames so the next read is the newest available."""
+        for _ in range(4):
+            if not self.cap.grab():
+                break
+
+    def _fallback_to_decoded(self, reason: str) -> None:
+        if not self._warned_fallback:
+            print(f"warning: {reason}; falling back to decoded frames (_ungraded.jpg)")
+            self._warned_fallback = True
+        self._raw = False
+        self.stream_info.raw_mjpeg = False
+        self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+
+    def read(self) -> Frame:
         for _ in range(3):
-            self.cap.grab()
-            self.cap.grab()
-            ok, frame = self.cap.read()
-            if ok and frame is not None:
-                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self._drain()
+            ok, data = self.cap.read()
+            if not ok or data is None:
+                continue
+            if self._raw:
+                buf = np.asarray(data, dtype=np.uint8).tobytes()
+                if not is_valid_jpeg(buf):
+                    self._fallback_to_decoded("camera returned an incomplete JPEG buffer")
+                    continue
+                bgr = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    self._fallback_to_decoded("camera buffer failed to decode")
+                    continue
+                return Frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), buf, "raw-mjpeg")
+            return Frame(cv2.cvtColor(data, cv2.COLOR_BGR2RGB), None, "decoded")
         raise CameraError("Failed to read a frame after 3 attempts")
 
     def close(self) -> None:
@@ -1705,279 +2581,243 @@ class V4L2Camera:
             self.cap = None
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_camera.py -q` → all pass. `test_v4l2_camera_reports_missing_device` must finish in under two seconds; if OpenCV prints a warning about the V4L2 backend on macOS that is fine.
+Run: `.venv/bin/pytest tests/test_camera.py -q` → all pass. `test_v4l2_camera_reports_missing_device` must finish in a couple of seconds; OpenCV printing a V4L2 backend warning on macOS is expected.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/capture/camera.py tests/test_camera.py
-git commit -m "feat: V4L2 camera wrapper forcing MJPEG 1080p, FakeCamera for tests
+git commit -m "feat: byte-exact MJPEG capture with validation, fallback and negotiation checks
+
+read() asks the V4L2 backend for the compressed buffer, validates SOI/EOI
+and the decode, and returns both the camera's own bytes and the decode of
+that same buffer. Invalid or unsupported raw mode falls back to decoded
+frames, which the app names _ungraded.jpg.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 9: Batch reprocessing (`capture/batch.py`, `kodachrome-process`)
+### Task 12: Capture app (`capture/app.py`)
 
-Implements spec 7.3. Also the easiest way to try the pipeline on the Mac with any folder of JPEGs.
-
-**Files:**
-- Create: `kodachrome/capture/batch.py`, `tests/test_batch.py`
-- Modify: `README.md` (Commands section: document `kodachrome-process`)
-
-**Interfaces:**
-- Consumes: `Artifacts`, `Pipeline`, `load_rgb`, `save_jpeg`, `list_images`
-- Produces: `process_dir(in_dir, out_dir, artifacts_dir, grain=True) -> list[Path]`, `main(argv=None) -> int`
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_batch.py`:
-```python
-import numpy as np
-
-from kodachrome.capture.batch import main, process_dir
-from kodachrome.imageio import save_jpeg
-
-
-def _make_inputs(dir_path, n=3):
-    dir_path.mkdir()
-    rng = np.random.default_rng(0)
-    for i in range(n):
-        save_jpeg(rng.integers(0, 256, (24, 32, 3), dtype=np.uint8), dir_path / f"img{i}.jpg")
-    (dir_path / "ignore.txt").write_text("x")
-
-
-def test_process_dir_writes_one_output_per_image(tmp_path, repo_root):
-    _make_inputs(tmp_path / "in")
-    outputs = process_dir(tmp_path / "in", tmp_path / "out", repo_root / "artifacts")
-    assert [p.name for p in outputs] == [
-        "img0_kodachrome.jpg",
-        "img1_kodachrome.jpg",
-        "img2_kodachrome.jpg",
-    ]
-    assert all(p.exists() for p in outputs)
-
-
-def test_main_returns_zero_and_prints_summary(tmp_path, repo_root, capsys):
-    _make_inputs(tmp_path / "in", n=2)
-    code = main(
-        [str(tmp_path / "in"), str(tmp_path / "out"), "--artifacts", str(repo_root / "artifacts")]
-    )
-    assert code == 0
-    assert "2 image" in capsys.readouterr().out
-
-
-def test_main_reports_missing_artifacts(tmp_path, capsys):
-    _make_inputs(tmp_path / "in", n=1)
-    code = main([str(tmp_path / "in"), str(tmp_path / "out"), "--artifacts", str(tmp_path / "none")])
-    assert code == 2
-    assert "params.json" in capsys.readouterr().err
-
-
-def test_main_reports_empty_input(tmp_path, repo_root, capsys):
-    (tmp_path / "in").mkdir()
-    code = main([str(tmp_path / "in"), str(tmp_path / "out"), "--artifacts", str(repo_root / "artifacts")])
-    assert code == 1
-    assert "no images" in capsys.readouterr().err.lower()
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `.venv/bin/pytest tests/test_batch.py -q`
-Expected: FAIL with `ModuleNotFoundError`
-
-- [ ] **Step 3: Implement batch.py**
-
-```python
-"""``kodachrome-process``: regrade a folder of images with the current artifacts.
-
-Use it to reprocess old originals after retraining, or to try the pipeline on
-the Mac without a camera.
-"""
-
-from __future__ import annotations
-
-import argparse
-import sys
-import time
-from pathlib import Path
-
-from ..imageio import list_images, load_rgb, save_jpeg
-from ..pipeline import Artifacts, ArtifactsError, Pipeline
-
-
-def process_dir(
-    in_dir: str | Path, out_dir: str | Path, artifacts_dir: str | Path, grain: bool = True
-) -> list[Path]:
-    pipeline = Pipeline(Artifacts.load(artifacts_dir))
-    out_dir = Path(out_dir)
-    outputs: list[Path] = []
-    for src in list_images(in_dir):
-        graded, _ = pipeline.process(load_rgb(src), grain=grain)
-        outputs.append(save_jpeg(graded, out_dir / f"{src.stem}_kodachrome.jpg"))
-    return outputs
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="kodachrome-process", description="Regrade a folder of images with the Kodachrome LUT."
-    )
-    parser.add_argument("in_dir", type=Path)
-    parser.add_argument("out_dir", type=Path)
-    parser.add_argument("--artifacts", type=Path, default=Path("artifacts"))
-    parser.add_argument("--no-grain", action="store_true", help="skip film grain")
-    args = parser.parse_args(argv)
-
-    if not args.in_dir.is_dir() or not list_images(args.in_dir):
-        print(f"error: no images found in {args.in_dir}", file=sys.stderr)
-        return 1
-    t0 = time.perf_counter()
-    try:
-        outputs = process_dir(args.in_dir, args.out_dir, args.artifacts, grain=not args.no_grain)
-    except ArtifactsError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    elapsed = time.perf_counter() - t0
-    print(f"Processed {len(outputs)} image(s) into {args.out_dir} in {elapsed:.1f}s")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-```
-
-- [ ] **Step 4: Run tests**
-
-Run: `.venv/bin/pytest tests/test_batch.py -q` → all pass.
-
-- [ ] **Step 5: Document and commit**
-
-In `README.md`, under the Commands table, add:
-
-````markdown
-### Regrade a folder
-
-```bash
-kodachrome-process ~/Pictures/kodachrome/2026-09-03 /tmp/regraded
-```
-
-Every `*_original.jpg` (or any JPEG/PNG) in the input folder is written to the
-output folder as `<name>_kodachrome.jpg` using the current `artifacts/`. Run
-this after retraining to bring old shots up to the new look.
-````
-
-```bash
-.venv/bin/ruff check kodachrome tests
-git add kodachrome/capture/batch.py tests/test_batch.py README.md
-git commit -m "feat: kodachrome-process batch regrading command
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-```
-
----
-
-### Task 10: Capture app (`capture/app.py`, `kodachrome-capture`)
-
-Implements spec 7.2 and the runtime rows of spec 8. The loops are separated from key reading and windowing so the whole flow is testable with `FakeCamera`.
+Implements spec 7.2. Fixes the runtime half of F-08, plus F-14 and F-15.
 
 **Files:**
 - Create: `kodachrome/capture/app.py`, `tests/test_app.py`
-- Modify: `README.md` (document `kodachrome-capture` and the output layout)
+- Modify: `README.md`
 
 **Interfaces:**
-- Consumes: `Camera`, `FakeCamera`, `V4L2Camera`, `CameraError`, `Artifacts`, `ArtifactsError`, `Pipeline`, `save_jpeg`
+- Consumes: `Camera`, `FakeCamera`, `V4L2Camera`, `CameraError`, `Frame`, `Artifacts`, `ArtifactsError`, `Pipeline`, `save_jpeg`
 - Produces:
-  - `@dataclass CaptureResult(original: Path, kodachrome: Path, info: dict, processing_ms: float)`
-  - `class CaptureSession(camera, pipeline, out_root, now=None)` with `capture() -> CaptureResult` and `preview_frame(graded=True, size=(640, 360)) -> np.ndarray`
-  - `run_headless_loop(session, read_key: Callable[[], str | None], out=print) -> int` (number of captures)
-  - `run_preview_loop(session, window_name=...) -> bool` (False if the OpenCV build has no GUI)
-  - `class TerminalKeys` context manager with `.read(timeout=0.1) -> str | None`
+  - `@dataclass CaptureResult(original: Path, kodachrome: Path, record: dict)`
+  - `class CaptureSession(camera, pipeline, out_root, now=None, seed_rng=None, package_version=...)` with `capture()` and `preview_frame(graded=True, size=(640, 360))`
+  - `run_headless_loop(session, read_key, out=print) -> int`
+  - `run_preview_loop(session, window_name=...) -> bool`
+  - `class TerminalKeys` context manager with `.read(timeout=0.1)`
   - `has_display() -> bool`, `main(argv=None) -> int`
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_app.py`:
 ```python
+import io
 import json
 from datetime import datetime
 
 import numpy as np
+import pytest
+from PIL import Image
 
-from kodachrome.capture.app import CaptureSession, main, run_headless_loop
-from kodachrome.capture.camera import FakeCamera, synthetic_frame
-from kodachrome.pipeline import Artifacts, Pipeline
+from kodachrome.artifacts import Artifacts, write_artifact
+from kodachrome.capture.app import CaptureSession, main, run_headless_loop, run_preview_loop
+from kodachrome.capture.camera import CameraError, FakeCamera, Frame, StreamInfo, synthetic_frame
+from kodachrome.grain import GrainParams
+from kodachrome.lut import LUT3D
+from kodachrome.normalize import NormalizeParams
+from kodachrome.pipeline import Pipeline
 
 
-def _session(tmp_path, repo_root, now=None):
-    pipeline = Pipeline(Artifacts.load(repo_root / "artifacts"))
-    camera = FakeCamera([synthetic_frame(90, 160)])
-    return CaptureSession(camera, pipeline, tmp_path / "shots", now=now)
+def _jpeg_bytes(rgb):
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, "JPEG", quality=95)
+    return buf.getvalue()
 
 
-def test_capture_writes_both_files_and_a_log_line(tmp_path, repo_root):
+@pytest.fixture
+def pipeline(tmp_path):
+    d = tmp_path / "art"
+    write_artifact(d, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    return Pipeline(Artifacts.load(d))
+
+
+def _session(tmp_path, pipeline, camera=None, now=None):
+    camera = camera or FakeCamera([synthetic_frame(90, 160)])
+    return CaptureSession(camera, pipeline, tmp_path / "shots", now=now,
+                          seed_rng=np.random.default_rng(0))
+
+
+def test_raw_mode_writes_the_camera_bytes_verbatim(tmp_path, pipeline):
+    rgb = synthetic_frame(48, 64)
+    data = _jpeg_bytes(rgb)
+    cam = FakeCamera(jpeg_bytes=[data], source="raw-mjpeg")
     fixed = datetime(2026, 9, 3, 21, 5, 7)
-    session = _session(tmp_path, repo_root, now=lambda: fixed)
-    result = session.capture()
-    day = tmp_path / "shots" / "2026-09-03"
-    assert result.original == day / "210507_original.jpg"
-    assert result.kodachrome == day / "210507_kodachrome.jpg"
-    assert result.original.exists() and result.kodachrome.exists()
-    assert result.processing_ms > 0
-    lines = (day / "captures.jsonl").read_text().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
-    assert record["original"] == "210507_original.jpg"
-    assert set(record) >= {"timestamp", "original", "kodachrome", "wb_gains", "exposure_gain", "processing_ms"}
+    result = _session(tmp_path, pipeline, cam, now=lambda: fixed).capture()
+    assert result.original.name == "210507_original.jpg"
+    assert result.original.read_bytes() == data, "the camera's own bytes must be saved unchanged"
+    assert result.record["frame_source"] == "raw-mjpeg"
 
 
-def test_same_second_captures_do_not_collide(tmp_path, repo_root):
+def test_decoded_mode_names_the_file_ungraded(tmp_path, pipeline):
     fixed = datetime(2026, 9, 3, 21, 5, 7)
-    session = _session(tmp_path, repo_root, now=lambda: fixed)
-    a = session.capture()
-    b = session.capture()
-    assert a.original.name == "210507_original.jpg"
-    assert b.original.name == "210507-2_original.jpg"
+    result = _session(tmp_path, pipeline, now=lambda: fixed).capture()
+    assert result.original.name == "210507_ungraded.jpg"
+    assert result.record["frame_source"] == "decoded"
 
 
-def test_preview_frame_is_small_rgb(tmp_path, repo_root):
-    session = _session(tmp_path, repo_root)
-    frame = session.preview_frame(graded=True)
-    assert frame.shape == (360, 640, 3) and frame.dtype == np.uint8
-    raw = session.preview_frame(graded=False)
-    assert raw.shape == (360, 640, 3)
+def test_both_outputs_come_from_one_acquisition(tmp_path, pipeline):
+    """A camera whose frames differ every read would produce mismatched files."""
+
+    class ChangingCamera:
+        stream_info = StreamInfo(64, 48, 30.0, "MJPG", False)
+
+        def __init__(self):
+            self.n = 0
+
+        def read(self):
+            self.n += 1
+            return Frame(np.full((48, 64, 3), self.n * 20, np.uint8), None, "decoded")
+
+        def close(self):
+            pass
+
+    cam = ChangingCamera()
+    result = _session(tmp_path, pipeline, cam).capture()
+    saved = np.asarray(Image.open(result.original).convert("RGB"))
+    assert cam.n == 1, "capture must read exactly one frame"
+    assert abs(int(saved.mean()) - 20) <= 2
 
 
-def test_headless_loop_captures_on_space_and_quits_on_q(tmp_path, repo_root):
-    session = _session(tmp_path, repo_root)
+def test_log_line_carries_full_provenance(tmp_path, pipeline):
+    fixed = datetime(2026, 9, 3, 21, 5, 7)
+    session = _session(tmp_path, pipeline, now=lambda: fixed)
+    session.capture()
+    line = json.loads((tmp_path / "shots" / "2026-09-03" / "captures.jsonl").read_text().strip())
+    assert set(line) >= {
+        "timestamp", "original", "kodachrome", "frame_source", "wb_gains", "exposure_gain",
+        "clamped", "grain_seed", "lut_sha1", "params_version", "package_version",
+        "width", "height", "fourcc", "fps", "pipeline_ms", "shutter_to_saved_ms",
+    }
+    assert line["shutter_to_saved_ms"] >= line["pipeline_ms"]
+    assert isinstance(line["grain_seed"], int)
+
+
+def test_recorded_seed_reproduces_the_graded_file(tmp_path, pipeline):
+    result = _session(tmp_path, pipeline).capture()
+    original = np.asarray(Image.open(result.original).convert("RGB"))
+    saved = np.asarray(Image.open(result.kodachrome).convert("RGB"))
+    again, _ = pipeline.process(original, rng=np.random.default_rng(result.record["grain_seed"]))
+    assert np.abs(again.astype(int) - saved.astype(int)).max() <= 2
+
+
+def test_same_second_captures_do_not_collide(tmp_path, pipeline):
+    fixed = datetime(2026, 9, 3, 21, 5, 7)
+    session = _session(tmp_path, pipeline, now=lambda: fixed)
+    a, b = session.capture(), session.capture()
+    assert a.original.name == "210507_ungraded.jpg"
+    assert b.original.name == "210507-2_ungraded.jpg"
+
+
+def test_preview_frame_is_small_rgb(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    assert session.preview_frame(graded=True).shape == (360, 640, 3)
+    assert session.preview_frame(graded=False).shape == (360, 640, 3)
+
+
+def test_headless_loop_captures_on_space_and_quits_on_q(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
     keys = iter([None, " ", "x", " ", "q"])
     messages = []
-    count = run_headless_loop(session, read_key=lambda: next(keys), out=messages.append)
-    assert count == 2
+    assert run_headless_loop(session, read_key=lambda: next(keys), out=messages.append) == 2
     assert len(list((tmp_path / "shots").rglob("*_kodachrome.jpg"))) == 2
     assert any("Saved" in m for m in messages)
 
 
-def test_main_headless_without_tty_exits_2(tmp_path, repo_root, capsys, monkeypatch):
+def test_headless_loop_survives_a_camera_error(tmp_path, pipeline):
+    class FlakyCamera(FakeCamera):
+        def read(self):
+            raise CameraError("boom")
+
+    session = _session(tmp_path, pipeline, FlakyCamera())
+    keys = iter([" ", "q"])
+    messages = []
+    assert run_headless_loop(session, read_key=lambda: next(keys), out=messages.append) == 0
+    assert any("boom" in m for m in messages)
+
+
+def test_preview_loop_falls_back_when_gui_is_unavailable(tmp_path, pipeline, monkeypatch):
+    import cv2
+
+    def boom(*a, **k):
+        raise cv2.error("no GUI support")
+
+    monkeypatch.setattr(cv2, "namedWindow", boom)
+    assert run_preview_loop(_session(tmp_path, pipeline)) is False
+
+
+def test_preview_loop_falls_back_when_imshow_fails(tmp_path, pipeline, monkeypatch):
+    import cv2
+
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", lambda *a, **k: (_ for _ in ()).throw(cv2.error("no GUI")))
+    assert run_preview_loop(_session(tmp_path, pipeline)) is False
+
+
+def test_preview_loop_survives_a_frame_error(tmp_path, pipeline, monkeypatch):
+    import cv2
+
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", lambda *a, **k: None)
+    keys = iter([ord("q")])
+    monkeypatch.setattr(cv2, "waitKey", lambda _n: next(keys))
+
+    session = _session(tmp_path, pipeline)
+    calls = {"n": 0}
+    real = session.preview_frame
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise CameraError("dropped frame")
+        return real(*a, **k)
+
+    monkeypatch.setattr(session, "preview_frame", flaky)
+    assert run_preview_loop(session) is True  # a dropped frame must not end the session
+
+
+def test_main_headless_without_tty_exits_2(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    code = main(["--fake", "--no-preview", "--out", str(tmp_path), "--artifacts", str(repo_root / "artifacts")])
+    code = main(["--fake", "--no-preview", "--out", str(tmp_path)])
     assert code == 2
     assert "terminal" in capsys.readouterr().err.lower()
 
 
-def test_main_reports_missing_artifacts(tmp_path, capsys):
+def test_main_reports_bad_artifacts(tmp_path, capsys):
     code = main(["--fake", "--no-preview", "--out", str(tmp_path), "--artifacts", str(tmp_path / "nope")])
     assert code == 2
     assert "params.json" in capsys.readouterr().err
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_app.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_app.py -q` → FAIL, no module `kodachrome.capture.app`.
 
-- [ ] **Step 3: Implement app.py**
+- [ ] **Step 3: Implement `app.py`**
 
 ```python
 """``kodachrome-capture``: live preview, press SPACE, get two JPEGs.
@@ -1986,23 +2826,39 @@ Structure
 ---------
 ``CaptureSession`` owns the camera, the pipeline and the output folder, and
 knows how to take one capture or produce one preview frame. Two thin loops
-drive it:
+drive it, both taking injectable key sources so the whole flow is testable
+with ``FakeCamera``:
 
-* ``run_preview_loop`` shows the graded live feed in an OpenCV window and
-  reads keys from it. Used when a display is present and the OpenCV build has
-  GUI support (apt ``python3-opencv`` on the Pi does; pip's headless wheel
-  does not).
-* ``run_headless_loop`` reads single keys from the terminal. Used when there
-  is no display, or as the fallback when the window cannot be created.
+* ``run_preview_loop`` draws the graded feed in an OpenCV window. Every GUI
+  call is inside the guard, because a build without GUI support can fail at
+  ``imshow`` rather than at ``namedWindow``, and a failure there must fall
+  back to headless rather than end the session.
+* ``run_headless_loop`` reads single keys from the terminal.
 
-Both take injectable key sources so tests can drive them with ``FakeCamera``.
+A dropped frame prints and continues in both loops. The spec promises the
+session survives frame read failures, and that promise is only worth
+anything if it also holds while the preview is running.
+
+Capture semantics
+-----------------
+``SPACE`` acquires one fresh frame and saves exactly that frame; the
+displayed frame is not re-used. ``capture()`` calls ``camera.read()`` once,
+so the saved original and the graded image always come from one acquisition.
 
 Output layout
 -------------
-``OUT/YYYY-MM-DD/HHMMSS_original.jpg`` and ``HHMMSS_kodachrome.jpg`` plus one
-JSON line per capture in ``OUT/YYYY-MM-DD/captures.jsonl`` recording the
-white balance and exposure gains that were applied and the processing time.
-When a shot looks wrong, that line says what the normaliser did to it.
+``OUT/YYYY-MM-DD/HHMMSS_original.jpg`` holds the camera's own JPEG bytes,
+written verbatim. When the camera could not supply them the file is named
+``_ungraded.jpg`` instead, so the name never overstates the contents.
+``HHMMSS_kodachrome.jpg`` is the graded version, and one JSON line per
+capture lands in ``captures.jsonl``.
+
+That line is an audit record, not a status message. It carries the grain
+seed and the LUT hash, which together let anyone regenerate the graded file
+from the original; the negotiated stream format, so a camera that quietly
+dropped to a different mode is visible; and two timings, because the
+pipeline cost and the time from shutter to durable file are different
+numbers and only the second is what the user waits for.
 """
 
 from __future__ import annotations
@@ -2020,12 +2876,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 import numpy as np
 
+from .. import __version__
+from .._cv2 import require_cv2
+from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
 from ..imageio import save_jpeg
-from ..pipeline import Artifacts, ArtifactsError, Pipeline
+from ..pipeline import Pipeline
 from .camera import Camera, CameraError, FakeCamera, V4L2Camera
+
+cv2 = require_cv2()
 
 DEFAULT_OUT = Path("~/Pictures/kodachrome")
 WINDOW_NAME = "Kodachrome  [SPACE capture | P toggle grade | Q quit]"
@@ -2035,8 +2895,7 @@ WINDOW_NAME = "Kodachrome  [SPACE capture | P toggle grade | Q quit]"
 class CaptureResult:
     original: Path
     kodachrome: Path
-    info: dict
-    processing_ms: float
+    record: dict
 
 
 class CaptureSession:
@@ -2046,54 +2905,77 @@ class CaptureSession:
         pipeline: Pipeline,
         out_root: str | Path,
         now: Callable[[], datetime] | None = None,
+        seed_rng: np.random.Generator | None = None,
+        package_version: str = __version__,
     ) -> None:
         self.camera = camera
         self.pipeline = pipeline
         self.out_root = Path(out_root).expanduser()
         self._now = now or datetime.now
+        self._seed_rng = seed_rng or np.random.default_rng()
+        self._package_version = package_version
 
-    def _allocate_paths(self) -> tuple[Path, str, datetime]:
+    def _allocate(self, suffix: str) -> tuple[Path, str, datetime]:
         t = self._now()
         day_dir = self.out_root / t.strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         base = t.strftime("%H%M%S")
         stem, k = base, 1
-        while (day_dir / f"{stem}_original.jpg").exists():
+        while (day_dir / f"{stem}_{suffix}.jpg").exists():
             k += 1
             stem = f"{base}-{k}"
         return day_dir, stem, t
 
     def capture(self) -> CaptureResult:
+        shutter = time.perf_counter()
         frame = self.camera.read()
+
+        seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
-        graded, info = self.pipeline.process(frame)
-        processing_ms = (time.perf_counter() - t0) * 1000.0
-        day_dir, stem, t = self._allocate_paths()
-        original = save_jpeg(frame, day_dir / f"{stem}_original.jpg")
+        graded, info = self.pipeline.process(frame.rgb, rng=np.random.default_rng(seed))
+        pipeline_ms = (time.perf_counter() - t0) * 1000.0
+
+        suffix = "original" if frame.jpeg is not None else "ungraded"
+        day_dir, stem, t = self._allocate(suffix)
+        original = day_dir / f"{stem}_{suffix}.jpg"
+        if frame.jpeg is not None:
+            original.write_bytes(frame.jpeg)
+        else:
+            save_jpeg(frame.rgb, original)
         kodachrome = save_jpeg(graded, day_dir / f"{stem}_kodachrome.jpg")
+        shutter_to_saved_ms = (time.perf_counter() - shutter) * 1000.0
+
         record = {
             "timestamp": t.isoformat(timespec="seconds"),
             "original": original.name,
             "kodachrome": kodachrome.name,
+            "frame_source": frame.source,
             **info,
-            "processing_ms": round(processing_ms, 1),
+            "grain_seed": seed,
+            "params_version": PARAMS_VERSION,
+            "package_version": self._package_version,
+            **self.camera.stream_info.to_dict(),
+            "pipeline_ms": round(pipeline_ms, 1),
+            "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
         }
         with (day_dir / "captures.jsonl").open("a") as fh:
             fh.write(json.dumps(record) + "\n")
-        return CaptureResult(original, kodachrome, info, processing_ms)
+        return CaptureResult(original, kodachrome, record)
 
     def preview_frame(self, graded: bool = True, size: tuple[int, int] = (640, 360)) -> np.ndarray:
-        frame = self.camera.read()
-        small = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        small = cv2.resize(self.camera.read().rgb, size, interpolation=cv2.INTER_AREA)
         if graded:
             small, _ = self.pipeline.process(small, grain=False)
         return small
 
 
 def _announce(result: CaptureResult, out: Callable[[str], None]) -> None:
+    r = result.record
+    clamps = [k for k, v in r["clamped"].items() if v]
+    note = f" (clamped: {', '.join(clamps)})" if clamps else ""
     out(
-        f"Saved {result.kodachrome.name} (+ original) in {result.processing_ms:.0f} ms; "
-        f"wb={result.info['wb_gains']} exposure={result.info['exposure_gain']}"
+        f"Saved {result.kodachrome.name} + {result.original.name} in "
+        f"{r['shutter_to_saved_ms']:.0f} ms; wb={r['wb_gains']} exposure={r['exposure_gain']}{note}"
     )
 
 
@@ -2119,7 +3001,7 @@ def run_headless_loop(
 
 
 def run_preview_loop(session: CaptureSession, window_name: str = WINDOW_NAME) -> bool:
-    """Returns False if OpenCV cannot open a window (headless build)."""
+    """Run the windowed loop. Returns False if this build cannot show a window."""
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     except cv2.error:
@@ -2127,9 +3009,15 @@ def run_preview_loop(session: CaptureSession, window_name: str = WINDOW_NAME) ->
     graded = True
     try:
         while True:
-            frame = session.preview_frame(graded)
-            cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            key = cv2.waitKey(1) & 0xFF
+            try:
+                frame = session.preview_frame(graded)
+                cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                key = cv2.waitKey(1) & 0xFF
+            except CameraError as exc:
+                print(f"error: {exc}")
+                continue
+            except cv2.error:
+                return False
             if key == ord(" "):
                 try:
                     _announce(session.capture(), print)
@@ -2140,7 +3028,10 @@ def run_preview_loop(session: CaptureSession, window_name: str = WINDOW_NAME) ->
             elif key in (ord("q"), ord("Q"), 27):
                 return True
     finally:
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
 
 
 class TerminalKeys:
@@ -2168,17 +3059,19 @@ def has_display() -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="kodachrome-capture", description="Capture Kodachrome-graded photos from the U20CAM."
+        prog="kodachrome-capture",
+        description="Capture Kodachrome-graded photos from the U20CAM.",
     )
-    parser.add_argument("--device", default=None, help="camera index or /dev/videoN (default: probe)")
-    parser.add_argument("--artifacts", type=Path, default=Path("artifacts"))
+    parser.add_argument("--device", default=None, help="index, /dev/videoN or /dev/v4l/by-id/...")
+    parser.add_argument("--artifacts", type=Path, default=None, help="artifact dir (default: bundled)")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--no-preview", action="store_true", help="never open a window")
-    parser.add_argument("--fake", action="store_true", help="use a synthetic camera (no hardware)")
+    parser.add_argument("--fake", action="store_true", help="synthetic camera, no hardware")
+    parser.add_argument("--seed", type=int, default=None, help="seed the grain seed generator")
     args = parser.parse_args(argv)
 
     try:
-        pipeline = Pipeline(Artifacts.load(args.artifacts))
+        pipeline = Pipeline(Artifacts.resolve(args.artifacts))
     except ArtifactsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -2188,7 +3081,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    session = CaptureSession(camera, pipeline, args.out)
+    session = CaptureSession(
+        camera,
+        pipeline,
+        args.out,
+        seed_rng=np.random.default_rng(args.seed),
+    )
     try:
         if not args.no_preview and has_display():
             if run_preview_loop(session):
@@ -2212,78 +3110,94 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/pytest tests/test_app.py -q` → all pass.
 
-- [ ] **Step 5: Try it for real on the Mac**
+- [ ] **Step 5: Try it by hand**
 
 ```bash
 .venv/bin/kodachrome-capture --fake --out /tmp/kodachrome-shots
 ```
-Expected: a window with the synthetic frame; SPACE writes two files and prints a "Saved" line; Q quits. If `opencv-python-headless` was installed in Task 1, it falls back to headless mode and SPACE still works in the terminal.
+Expected: a window with the synthetic frame; SPACE prints a Saved line and writes `*_ungraded.jpg` (the fake camera has no JPEG bytes) plus `*_kodachrome.jpg`; Q quits. Confirm `captures.jsonl` has one line per capture with both timings.
 
 - [ ] **Step 6: Document and commit**
 
-In `README.md`, under Commands, add:
+In `README.md`:
 
 ````markdown
 ### Capture on the Pi
 
 ```bash
-kodachrome-capture                 # probes /dev/video*, opens a preview if a display is attached
-kodachrome-capture --device 0      # pick a camera explicitly
-kodachrome-capture --no-preview    # headless: SPACE and Q read from the terminal
-kodachrome-capture --fake          # no hardware: synthetic frames, for trying the app
+kodachrome-capture                 # probes for the camera, opens a preview if a display is attached
+kodachrome-capture --device /dev/v4l/by-id/usb-…   # pick a camera by stable path
+kodachrome-capture --no-preview    # headless: SPACE and Q from the terminal
+kodachrome-capture --fake          # no hardware, synthetic frames
 ```
 
-Keys: `SPACE` capture, `P` toggle graded/original preview, `Q` quit.
+Keys: `SPACE` capture, `P` toggle graded/original preview, `Q` quit. SPACE
+takes a fresh frame; it does not save the frame currently displayed.
 
-Output goes to `~/Pictures/kodachrome/YYYY-MM-DD/` as `HHMMSS_original.jpg`
-and `HHMMSS_kodachrome.jpg`, plus `captures.jsonl` with one line per capture
-recording the white balance gains, exposure gain and processing time. The
-originals double as the training corpus for `kodachrome-train --source`.
+Each capture writes to `~/Pictures/kodachrome/YYYY-MM-DD/`:
+
+| File | Contents |
+|---|---|
+| `HHMMSS_original.jpg` | the camera's own JPEG bytes, unmodified |
+| `HHMMSS_ungraded.jpg` | a re-encode, written **instead** when the camera cannot supply its compressed frame |
+| `HHMMSS_kodachrome.jpg` | the graded version |
+| `captures.jsonl` | one audit line per capture |
+
+The audit line records the white balance and exposure gains, whether either
+hit its clamp, the grain seed, the LUT's SHA-1, the negotiated stream format,
+and both the pipeline time and the full shutter-to-saved time. The seed and
+hash together mean a graded file can be regenerated exactly from its
+original.
 ````
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/capture/app.py tests/test_app.py README.md
-git commit -m "feat: kodachrome-capture app with preview and headless loops
+git commit -m "feat: capture app with guarded loops, byte-exact originals and audit log
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 11: Commons downloader (`train/fetch.py`, `kodachrome-fetch`)
+### Task 13: Commons downloader (`train/fetch.py`)
 
-Implements spec 3 and 6.1. Tests use a fake HTTP session; nothing hits the network.
+Implements spec 3 and 6.1. Fixes F-13 and the download half of F-06. Tests use a fake HTTP session; nothing touches the network.
 
 **Files:**
 - Create: `kodachrome/train/fetch.py`, `tests/test_fetch.py`
-- Modify: `README.md` (Training section, part 1: fetching)
+- Modify: `README.md`
 
 **Interfaces:**
 - Produces:
   - `API_URL`, `USER_AGENT`, `DEFAULT_CATEGORY`, `SKIP_WORDS`, `MIN_LONG_SIDE = 800`
+  - `LICENCE_ALLOWLIST` — exact strings plus a `PD-` prefix rule
   - `class FetchError(Exception)`
-  - `@dataclass FileInfo(title, url, width, height, license, lccn)` with `.filename`
+  - `@dataclass FileInfo(title, pageid, revid, url, width, height, license, lccn)` with `.filename`
+  - `licence_allowed(text) -> bool`
   - `api_get(session, params, retries=3) -> dict`
-  - `iter_category_members(session, category, recurse=True) -> Iterator[str]`
-  - `select_titles(titles) -> list[str]`
-  - `fetch_imageinfo(session, titles, width) -> list[FileInfo]`
-  - `download(session, info, out_dir, retries=3) -> Path | None`
-  - `fetch_category(session, category, out_dir, width=1024, limit=None, sample=None, seed=0, progress=None) -> list[dict]` (manifest entries, also written to `out_dir/manifest.json`)
+  - `iter_category_members(session, category, recurse=True) -> Iterator[dict]`
+  - `select_titles(entries) -> (list[str], list[dict])` — accepted titles and rejection records
+  - `fetch_imageinfo(session, titles, width) -> (list[FileInfo], list[dict])`
+  - `validate_image(data: bytes) -> tuple[bool, str]` — decodes with Pillow, checks size and colour
+  - `download(session, info, out_dir, retries=3) -> Path | None` — atomic
+  - `fetch_category(...) -> FetchReport`
   - `main(argv=None) -> int`
-  - A session is anything with `.get(url, params=None, headers=None, timeout=None)` returning an object with `.status_code`, `.json()`, `.content`. `requests.Session` qualifies.
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_fetch.py`:
 ```python
+import io
 import json
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from kodachrome.train.fetch import (
     API_URL,
@@ -2292,12 +3206,27 @@ from kodachrome.train.fetch import (
     fetch_category,
     fetch_imageinfo,
     iter_category_members,
+    licence_allowed,
     main,
     select_titles,
+    validate_image,
 )
 
 CAT = "Category:Test"
 SUB = "Category:Sub"
+
+
+def _photo_bytes(w=1200, h=900, seed=0):
+    rgb = np.random.default_rng(seed).integers(0, 256, (h, w, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+def _grey_bytes(w=1200, h=900):
+    buf = io.BytesIO()
+    Image.fromarray(np.full((h, w), 128, dtype=np.uint8), "L").save(buf, "JPEG")
+    return buf.getvalue()
 
 
 class FakeResponse:
@@ -2311,8 +3240,6 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Routes API calls to a handler and file URLs to a dict of bytes."""
-
     def __init__(self, handler, files=None, fail_urls=()):
         self.handler = handler
         self.files = files or {}
@@ -2340,37 +3267,70 @@ def _handler(params):
     if params.get("list") == "categorymembers":
         if params["cmtitle"] == CAT and "cmcontinue" not in params:
             return _members(
-                [{"ns": 6, "title": "File:A LCCN2017000001.jpg"}, {"ns": 14, "title": SUB}], cont="c1"
+                [
+                    {"ns": 6, "title": "File:A LCCN2017000001.jpg", "pageid": 11},
+                    {"ns": 14, "title": SUB, "pageid": 12},
+                ],
+                cont="c1",
             )
         if params["cmtitle"] == CAT:
-            return _members([{"ns": 6, "title": "File:B LCCN2017000002.jpg"}])
+            return _members([{"ns": 6, "title": "File:B LCCN2017000002.jpg", "pageid": 13}])
         if params["cmtitle"] == SUB:
             return _members(
-                [{"ns": 6, "title": "File:C (cropped) LCCN2017000003.jpg"}, {"ns": 14, "title": CAT}]
+                [
+                    {"ns": 6, "title": "File:C (cropped) LCCN2017000003.jpg", "pageid": 14},
+                    {"ns": 14, "title": CAT, "pageid": 15},
+                ]
             )
     if params.get("prop") == "imageinfo":
         pages = {}
         for i, title in enumerate(params["titles"].split("|")):
-            big = "small" not in title
+            small = "small" in title
+            nonfree = "nonfree" in title
             pages[str(i)] = {
                 "title": title,
+                "pageid": 100 + i,
                 "imageinfo": [
                     {
                         "url": f"https://upload/{i}.jpg",
                         "thumburl": f"https://upload/thumb/{i}.jpg",
-                        "width": 4000 if big else 300,
-                        "height": 3000 if big else 200,
+                        "width": 300 if small else 4000,
+                        "height": 200 if small else 3000,
                         "mime": "image/jpeg",
-                        "extmetadata": {"LicenseShortName": {"value": "Public domain"}},
+                        "timestamp": "2020-01-01T00:00:00Z",
+                        "extmetadata": {
+                            "LicenseShortName": {
+                                "value": "CC BY-SA 4.0" if nonfree else "Public domain"
+                            }
+                        },
                     }
                 ],
+                "revisions": [{"revid": 900 + i}],
             }
         return {"query": {"pages": pages}}
     raise AssertionError(f"unexpected params {params}")
 
 
+@pytest.mark.parametrize(
+    "text, allowed",
+    [
+        ("Public domain", True),
+        ("CC0", True),
+        ("PDM", True),
+        ("PD-USGov", True),
+        ("PD-1996", True),
+        ("CC BY-SA 4.0", False),
+        ("GFDL", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_licence_allowlist(text, allowed):
+    assert licence_allowed(text) is allowed
+
+
 def test_iter_category_members_follows_continue_and_recurses_once():
-    titles = list(iter_category_members(FakeSession(_handler), CAT))
+    titles = [m["title"] for m in iter_category_members(FakeSession(_handler), CAT)]
     assert titles == [
         "File:A LCCN2017000001.jpg",
         "File:C (cropped) LCCN2017000003.jpg",
@@ -2378,85 +3338,105 @@ def test_iter_category_members_follows_continue_and_recurses_once():
     ]
 
 
-def test_select_titles_skips_dedupes_and_orders():
-    titles = [
-        "File:Zed no lccn.jpg",
-        "File:A LCCN2017000001.jpg",
-        "File:A again LCCN2017000001.jpg",
-        "File:C (cropped) LCCN2017000003.jpg",
-        "File:D restored LCCN2017000004.jpg",
-        "File:B LCCN2017000002.jpg",
+def test_select_titles_records_why_each_rejection_happened():
+    entries = [
+        {"title": "File:A LCCN2017000001.jpg"},
+        {"title": "File:A again LCCN2017000001.jpg"},
+        {"title": "File:C (cropped) LCCN2017000003.jpg"},
+        {"title": "File:Zed no lccn.jpg"},
     ]
-    assert select_titles(titles) == [
-        "File:A LCCN2017000001.jpg",
-        "File:B LCCN2017000002.jpg",
-        "File:Zed no lccn.jpg",
-    ]
+    accepted, rejected = select_titles(entries)
+    assert accepted == ["File:A LCCN2017000001.jpg", "File:Zed no lccn.jpg"]
+    reasons = {r["title"]: r["reason"] for r in rejected}
+    assert reasons["File:A again LCCN2017000001.jpg"] == "duplicate-lccn"
+    assert reasons["File:C (cropped) LCCN2017000003.jpg"] == "title-filter"
 
 
-def test_fetch_imageinfo_uses_thumb_and_skips_small():
-    infos = fetch_imageinfo(FakeSession(_handler), ["File:X LCCN2017000009.jpg", "File:small.jpg"], 1024)
-    assert len(infos) == 1
-    assert infos[0].url == "https://upload/thumb/0.jpg"
-    assert infos[0].lccn == "2017000009"
-    assert infos[0].license == "Public domain"
-    assert infos[0].filename == "2017000009.jpg"
+def test_fetch_imageinfo_rejects_small_and_non_free():
+    infos, rejected = fetch_imageinfo(
+        FakeSession(_handler),
+        ["File:X LCCN2017000009.jpg", "File:small.jpg", "File:nonfree.jpg"],
+        1024,
+    )
+    assert [i.title for i in infos] == ["File:X LCCN2017000009.jpg"]
+    reasons = {r["title"]: r["reason"] for r in rejected}
+    assert reasons["File:small.jpg"] == "too-small"
+    assert reasons["File:nonfree.jpg"] == "licence"
+    info = infos[0]
+    assert info.url == "https://upload/thumb/0.jpg"
+    assert info.lccn == "2017000009" and info.filename == "2017000009.jpg"
+    assert info.pageid == 100 and info.revid == 900
 
 
-def test_filename_without_lccn_is_sanitised():
-    info = FileInfo("File:Odd name / with: chars.jpg", "u", 1, 1, "PD", None)
-    assert info.filename == "Odd_name_with_chars.jpg"
+def test_validate_image_accepts_photos_and_rejects_junk():
+    ok, reason = validate_image(_photo_bytes())
+    assert ok and reason == ""
+    assert validate_image(b"not an image")[0] is False
+    assert validate_image(_photo_bytes(w=400, h=300))[1] == "too-small"
+    assert validate_image(_grey_bytes())[1] == "greyscale"
 
 
-def test_download_skips_existing_and_reports_failure(tmp_path):
-    info = FileInfo("File:T LCCN2017000001.jpg", "https://upload/1.jpg", 1, 1, "PD", "2017000001")
-    session = FakeSession(_handler, files={"https://upload/1.jpg": b"JPEGDATA"})
+def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
+    info = FileInfo("File:T LCCN2017000001.jpg", 1, 2, "https://upload/1.jpg", 1200, 900, "Public domain", "2017000001")
+    session = FakeSession(_handler, files={"https://upload/1.jpg": _photo_bytes()})
     path = download(session, info, tmp_path)
-    assert path.read_bytes() == b"JPEGDATA"
-    n_calls = len(session.calls)
-    assert download(session, info, tmp_path) == path
-    assert len(session.calls) == n_calls  # not re-downloaded
-    bad = FileInfo("File:U LCCN2017000002.jpg", "https://upload/bad.jpg", 1, 1, "PD", "2017000002")
-    assert download(FakeSession(_handler, fail_urls={"https://upload/bad.jpg"}), bad, tmp_path, retries=1) is None
+    assert path is not None and path.name == "2017000001.jpg"
+    calls = len(session.calls)
+    assert download(session, info, tmp_path) == path      # resumed, not re-fetched
+    assert len(session.calls) == calls
+
+    bad = FileInfo("File:U LCCN2017000002.jpg", 1, 2, "https://upload/bad.jpg", 1, 1, "Public domain", "2017000002")
+    failing = FakeSession(_handler, fail_urls={"https://upload/bad.jpg"})
+    assert download(failing, bad, tmp_path, retries=1) is None
+    assert list(tmp_path.glob("*.part")) == [], "no partial files may remain"
+    assert not (tmp_path / "2017000002.jpg").exists()
 
 
-def test_fetch_category_writes_manifest(tmp_path):
-    files = {f"https://upload/thumb/{i}.jpg": b"x" * (i + 1) for i in range(3)}
-    entries = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, width=1024)
-    assert [e["lccn"] for e in entries] == ["2017000001", "2017000002"]
+def test_download_rejects_undecodable_content(tmp_path):
+    info = FileInfo("File:V LCCN2017000003.jpg", 1, 2, "https://upload/x.jpg", 1200, 900, "Public domain", "2017000003")
+    session = FakeSession(_handler, files={"https://upload/x.jpg": b"garbage"})
+    assert download(session, info, tmp_path) is None
+    assert not (tmp_path / "2017000003.jpg").exists()
+
+
+def test_fetch_category_writes_a_manifest_with_hashes_and_rejections(tmp_path):
+    files = {f"https://upload/thumb/{i}.jpg": _photo_bytes(seed=i) for i in range(3)}
+    report = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, width=1024)
+    assert [e["lccn"] for e in report.files] == ["2017000001", "2017000002"]
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["category"] == CAT
-    assert {e["filename"] for e in manifest["files"]} == {"2017000001.jpg", "2017000002.jpg"}
-    assert all({"title", "lccn", "url", "width", "height", "license", "filename", "sha1"} <= set(e) for e in entries)
+    assert manifest["corpus_sha1"]
+    assert any(r["reason"] == "title-filter" for r in manifest["rejected"])
+    for entry in manifest["files"]:
+        assert len(entry["sha1"]) == 40
+        assert entry["pageid"] and entry["revid"]
 
 
-def test_fetch_category_limit_and_sample(tmp_path):
-    files = {f"https://upload/thumb/{i}.jpg": b"x" for i in range(3)}
-    entries = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, limit=1)
-    assert len(entries) == 1
-    entries = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path / "s", sample=1, seed=3)
-    assert len(entries) == 1
+def test_resume_revalidates_against_the_manifest_hash(tmp_path):
+    files = {f"https://upload/thumb/{i}.jpg": _photo_bytes(seed=i) for i in range(3)}
+    fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, width=1024)
+    victim = tmp_path / "2017000001.jpg"
+    victim.write_bytes(_photo_bytes(seed=99))  # same name, different content
+    report = fetch_category(FakeSession(_handler, files=files), CAT, tmp_path, width=1024)
+    assert victim.read_bytes() == files["https://upload/thumb/0.jpg"], "corrupt file must be refetched"
+    assert report.repaired == 1
 
 
-def test_main_min_files_threshold(tmp_path, monkeypatch, capsys):
-    files = {f"https://upload/thumb/{i}.jpg": b"x" for i in range(3)}
-    monkeypatch.setattr("kodachrome.train.fetch.make_session", lambda: FakeSession(_handler, files=files))
+def test_main_enforces_min_files(tmp_path, monkeypatch, capsys):
+    files = {f"https://upload/thumb/{i}.jpg": _photo_bytes(seed=i) for i in range(3)}
+    monkeypatch.setattr(
+        "kodachrome.train.fetch.make_session", lambda: FakeSession(_handler, files=files)
+    )
     assert main(["--out", str(tmp_path), "--category", CAT, "--min-files", "5"]) == 1
     assert "fewer than 5" in capsys.readouterr().err
     assert main(["--out", str(tmp_path), "--category", CAT, "--min-files", "2"]) == 0
-
-
-@pytest.mark.parametrize("bad", ["File:E edit.jpg", "File:F colorized.jpg", "File:G retouched.jpg"])
-def test_skip_words(bad):
-    assert select_titles([bad]) == []
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_fetch.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_fetch.py -q` → FAIL, no module `kodachrome.train.fetch`.
 
-- [ ] **Step 3: Implement fetch.py**
+- [ ] **Step 3: Implement `fetch.py`**
 
 ```python
 """``kodachrome-fetch``: download public-domain Kodachrome scans from Wikimedia Commons.
@@ -2465,45 +3445,56 @@ Why Commons and not loc.gov
 ---------------------------
 The Library of Congress FSA/OWI colour transparencies are the target corpus,
 but loc.gov sits behind a Cloudflare challenge that returns HTTP 403 to
-scripted clients (checked 2026-09-03 with several User-Agents). Commons hosts
-the same LoC scans in "Category:Color photographs from the Farm Security
-Administration", keeps the LoC catalogue number (LCCN) in each filename, tags
-each file public domain, and its API welcomes scripted access as long as the
-User-Agent identifies the tool.
+scripted clients (checked 2026-09-03 with several User-Agents). Commons
+hosts the same LoC scans, keeps the catalogue number (LCCN) in each
+filename, and its API welcomes scripted access from a tool that identifies
+itself.
 
-Selection rules (spec section 3)
---------------------------------
-* Skip titles containing cropped / restored / retouched / colorized / edit:
-  they are derivatives whose colours were changed by a Commons editor.
-* Skip files under 800 px on the long side.
-* Files with an LCCN come first and are de-duplicated by LCCN; files without
-  one follow. ``--sample`` draws a seeded random subset; ``--limit`` truncates.
-* Download at ``--width`` (default 1024) using Commons' thumbnail service.
+What "public domain" is allowed to mean
+---------------------------------------
+A category is a claim, not a guarantee: anyone can file an image into it.
+So the licence is checked per file against an allowlist rather than assumed
+from the category, and every rejection is written to the manifest with its
+reason. A corpus you cannot audit is a corpus you cannot defend.
 
-``manifest.json`` in the output directory records exactly what was fetched:
-title, LCCN, URL, size, licence string and file SHA-1. That is the provenance
-for whatever LUT gets trained on the folder.
+Validation before acceptance
+----------------------------
+The API's word is not enough either. Bytes are downloaded to a temporary
+file, decoded with Pillow, and checked for size and for being an actual
+colour photograph rather than a scanned document or diagram, before being
+renamed into place. A resumed run re-hashes what is already on disk against
+the manifest and refetches anything that does not match, so a truncated
+earlier download cannot silently poison the training set.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import random
 import re
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
 API_URL = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "kodachrome-film/0.1 (Kodachrome LUT trainer; https://github.com/kodachrome-film) python-requests"
+USER_AGENT = (
+    "kodachrome-film/0.1 (Kodachrome LUT trainer; "
+    "https://github.com/kodachrome-film) python-requests"
+)
 DEFAULT_CATEGORY = "Category:Color photographs from the Farm Security Administration"
 SKIP_WORDS = ("cropped", "restored", "retouched", "colorized", "colourized", "edit")
 MIN_LONG_SIDE = 800
+LICENCE_ALLOWLIST = {"public domain", "cc0", "pdm", "no restrictions"}
+ALLOWED_MIME = {"image/jpeg", "image/png", "image/tiff"}
 _LCCN_RE = re.compile(r"LCCN(\d{6,})", re.IGNORECASE)
 
 
@@ -2514,6 +3505,8 @@ class FetchError(Exception):
 @dataclass
 class FileInfo:
     title: str
+    pageid: int
+    revid: int
     url: str
     width: int
     height: int
@@ -2525,8 +3518,23 @@ class FileInfo:
         if self.lccn:
             return f"{self.lccn}.jpg"
         stem = self.title.removeprefix("File:").rsplit(".", 1)[0]
-        stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")[:120]
-        return f"{stem}.jpg"
+        return f"{re.sub(r'[^A-Za-z0-9]+', '_', stem).strip('_')[:120]}.jpg"
+
+
+@dataclass
+class FetchReport:
+    files: list[dict] = field(default_factory=list)
+    rejected: list[dict] = field(default_factory=list)
+    failed: int = 0
+    repaired: int = 0
+
+
+def licence_allowed(text: str | None) -> bool:
+    """Explicit allowlist: exact free-licence names, plus the PD-* family."""
+    if not text:
+        return False
+    normalised = text.strip().lower()
+    return normalised in LICENCE_ALLOWLIST or normalised.startswith("pd-")
 
 
 def make_session() -> Any:
@@ -2544,7 +3552,7 @@ def api_get(session: Any, params: dict, retries: int = 3) -> dict:
             if r.status_code == 200:
                 return r.json()
             last = f"HTTP {r.status_code}"
-        except Exception as exc:  # noqa: BLE001 - network errors are all retried the same way
+        except Exception as exc:  # noqa: BLE001 - network errors are all retried alike
             last = repr(exc)
         time.sleep(2**attempt)
     raise FetchError(f"Commons API request failed after {retries} attempts: {last}")
@@ -2552,7 +3560,7 @@ def api_get(session: Any, params: dict, retries: int = 3) -> dict:
 
 def iter_category_members(
     session: Any, category: str, recurse: bool = True, _seen: set[str] | None = None
-) -> Iterator[str]:
+) -> Iterator[dict]:
     seen = _seen if _seen is not None else set()
     if category in seen:
         return
@@ -2568,7 +3576,7 @@ def iter_category_members(
         data = api_get(session, params)
         for member in data.get("query", {}).get("categorymembers", []):
             if member["ns"] == 6:
-                yield member["title"]
+                yield member
             elif member["ns"] == 14 and recurse:
                 yield from iter_category_members(session, member["title"], recurse, seen)
         cont = data.get("continue")
@@ -2577,73 +3585,130 @@ def iter_category_members(
         params = {**params, **cont}
 
 
-def select_titles(titles: list[str]) -> list[str]:
-    with_lccn: list[str] = []
+def select_titles(entries: list[dict]) -> tuple[list[str], list[dict]]:
+    accepted: list[str] = []
     without: list[str] = []
+    rejected: list[dict] = []
     seen: set[str] = set()
-    for title in titles:
+    for entry in entries:
+        title = entry["title"] if isinstance(entry, dict) else entry
         low = title.lower()
         if any(word in low for word in SKIP_WORDS):
+            rejected.append({"title": title, "reason": "title-filter"})
             continue
         m = _LCCN_RE.search(title)
         if m:
             if m.group(1) in seen:
+                rejected.append({"title": title, "reason": "duplicate-lccn"})
                 continue
             seen.add(m.group(1))
-            with_lccn.append(title)
+            accepted.append(title)
         else:
             without.append(title)
-    return with_lccn + without
+    return accepted + without, rejected
 
 
-def fetch_imageinfo(session: Any, titles: list[str], width: int) -> list[FileInfo]:
+def fetch_imageinfo(session: Any, titles: list[str], width: int) -> tuple[list[FileInfo], list[dict]]:
     infos: list[FileInfo] = []
+    rejected: list[dict] = []
     for start in range(0, len(titles), 50):
         batch = titles[start : start + 50]
         data = api_get(
             session,
             {
                 "action": "query",
-                "prop": "imageinfo",
+                "prop": "imageinfo|revisions",
                 "titles": "|".join(batch),
-                "iiprop": "url|size|mime|extmetadata",
+                "iiprop": "url|size|mime|extmetadata|timestamp",
                 "iiurlwidth": str(width),
+                "rvprop": "ids",
             },
         )
         for page in data.get("query", {}).get("pages", {}).values():
+            title = page.get("title", "?")
             ii = (page.get("imageinfo") or [None])[0]
-            if not ii or not str(ii.get("mime", "")).startswith("image/"):
+            if not ii:
+                rejected.append({"title": title, "reason": "no-imageinfo"})
+                continue
+            if str(ii.get("mime", "")) not in ALLOWED_MIME:
+                rejected.append({"title": title, "reason": f"mime:{ii.get('mime')}"})
+                continue
+            licence = ii.get("extmetadata", {}).get("LicenseShortName", {}).get("value", "")
+            if not licence_allowed(licence):
+                rejected.append({"title": title, "reason": "licence", "license": licence})
                 continue
             if max(int(ii["width"]), int(ii["height"])) < MIN_LONG_SIDE:
+                rejected.append({"title": title, "reason": "too-small"})
                 continue
-            m = _LCCN_RE.search(page["title"])
+            m = _LCCN_RE.search(title)
+            revisions = page.get("revisions") or [{}]
             infos.append(
                 FileInfo(
-                    title=page["title"],
+                    title=title,
+                    pageid=int(page.get("pageid", 0)),
+                    revid=int(revisions[0].get("revid", 0)),
                     url=ii.get("thumburl") or ii["url"],
                     width=int(ii["width"]),
                     height=int(ii["height"]),
-                    license=ii.get("extmetadata", {}).get("LicenseShortName", {}).get("value", ""),
+                    license=licence,
                     lccn=m.group(1) if m else None,
                 )
             )
-    return infos
+    return infos, rejected
+
+
+def validate_image(data: bytes) -> tuple[bool, str]:
+    """Decode the bytes and confirm they are a colour photograph of usable size."""
+    if not data:
+        return False, "empty"
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            width, height = im.size
+            mode = im.mode
+            sample = np.asarray(im.convert("RGB").resize((64, 64)))
+    except Exception as exc:  # noqa: BLE001 - any decode failure disqualifies the file
+        return False, f"undecodable:{type(exc).__name__}"
+    if max(width, height) < MIN_LONG_SIDE:
+        return False, "too-small"
+    channel_spread = float(np.abs(sample.max(axis=2).astype(int) - sample.min(axis=2)).mean())
+    if mode in ("L", "1") or channel_spread < 2.0:
+        return False, "greyscale"
+    return True, ""
 
 
 def download(session: Any, info: FileInfo, out_dir: str | Path, retries: int = 3) -> Path | None:
-    path = Path(out_dir) / info.filename
-    if path.is_file() and path.stat().st_size > 0:
-        return path
+    """Download to a temporary file, validate, then rename. Never leaves a partial file."""
+    out_dir = Path(out_dir)
+    final = out_dir / info.filename
+    if final.is_file() and final.stat().st_size > 0:
+        return final
+    tmp = final.with_suffix(final.suffix + ".part")
     for attempt in range(retries):
         try:
             r = session.get(info.url, headers={"User-Agent": USER_AGENT}, timeout=120)
             if r.status_code == 200 and r.content:
-                path.write_bytes(r.content)
-                return path
+                ok, _reason = validate_image(r.content)
+                if not ok:
+                    return None
+                tmp.write_bytes(r.content)
+                tmp.replace(final)
+                return final
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            tmp.unlink(missing_ok=True)
         time.sleep(2**attempt)
     return None
+
+
+def corpus_sha1(paths: list[Path]) -> str:
+    """Hash the actual bytes of every file, so different content cannot collide."""
+    h = hashlib.sha1()
+    for p in sorted(paths):
+        h.update(p.name.encode())
+        h.update(hashlib.sha1(p.read_bytes()).digest())
+    return h.hexdigest()
 
 
 def fetch_category(
@@ -2655,32 +3720,51 @@ def fetch_category(
     sample: int | None = None,
     seed: int = 0,
     progress: Callable[[str], None] | None = None,
-) -> list[dict]:
+) -> FetchReport:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    say = progress or (lambda _msg: None)
+    say = progress or (lambda _m: None)
 
-    titles = select_titles(list(iter_category_members(session, category)))
-    say(f"{len(titles)} candidate files in {category}")
+    previous: dict[str, str] = {}
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            previous = {
+                e["filename"]: e["sha1"] for e in json.loads(manifest_path.read_text())["files"]
+            }
+        except (KeyError, json.JSONDecodeError):
+            previous = {}
+
+    members = list(iter_category_members(session, category))
+    titles, rejected = select_titles(members)
+    say(f"{len(titles)} candidate files in {category}, {len(rejected)} rejected by title")
     if sample is not None and sample < len(titles):
         titles = sorted(random.Random(seed).sample(titles, sample), key=titles.index)
     if limit is not None:
         titles = titles[:limit]
 
-    infos = fetch_imageinfo(session, titles, width)
-    say(f"{len(infos)} files pass the size filter; downloading at {width}px")
+    infos, info_rejected = fetch_imageinfo(session, titles, width)
+    rejected.extend(info_rejected)
+    say(f"{len(infos)} files pass licence and size checks; downloading at {width}px")
 
-    entries: list[dict] = []
-    failed = 0
+    report = FetchReport(rejected=rejected)
     for i, info in enumerate(infos, start=1):
+        final = out_dir / info.filename
+        recorded = previous.get(info.filename)
+        if final.is_file() and recorded:
+            if hashlib.sha1(final.read_bytes()).hexdigest() != recorded:
+                say(f"  {info.filename} does not match its recorded hash; refetching")
+                final.unlink()
+                report.repaired += 1
         path = download(session, info, out_dir)
         if path is None:
-            failed += 1
+            report.failed += 1
+            rejected.append({"title": info.title, "reason": "download-failed"})
             continue
         entry = asdict(info)
         entry["filename"] = info.filename
         entry["sha1"] = hashlib.sha1(path.read_bytes()).hexdigest()
-        entries.append(entry)
+        report.files.append(entry)
         if i % 25 == 0:
             say(f"  {i}/{len(infos)}")
         time.sleep(0.05)
@@ -2689,18 +3773,25 @@ def fetch_category(
         "category": category,
         "width": width,
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "n_files": len(entries),
-        "n_failed": failed,
-        "files": entries,
+        "n_files": len(report.files),
+        "n_failed": report.failed,
+        "n_repaired": report.repaired,
+        "corpus_sha1": corpus_sha1([out_dir / e["filename"] for e in report.files]),
+        "files": report.files,
+        "rejected": rejected,
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    say(f"done: {len(entries)} files, {failed} failed, manifest at {out_dir / 'manifest.json'}")
-    return entries
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    say(
+        f"done: {len(report.files)} files, {report.failed} failed, "
+        f"{len(rejected)} rejected, manifest at {manifest_path}"
+    )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="kodachrome-fetch", description="Download public-domain Kodachrome scans from Wikimedia Commons."
+        prog="kodachrome-fetch",
+        description="Download public-domain Kodachrome scans from Wikimedia Commons.",
     )
     parser.add_argument("--out", type=Path, default=Path("data/kodachrome"))
     parser.add_argument("--category", default=DEFAULT_CATEGORY)
@@ -2708,11 +3799,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="stop after N files")
     parser.add_argument("--sample", type=int, default=None, help="seeded random subset of N files")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--min-files", type=int, default=200, help="exit 1 if fewer files were obtained")
+    parser.add_argument("--min-files", type=int, default=200)
     args = parser.parse_args(argv)
 
     try:
-        entries = fetch_category(
+        report = fetch_category(
             make_session(),
             args.category,
             args.out,
@@ -2725,10 +3816,11 @@ def main(argv: list[str] | None = None) -> int:
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    if len(entries) < args.min_files:
+    if len(report.files) < args.min_files:
         print(
-            f"error: obtained {len(entries)} files, fewer than {args.min_files}; "
-            "not enough to train on. Check the category name or network.",
+            f"error: accepted {len(report.files)} files, fewer than {args.min_files}. "
+            "Check the category name, the licence filter, or the network; "
+            "see the manifest's 'rejected' list for reasons.",
             file=sys.stderr,
         )
         return 1
@@ -2739,13 +3831,13 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_fetch.py -q` → all pass. The download tests call `time.sleep(2**attempt)` on failure; with `retries=1` that is one second, acceptable.
+Run: `.venv/bin/pytest tests/test_fetch.py -q` → all pass. The failure-path tests sleep on retry; with `retries=1` that is about a second.
 
 - [ ] **Step 5: Document and commit**
 
-In `README.md` add a `## Training (Mac)` section after Commands:
+In `README.md`, add a `## Training (Mac)` section:
 
 ````markdown
 ## Training (Mac)
@@ -2753,169 +3845,250 @@ In `README.md` add a `## Training (Mac)` section after Commands:
 ### 1. Fetch the Kodachrome scans
 
 ```bash
-.venv/bin/kodachrome-fetch            # about 1,000 files, ~200 MB, into data/kodachrome/
+.venv/bin/kodachrome-fetch          # about 1,000 files, ~200 MB, into data/kodachrome/
 ```
 
 The scans are the Library of Congress FSA/OWI colour transparencies
-(1939-1944), public domain, mirrored on Wikimedia Commons. loc.gov itself
-blocks scripted downloads, so the tool uses the Commons API with a descriptive
-User-Agent. Derivatives (cropped, restored, colorized) and files under 800 px
-are skipped. `data/kodachrome/manifest.json` lists every file with its LoC
-catalogue number, licence and SHA-1. The command is resumable.
+(1939-1944), mirrored on Wikimedia Commons because loc.gov blocks scripted
+downloads. Every file is checked individually rather than trusted for being
+in the category: the licence must be on an allowlist, the bytes must decode,
+and the image must be a colour photograph of at least 800 px. Downloads are
+atomic, and a resumed run re-hashes what is on disk and refetches anything
+that does not match.
 
-To use your own Kodachrome scans instead, put them in any folder and pass it
-to `kodachrome-train --target`.
+`data/kodachrome/manifest.json` lists every accepted file with its catalogue
+number, Commons page and revision ID, licence and SHA-1, plus every
+rejection and why. To use your own scans instead, point `kodachrome-train
+--target` at any folder.
 ````
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/train/fetch.py tests/test_fetch.py README.md
-git commit -m "feat: kodachrome-fetch downloads FSA Kodachrome scans from Wikimedia Commons
+git commit -m "feat: Commons downloader with licence allowlist, media validation and atomic writes
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 12: Dataset preparation (`train/dataset.py`)
+### Task 14: Dataset preparation with a held-out split (`train/dataset.py`)
 
-Implements spec 6.2 and 6.3.
+Implements spec 6.3. Fixes the leakage half of F-01/F-05 and the corpus-hash half of F-06.
 
 **Files:**
 - Create: `kodachrome/train/dataset.py`, `tests/test_dataset.py`
 
 **Interfaces:**
-- Consumes: `load_rgb`, `list_images`, `normalize_float`, `NormalizeParams`, `srgb_to_oklab`
+- Consumes: `load_rgb`, `list_images`, `normalize_float`, `NormalizeParams`, `srgb_to_oklab`, `require_cv2`
 - Produces:
-  - `@dataclass SampleConfig(crop_frac=0.06, max_side=512, pixels_per_image=3000, l_min=0.02, l_max=0.98, max_pixels=400_000, seed=0)`
-  - `@dataclass PixelPool(srgb: np.ndarray (M,3) float32, n_images: int)` with `.lab` property (Oklab, computed once and cached)
-  - `crop_and_resize(rgb_u8, crop_frac, max_side) -> rgb_u8`
-  - `prepare_image(rgb_u8, normalize_params, cfg) -> rgb_float32` (crop, resize, normalise)
-  - `sample_pixels(rgb_float, n, l_min, l_max, rng) -> (k, 3) float32 sRGB`
+  - `@dataclass SampleConfig(crop_frac=0.06, max_side=512, pixels_per_image=3000, l_min=0.02, l_max=0.98, max_pixels=400_000, val_fraction=0.2, seed=0)` with validation
+  - `@dataclass PixelPool(srgb, n_images, clamp_rate, wb_gains, exposure_gains, profiles)` with cached `.lab`
+  - `@dataclass CorpusSplit(train_paths, val_paths, train_pool, val_pool, corpus_sha1)`
+  - `class CorpusTooSmall(ValueError)`
+  - `crop_and_resize(rgb_u8, crop_frac, max_side)`
+  - `prepare_image(rgb_u8, normalize_params, cfg) -> (rgb_float, Gains)`
+  - `sample_pixels(rgb_float, n, l_min, l_max, rng)`
+  - `split_paths(paths, val_fraction, seed) -> (train, val)`
   - `build_pool(paths, normalize_params, cfg, progress=None) -> PixelPool`
-  - `dir_fingerprint(paths) -> str` (sha1 over sorted names and sizes)
+  - `build_corpus(dir_or_paths, normalize_params, cfg, minimum, label, allow_small=False, progress=None) -> CorpusSplit`
+  - `corpus_sha1(paths) -> str`
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_dataset.py`:
 ```python
 import numpy as np
+import pytest
 
 from kodachrome.color import srgb_to_oklab
 from kodachrome.imageio import save_jpeg
 from kodachrome.normalize import NormalizeParams
 from kodachrome.train.dataset import (
+    CorpusTooSmall,
     PixelPool,
     SampleConfig,
+    build_corpus,
     build_pool,
+    corpus_sha1,
     crop_and_resize,
-    dir_fingerprint,
     prepare_image,
     sample_pixels,
+    split_paths,
 )
 
 
+def _write_images(dir_path, n, seed=0):
+    dir_path.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    paths = []
+    for i in range(n):
+        p = dir_path / f"{i:03d}.jpg"
+        save_jpeg(rng.integers(30, 220, (40, 60, 3), dtype=np.uint8), p)
+        paths.append(p)
+    return paths
+
+
 def test_crop_and_resize_geometry():
-    img = np.zeros((500, 1000, 3), dtype=np.uint8)
-    out = crop_and_resize(img, crop_frac=0.06, max_side=512)
-    assert out.shape == (256, 512, 3)
-    tall = crop_and_resize(np.zeros((1000, 500, 3), dtype=np.uint8), 0.0, 100)
-    assert tall.shape == (100, 50, 3)
+    assert crop_and_resize(np.zeros((500, 1000, 3), np.uint8), 0.06, 512).shape == (256, 512, 3)
+    assert crop_and_resize(np.zeros((1000, 500, 3), np.uint8), 0.0, 100).shape == (100, 50, 3)
 
 
 def test_crop_removes_border():
     img = np.zeros((100, 100, 3), dtype=np.uint8)
-    img[10:90, 10:90] = 200  # 10% black border
-    out = crop_and_resize(img, crop_frac=0.1, max_side=80)
-    assert out.min() >= 190
+    img[10:90, 10:90] = 200
+    assert crop_and_resize(img, 0.1, 80).min() >= 190
 
 
-def test_prepare_image_normalises():
-    # mild cast so the white-balance gains stay inside the clamps (see test_normalize)
+def test_prepare_image_normalises_and_returns_gains():
     img = np.full((100, 100, 3), (190, 170, 150), dtype=np.uint8)
-    out = prepare_image(img, NormalizeParams(), SampleConfig(crop_frac=0.0, max_side=50))
+    out, gains = prepare_image(img, NormalizeParams(), SampleConfig(crop_frac=0.0, max_side=50))
     assert out.dtype == np.float32 and out.shape == (50, 50, 3)
-    assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)  # grey-world made it neutral
+    assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)
+    assert gains.clamped == {"wb": False, "exposure": False}
 
 
-def test_sample_pixels_respects_lightness_bounds_and_count():
+def test_sample_pixels_respects_bounds_and_count():
     img = np.zeros((10, 20, 3), dtype=np.float32)
-    img[:, 10:] = 0.5  # left half black (L≈0), right half mid grey
+    img[:, 10:] = 0.5
     rng = np.random.default_rng(0)
     px = sample_pixels(img, 1000, 0.02, 0.98, rng)
-    assert px.shape == (100, 3)  # only the 100 mid-grey pixels qualify
-    assert np.allclose(px, 0.5)
-    px = sample_pixels(img, 30, 0.02, 0.98, rng)
-    assert px.shape == (30, 3)
+    assert px.shape == (100, 3) and np.allclose(px, 0.5)
+    assert sample_pixels(img, 30, 0.02, 0.98, rng).shape == (30, 3)
 
 
-def test_build_pool_and_cap(tmp_path):
-    rng = np.random.default_rng(0)
-    paths = []
-    for i in range(3):
-        p = tmp_path / f"{i}.jpg"
-        save_jpeg(rng.integers(30, 220, (40, 60, 3), dtype=np.uint8), p)
-        paths.append(p)
+@pytest.mark.parametrize("n, frac, expected_val", [(10, 0.2, 2), (5, 0.2, 1), (3, 0.5, 1), (1, 0.2, 0)])
+def test_split_sizes(n, frac, expected_val):
+    paths = [f"{i}.jpg" for i in range(n)]
+    train, val = split_paths(paths, frac, seed=0)
+    assert len(val) == expected_val
+    assert len(train) == n - expected_val
+    assert set(train).isdisjoint(val)
+    assert set(train) | set(val) == set(paths)
+
+
+def test_split_is_seeded_and_stable():
+    paths = [f"{i}.jpg" for i in range(20)]
+    assert split_paths(paths, 0.2, seed=3) == split_paths(paths, 0.2, seed=3)
+    assert split_paths(paths, 0.2, seed=3) != split_paths(paths, 0.2, seed=4)
+
+
+def test_build_pool_collects_diagnostics(tmp_path):
+    paths = _write_images(tmp_path / "src", 3)
     cfg = SampleConfig(crop_frac=0.0, max_side=60, pixels_per_image=500, max_pixels=800)
     pool = build_pool(paths, NormalizeParams(), cfg)
     assert isinstance(pool, PixelPool)
     assert pool.n_images == 3
     assert pool.srgb.shape == (800, 3) and pool.srgb.dtype == np.float32
-    assert pool.lab.shape == (800, 3)
     assert np.allclose(pool.lab, srgb_to_oklab(pool.srgb), atol=1e-6)
+    assert len(pool.wb_gains) == 3 and len(pool.exposure_gains) == 3
+    assert 0.0 <= pool.clamp_rate <= 1.0
+    assert pool.profiles  # profile name -> count
 
 
-def test_dir_fingerprint_changes_with_content(tmp_path):
-    a = tmp_path / "a.jpg"
-    a.write_bytes(b"12")
-    f1 = dir_fingerprint([a])
-    a.write_bytes(b"123")
-    assert dir_fingerprint([a]) != f1
-    assert len(f1) == 40
+def test_no_validation_pixel_appears_in_training(tmp_path):
+    """The split must happen before sampling, or held-out metrics are meaningless."""
+    paths = _write_images(tmp_path / "src", 10, seed=5)
+    cfg = SampleConfig(crop_frac=0.0, max_side=60, pixels_per_image=2000, val_fraction=0.3)
+    split = build_corpus(paths, NormalizeParams(), cfg, minimum=1, label="source")
+    assert len(split.val_paths) == 3 and len(split.train_paths) == 7
+    assert set(split.train_paths).isdisjoint(split.val_paths)
+
+    # Rebuild each side independently: the pools must match what build_corpus produced,
+    # which is only possible if neither drew pixels from the other's images.
+    expected_val = build_pool(split.val_paths, NormalizeParams(), cfg)
+    assert np.array_equal(split.val_pool.srgb, expected_val.srgb)
+
+
+def test_corpus_too_small_names_the_escape_hatch(tmp_path):
+    paths = _write_images(tmp_path / "src", 4)
+    cfg = SampleConfig(crop_frac=0.0, max_side=60, pixels_per_image=100)
+    with pytest.raises(CorpusTooSmall, match="--allow-small"):
+        build_corpus(paths, NormalizeParams(), cfg, minimum=30, label="source")
+    split = build_corpus(paths, NormalizeParams(), cfg, minimum=30, label="source", allow_small=True)
+    assert split.train_pool.n_images >= 1
+
+
+def test_corpus_sha1_tracks_content_not_names(tmp_path):
+    paths = _write_images(tmp_path / "a", 2)
+    first = corpus_sha1(paths)
+    assert first == corpus_sha1(paths)
+    assert len(first) == 40
+    save_jpeg(np.full((40, 60, 3), 7, dtype=np.uint8), paths[0])  # same name, new content
+    assert corpus_sha1(paths) != first
+
+
+def test_invalid_sample_config_names_the_field():
+    with pytest.raises(ValueError, match="val_fraction"):
+        SampleConfig(val_fraction=1.5)
+    with pytest.raises(ValueError, match="max_side"):
+        SampleConfig(max_side=0)
+    with pytest.raises(ValueError, match="crop_frac"):
+        SampleConfig(crop_frac=0.5)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_dataset.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_dataset.py -q` → FAIL, no module `kodachrome.train.dataset`.
 
-- [ ] **Step 3: Implement dataset.py**
+- [ ] **Step 3: Implement `dataset.py`**
 
 ```python
-"""Turn folders of images into pixel pools the fitter can work on.
+"""Turn folders of images into the pixel pools the fitter and evaluator use.
 
-Both corpora (camera samples and Kodachrome scans) go through the same steps:
+Both corpora go through the same steps:
 
-1. Crop ``crop_frac`` from every edge. Slide scans include the film rebate,
-   mount shadow or scanner bed; camera frames may have vignetted corners.
+1. Crop ``crop_frac`` from every edge. Slide scans carry film rebate, mount
+   shadow or scanner bed; camera frames can have vignetted corners.
 2. Downscale so the long side is ``max_side``. Colour statistics do not need
-   full resolution and this keeps the trainer fast.
-3. Normalise with :func:`kodachrome.normalize.normalize_float`, using the
-   **same** parameters the Pi will use. Sources get white balance; targets
-   are passed ``NormalizeParams(white_balance=False)`` by the caller because
-   the film's cast is part of the look.
-4. Sample up to ``pixels_per_image`` pixels whose Oklab lightness is inside
-   ``(l_min, l_max)``. Near-black pixels are borders and crushed shadows;
-   near-white pixels are blown highlights or scanner glare. Neither says
-   anything about how Kodachrome renders colour.
+   full resolution.
+3. Normalise with the same code the Pi runs. Sources get white balance;
+   targets are given ``NormalizeParams(white_balance=False)`` by the caller,
+   because the film's cast is part of the look being learned.
+4. Sample pixels whose Oklab lightness is inside ``(l_min, l_max)``.
+   Near-black pixels are borders and crushed shadows, near-white are blown
+   highlights and scanner glare; neither says anything about how the film
+   renders colour.
 
-The pool is capped at ``max_pixels`` by a seeded subsample so runs are
-reproducible and the transport step stays in seconds.
+Why the split happens here, before sampling
+-------------------------------------------
+Metrics computed on the pixels a LUT was fitted to measure how well the fit
+memorised its training data, not whether the look generalises. So each
+corpus is split **by image** first, and only then sampled. Splitting after
+sampling would be worse than useless: pixels from the same photograph are
+highly correlated, so a "held-out" pixel drawn from a training image leaks
+almost everything about its neighbours, and the reported improvement would
+be inflated in a way no seed average would reveal.
+
+Diagnostics travel with the pool
+--------------------------------
+``PixelPool`` carries the white balance and exposure gains applied to each
+image, how often a gain hit its clamp, and which ICC profiles were seen. A
+corpus where normalisation is clamping constantly, or which is secretly half
+Adobe RGB, produces a misleading fit; the report publishes these so it is
+visible rather than silent.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import cv2
 import numpy as np
 
+from .._cv2 import require_cv2
 from ..color import srgb_to_oklab
-from ..imageio import load_rgb
-from ..normalize import NormalizeParams, normalize_float
+from ..imageio import list_images, load_rgb
+from ..normalize import Gains, NormalizeParams, normalize_float
+
+cv2 = require_cv2()
+
+
+class CorpusTooSmall(ValueError):
+    """A corpus has too few images for a statistically meaningful fit."""
 
 
 @dataclass
@@ -2926,13 +4099,32 @@ class SampleConfig:
     l_min: float = 0.02
     l_max: float = 0.98
     max_pixels: int = 400_000
+    val_fraction: float = 0.2
     seed: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.crop_frac < 0.4:
+            raise ValueError(f"crop_frac must be in [0, 0.4), got {self.crop_frac}")
+        if self.max_side < 16:
+            raise ValueError(f"max_side must be at least 16, got {self.max_side}")
+        if self.pixels_per_image < 1:
+            raise ValueError(f"pixels_per_image must be positive, got {self.pixels_per_image}")
+        if self.max_pixels < 1:
+            raise ValueError(f"max_pixels must be positive, got {self.max_pixels}")
+        if not 0.0 <= self.val_fraction < 1.0:
+            raise ValueError(f"val_fraction must be in [0, 1), got {self.val_fraction}")
+        if not 0.0 <= self.l_min < self.l_max <= 1.0:
+            raise ValueError(f"l_min ({self.l_min}) must be below l_max ({self.l_max})")
 
 
 @dataclass
 class PixelPool:
     srgb: np.ndarray
     n_images: int
+    clamp_rate: float = 0.0
+    wb_gains: list = field(default_factory=list)
+    exposure_gains: list = field(default_factory=list)
+    profiles: dict = field(default_factory=dict)
     _lab: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     @property
@@ -2940,6 +4132,15 @@ class PixelPool:
         if self._lab is None:
             self._lab = srgb_to_oklab(self.srgb)
         return self._lab
+
+
+@dataclass
+class CorpusSplit:
+    train_paths: list[Path]
+    val_paths: list[Path]
+    train_pool: PixelPool
+    val_pool: PixelPool
+    corpus_sha1: str
 
 
 def crop_and_resize(rgb_u8: np.ndarray, crop_frac: float, max_side: int) -> np.ndarray:
@@ -2954,10 +4155,11 @@ def crop_and_resize(rgb_u8: np.ndarray, crop_frac: float, max_side: int) -> np.n
     return cv2.resize(np.ascontiguousarray(cropped), size, interpolation=cv2.INTER_AREA)
 
 
-def prepare_image(rgb_u8: np.ndarray, normalize_params: NormalizeParams, cfg: SampleConfig) -> np.ndarray:
+def prepare_image(
+    rgb_u8: np.ndarray, normalize_params: NormalizeParams, cfg: SampleConfig
+) -> tuple[np.ndarray, Gains]:
     small = crop_and_resize(rgb_u8, cfg.crop_frac, cfg.max_side).astype(np.float32) / 255.0
-    normalised, _ = normalize_float(small, normalize_params)
-    return normalised
+    return normalize_float(small, normalize_params)
 
 
 def sample_pixels(
@@ -2971,6 +4173,19 @@ def sample_pixels(
     return flat[keep]
 
 
+def split_paths(paths: Sequence, val_fraction: float, seed: int) -> tuple[list, list]:
+    """Split by image, deterministically. Validation gets ``floor(n * fraction)`` images."""
+    ordered = list(paths)
+    n_val = int(math.floor(len(ordered) * val_fraction))
+    if n_val == 0:
+        return ordered, []
+    rng = np.random.default_rng(seed)
+    val_idx = set(rng.choice(len(ordered), n_val, replace=False).tolist())
+    train = [p for i, p in enumerate(ordered) if i not in val_idx]
+    val = [p for i, p in enumerate(ordered) if i in val_idx]
+    return train, val
+
+
 def build_pool(
     paths: Sequence[Path],
     normalize_params: NormalizeParams,
@@ -2979,41 +4194,91 @@ def build_pool(
 ) -> PixelPool:
     rng = np.random.default_rng(cfg.seed)
     chunks: list[np.ndarray] = []
+    wb_gains: list[list[float]] = []
+    exposure_gains: list[float] = []
+    profiles: dict[str, int] = {}
+    clamped = 0
     for i, path in enumerate(paths, start=1):
-        img = prepare_image(load_rgb(path), normalize_params, cfg)
-        chunks.append(sample_pixels(img, cfg.pixels_per_image, cfg.l_min, cfg.l_max, rng))
+        rgb, meta = load_rgb(path)
+        profiles[meta.profile] = profiles.get(meta.profile, 0) + 1
+        prepared, gains = prepare_image(rgb, normalize_params, cfg)
+        wb_gains.append([round(float(g), 4) for g in gains.wb])
+        exposure_gains.append(round(float(gains.exposure), 4))
+        clamped += int(any(gains.clamped.values()))
+        chunks.append(sample_pixels(prepared, cfg.pixels_per_image, cfg.l_min, cfg.l_max, rng))
         if progress and i % 100 == 0:
             progress(f"  {i}/{len(paths)} images sampled")
+
     pixels = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 3), np.float32)
     if len(pixels) > cfg.max_pixels:
         pixels = pixels[rng.choice(len(pixels), cfg.max_pixels, replace=False)]
-    return PixelPool(srgb=np.ascontiguousarray(pixels, dtype=np.float32), n_images=len(paths))
+    return PixelPool(
+        srgb=np.ascontiguousarray(pixels, dtype=np.float32),
+        n_images=len(paths),
+        clamp_rate=round(clamped / max(len(paths), 1), 4),
+        wb_gains=wb_gains,
+        exposure_gains=exposure_gains,
+        profiles=profiles,
+    )
 
 
-def dir_fingerprint(paths: Sequence[Path]) -> str:
+def corpus_sha1(paths: Sequence[Path]) -> str:
+    """Hash the bytes of every file, so equal names with different content differ."""
     h = hashlib.sha1()
     for p in sorted(Path(x) for x in paths):
-        h.update(f"{p.name}:{p.stat().st_size}\n".encode())
+        h.update(p.name.encode())
+        h.update(hashlib.sha1(p.read_bytes()).digest())
     return h.hexdigest()
+
+
+def build_corpus(
+    dir_or_paths: str | Path | Sequence[Path],
+    normalize_params: NormalizeParams,
+    cfg: SampleConfig,
+    minimum: int,
+    label: str,
+    allow_small: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> CorpusSplit:
+    paths = (
+        list_images(dir_or_paths)
+        if isinstance(dir_or_paths, (str, Path))
+        else [Path(p) for p in dir_or_paths]
+    )
+    if len(paths) < minimum and not allow_small:
+        raise CorpusTooSmall(
+            f"{label} corpus has {len(paths)} images, fewer than the {minimum} needed for a "
+            f"meaningful fit. Add more images, or pass --allow-small to proceed anyway."
+        )
+    train_paths, val_paths = split_paths(paths, cfg.val_fraction, cfg.seed)
+    if progress:
+        progress(f"{label}: {len(train_paths)} train, {len(val_paths)} validation images")
+    return CorpusSplit(
+        train_paths=train_paths,
+        val_paths=val_paths,
+        train_pool=build_pool(train_paths, normalize_params, cfg, progress),
+        val_pool=build_pool(val_paths, normalize_params, cfg, progress),
+        corpus_sha1=corpus_sha1(paths),
+    )
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [ ] **Step 4: Run and commit**
 
 Run: `.venv/bin/pytest tests/test_dataset.py -q` → all pass.
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/train/dataset.py tests/test_dataset.py
-git commit -m "feat: dataset preparation into normalised pixel pools
+git commit -m "feat: dataset pools with split-by-image, corpus hashing and normalisation diagnostics
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 13: Distribution transport (`train/transport.py`)
+### Task 15: Distribution transport (`train/transport.py`)
 
-Implements spec 6.4 steps 1 and 2 and the sliced Wasserstein metric of 6.5.
+Implements spec 6.4 steps 1 and 2 and the sliced Wasserstein metric used by spec 6.5.
 
 **Files:**
 - Create: `kodachrome/train/transport.py`, `tests/test_transport.py`
@@ -3149,17 +4414,24 @@ possible, where would each camera colour go?" That is a transport problem;
 its answer gives every source pixel a partner, and the LUT is then fitted to
 those pairs (see ``lutfit.py``).
 
-Content bias and hue reweighting
---------------------------------
+Content bias and hue reweighting: a heuristic, not a constraint
+---------------------------------------------------------------
 The two corpora do not show the same things. The 1940s FSA photographs are
 full of fields, khaki and weathered wood; a modern indoor sample set is not.
 Raw distribution matching would happily turn a blue wall green because the
-film corpus has more green. ``hue_weights`` prevents that: target pixels are
-reweighted so the target's hue histogram matches the source's. The transport
-can then only learn how Kodachrome renders each hue (its saturation,
-lightness and tone curve, plus local hue shifts smaller than a bin), not how
-much of each hue the 1940s contained. This deliberately caps learnable hue
-rotation at about one bin (15 degrees for 24 bins).
+film corpus contains more green. ``hue_weights`` reduces that: target pixels
+are reweighted so the target's hue histogram matches the source's, removing
+the largest content-driven bias.
+
+Be precise about what this does **not** do. The transport still operates on
+the full three-dimensional distribution and can move individual pixels
+across hue bins; matching the aggregate histogram does not constrain where
+any particular pixel goes. Clipping the weights to ``[0.2, 5.0]`` also means
+the reweighted histograms match only approximately when a hue is nearly
+absent from one side. So this is a bias-reduction heuristic, not a guarantee
+about what is learned, and the report publishes the residual histogram
+difference (``hue_hist_residual``) so its size is visible rather than
+assumed. Spec section 1 states the resulting limit on the project's claim.
 
 Iterative distribution transfer (Pitié, Kokaram, Dahyot 2005)
 -------------------------------------------------------------
@@ -3298,7 +4570,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 14: Smooth LUT regression (`train/lutfit.py`)
+### Task 16: Smooth LUT regression (`train/lutfit.py`)
 
 Implements spec 6.4 step 3.
 
@@ -3558,22 +4830,549 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 15: Training report (`train/report.py`)
+### Task 17: Paired evaluation and LUT safety gates (`train/evaluate.py`)
 
-Implements spec 6.5. The report is how a human judges the fit, so it must be readable, not just present.
+Implements spec 6.5. Fixes F-05 and F-18. This is the task that makes the project's central claim measurable.
+
+**Files:**
+- Create: `kodachrome/train/evaluate.py`, `tests/test_evaluate.py`
+
+**Interfaces:**
+- Consumes: `LUT3D`, `PixelPool`, `sliced_wasserstein`, `hue_bin_index`, colour conversions
+- Produces:
+  - `@dataclass Evaluator(src_idx, tgt_idx, directions)` built by `Evaluator.build(src_pool, tgt_pool, tgt_weights, n_proj=64, max_points=100_000, seed=0)`, with `distance(src_lab) -> float`
+  - `swd_seed_spread(src_pool, tgt_pool, tgt_weights, lut, seeds=(0,1,2,3,4)) -> (mean, spread)`
+  - `grey_axis_is_monotone(lut, tolerance=1e-3) -> bool`
+  - `channels_are_monotone(lut, tolerance=1e-3) -> bool`
+  - `neutral_axis_max_chroma(lut) -> float`
+  - `clipped_volume_fraction(lut, eps=1e-4) -> float`
+  - `hue_bin_shifts(src_srgb, lut, n_bins=24, chroma_floor=0.03) -> list[dict]`
+  - `hue_hist_residual(src_lab, tgt_lab, weights, n_bins, chroma_floor) -> float`
+  - `@dataclass Gate(name, value, threshold, passed, detail)`
+  - `check_gates(metrics) -> list[Gate]`
+  - `evaluate(...) -> dict` (the metrics block of spec 5.8)
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_evaluate.py`:
+```python
+import numpy as np
+import pytest
+
+from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
+from kodachrome.lut import LUT3D
+from kodachrome.train.dataset import PixelPool
+from kodachrome.train.evaluate import (
+    Evaluator,
+    channels_are_monotone,
+    check_gates,
+    clipped_volume_fraction,
+    evaluate,
+    grey_axis_is_monotone,
+    hue_bin_shifts,
+    hue_hist_residual,
+    neutral_axis_max_chroma,
+    swd_seed_spread,
+)
+
+
+def _pool(seed, n=4000, scale=1.0, offset=0.0):
+    rng = np.random.default_rng(seed)
+    srgb = np.clip(rng.random((n, 3), dtype=np.float32) * scale + offset, 0, 1).astype(np.float32)
+    return PixelPool(srgb=srgb, n_images=5)
+
+
+def _darkening_lut(n=9, gamma=1.5):
+    return LUT3D(LUT3D.identity(n).table**gamma)
+
+
+def test_identity_lut_gives_identical_before_and_after():
+    """The whole point of a paired evaluator: no LUT change, no metric change."""
+    src, tgt = _pool(0), _pool(1, scale=0.8)
+    weights = np.ones(len(tgt.srgb))
+    ev = Evaluator.build(src, tgt, weights, seed=0)
+    before = ev.distance(src.lab)
+    after = ev.distance(srgb_to_oklab(LUT3D.identity(33).apply_numpy(src.srgb)))
+    assert after == pytest.approx(before, abs=1e-6)
+
+
+def test_evaluator_is_reusable_and_deterministic():
+    src, tgt = _pool(2), _pool(3)
+    ev = Evaluator.build(src, tgt, np.ones(len(tgt.srgb)), seed=7)
+    assert ev.distance(src.lab) == ev.distance(src.lab)
+    again = Evaluator.build(src, tgt, np.ones(len(tgt.srgb)), seed=7)
+    assert ev.distance(src.lab) == pytest.approx(again.distance(src.lab), abs=1e-12)
+
+
+def test_a_real_improvement_beats_the_seed_spread():
+    """A LUT that genuinely moves the source toward the target must clear the noise floor."""
+    rng = np.random.default_rng(4)
+    src = PixelPool(rng.random((6000, 3), dtype=np.float32).astype(np.float32), 5)
+    tgt = PixelPool(np.clip(src.srgb**1.5 + rng.normal(0, 0.01, src.srgb.shape), 0, 1).astype(np.float32), 5)
+    weights = np.ones(len(tgt.srgb))
+    ev = Evaluator.build(src, tgt, weights, seed=0)
+    before = ev.distance(src.lab)
+    lut = _darkening_lut(17, gamma=1.5)
+    after = ev.distance(srgb_to_oklab(lut.apply_numpy(src.srgb)))
+    _mean, spread = swd_seed_spread(src, tgt, weights, lut)
+    assert after < before
+    assert before - after > 3 * spread
+
+
+def test_seed_spread_is_small_and_positive():
+    src, tgt = _pool(5), _pool(6, scale=0.7)
+    mean, spread = swd_seed_spread(src, tgt, np.ones(len(tgt.srgb)), LUT3D.identity(9))
+    assert mean > 0 and spread >= 0
+    assert spread < mean
+
+
+def test_grey_axis_monotonicity():
+    assert grey_axis_is_monotone(LUT3D.identity(9))
+    t = LUT3D.identity(9).table.copy()
+    t[4, 4, 4] = 0.05
+    assert not grey_axis_is_monotone(LUT3D(t))
+
+
+def test_channel_monotonicity_catches_a_per_channel_inversion():
+    assert channels_are_monotone(LUT3D.identity(9))
+    t = LUT3D.identity(9).table.copy()
+    t[5, :, :, 0] = 0.1  # red output dips as red input rises
+    assert not channels_are_monotone(LUT3D(t))
+
+
+def test_neutral_axis_chroma_catches_a_tinting_lut():
+    assert neutral_axis_max_chroma(LUT3D.identity(33)) < 0.01
+    t = LUT3D.identity(33).table.copy()
+    for i in range(33):
+        t[i, i, i, 2] = min(1.0, t[i, i, i, 2] + 0.25)  # push greys blue
+    assert neutral_axis_max_chroma(LUT3D(t)) > 0.05
+
+
+def test_clipped_volume_fraction():
+    assert clipped_volume_fraction(LUT3D.identity(9)) < 0.35  # cube faces are legitimately at 0/1
+    t = np.clip(LUT3D.identity(9).table * 3.0, 0, 1)
+    assert clipped_volume_fraction(LUT3D(t)) > 0.6
+
+
+def test_hue_bin_shifts_report_darkening():
+    rng = np.random.default_rng(0)
+    src = (rng.random((5000, 3), dtype=np.float32) * 0.6 + 0.2).astype(np.float32)
+    shifts = hue_bin_shifts(src, _darkening_lut(), n_bins=12)
+    assert len(shifts) == 13
+    populated = [s for s in shifts if s["count"] > 0]
+    assert populated and all(s["delta_L"] < 0 for s in populated)
+    assert {"bin", "hue_deg", "count", "delta_L", "chroma_ratio", "delta_hue_deg"} <= set(shifts[0])
+
+
+def test_hue_hist_residual_is_zero_when_reweighting_is_exact():
+    from kodachrome.train.transport import hue_weights
+
+    rng = np.random.default_rng(8)
+    src_lab = lch_to_oklab(
+        np.stack([rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, 2 * np.pi, 8000)], 1)
+    )
+    tgt_lab = lch_to_oklab(
+        np.stack([rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, np.pi, 8000)], 1)
+    )
+    w = hue_weights(src_lab, tgt_lab, 24)
+    assert hue_hist_residual(src_lab, tgt_lab, w, 24, 0.03) < 0.02
+
+
+def test_evaluate_returns_the_documented_metric_block():
+    src, tgt = _pool(9), _pool(10, scale=0.8)
+    weights = np.ones(len(tgt.srgb))
+    lut = _darkening_lut(9)
+    partners = srgb_to_oklab(lut.apply_numpy(src.srgb))
+    metrics = evaluate(
+        lut=lut,
+        val_src=src,
+        val_tgt=tgt,
+        val_weights=weights,
+        train_src=src,
+        train_tgt=tgt,
+        train_weights=weights,
+        transported_lab=partners,
+        n_bins=12,
+        chroma_floor=0.03,
+        seed=0,
+    )
+    for key in (
+        "swd_before", "swd_after", "swd_identity", "swd_seed_spread",
+        "transport_gamut_clip_deltaE", "lut_fit_rms_deltaE", "grey_axis_monotone",
+        "channel_monotone", "neutral_axis_max_chroma", "clipped_volume_fraction",
+        "hue_bins", "train_swd_before", "train_swd_after",
+    ):
+        assert key in metrics, key
+    assert metrics["swd_identity"] == pytest.approx(metrics["swd_before"], abs=1e-6)
+
+
+def test_gates_pass_and_fail_explicitly():
+    good = {
+        "swd_before": 0.10, "swd_after": 0.04, "swd_seed_spread": 0.001,
+        "grey_axis_monotone": True, "channel_monotone": True,
+        "neutral_axis_max_chroma": 0.005, "clipped_volume_fraction": 0.01,
+    }
+    assert all(g.passed for g in check_gates(good))
+
+    marginal = {**good, "swd_after": 0.0999}          # improvement inside the noise floor
+    failed = [g.name for g in check_gates(marginal) if not g.passed]
+    assert "improvement_exceeds_noise" in failed
+
+    tinted = {**good, "neutral_axis_max_chroma": 0.09}
+    assert "neutral_axis_chroma" in [g.name for g in check_gates(tinted) if not g.passed]
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `.venv/bin/pytest tests/test_evaluate.py -q` → FAIL, no module `kodachrome.train.evaluate`.
+
+- [ ] **Step 3: Implement `evaluate.py`**
+
+```python
+"""Measuring whether the fitted LUT actually did what we claim, and is safe.
+
+Two jobs live here, and both exist because the obvious way to do them is
+wrong.
+
+**Paired measurement.** The headline number is "distance from the graded
+images to the Kodachrome colour cloud, before and after". Computing that
+twice with fresh random samples and fresh random projections means the two
+numbers differ partly because the LUT changed the pixels and partly because
+the sampling changed - and on a good day the sampling noise is the same size
+as the effect. ``Evaluator`` therefore fixes the sample indices and the
+projection directions once, and both measurements reuse them. A test asserts
+that an identity LUT produces *exactly* equal before and after values, which
+is only true if the evaluator is genuinely paired.
+
+Alongside it, ``swd_seed_spread`` re-runs the measurement across five
+evaluator seeds and reports the spread, so a claimed improvement can be
+compared against the noise floor instead of being asserted.
+
+Metrics are computed on **held-out images**. Values on the training pool are
+reported too, prefixed ``train_``, and are only useful for spotting
+overfitting.
+
+**Safety gates.** A LUT can reduce the distribution distance and still be
+unusable. Checking only that neutral grey keeps rising in luminance, as the
+first version did, misses a LUT that tints greys blue, one whose red channel
+folds back on itself while overall luminance still climbs, and one that
+crushes most of the colour cube onto the gamut boundary. Each of those is
+checked directly, with a numeric threshold agreed before tuning so the gates
+cannot be quietly relaxed to fit whatever the fit produced.
+
+``transport_gamut_clip_deltaE`` is separated from ``lut_fit_rms_deltaE``
+deliberately: the first says "the transport asked for colours outside sRGB",
+the second says "a smooth LUT could not express what was asked". Folding
+them together, as the first version did, made a gamut problem look like a
+fitting problem.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from ..color import luminance, oklab_to_lch, oklab_to_srgb, srgb_to_linear, srgb_to_oklab
+from ..lut import LUT3D
+from .dataset import PixelPool
+from .transport import hue_bin_index, hue_histogram
+
+# Numeric acceptance thresholds, fixed before tuning (spec 6.5).
+NOISE_MARGIN = 3.0
+MAX_NEUTRAL_CHROMA = 0.02
+MAX_CLIPPED_VOLUME = 0.05
+
+
+@dataclass
+class Evaluator:
+    """A fixed sample and projection set, so before/after differ only by the LUT."""
+
+    src_idx: np.ndarray
+    tgt_points: np.ndarray
+    directions: np.ndarray
+
+    @classmethod
+    def build(
+        cls,
+        src_pool: PixelPool,
+        tgt_pool: PixelPool,
+        tgt_weights: np.ndarray | None = None,
+        n_proj: int = 64,
+        max_points: int = 100_000,
+        seed: int = 0,
+    ) -> Evaluator:
+        rng = np.random.default_rng(seed)
+        n = min(len(src_pool.srgb), len(tgt_pool.srgb), max_points)
+        src_idx = rng.choice(len(src_pool.srgb), n, replace=False)
+        if tgt_weights is not None:
+            p = np.asarray(tgt_weights, dtype=np.float64)
+            tgt_idx = rng.choice(len(tgt_pool.srgb), n, replace=True, p=p / p.sum())
+        else:
+            tgt_idx = rng.choice(len(tgt_pool.srgb), n, replace=False)
+        directions = rng.standard_normal((n_proj, 3))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        return cls(
+            src_idx=src_idx,
+            tgt_points=np.sort(np.asarray(tgt_pool.lab, dtype=np.float64)[tgt_idx] @ directions.T, axis=0),
+            directions=directions,
+        )
+
+    def distance(self, src_lab: np.ndarray) -> float:
+        """Sliced Wasserstein distance from these source pixels to the fixed target sample."""
+        projected = np.sort(
+            np.asarray(src_lab, dtype=np.float64)[self.src_idx] @ self.directions.T, axis=0
+        )
+        return float(np.sqrt(np.mean((projected - self.tgt_points) ** 2)))
+
+
+def swd_seed_spread(
+    src_pool: PixelPool,
+    tgt_pool: PixelPool,
+    tgt_weights: np.ndarray | None,
+    lut: LUT3D,
+    seeds: tuple[int, ...] = (0, 1, 2, 3, 4),
+) -> tuple[float, float]:
+    """Mean and standard deviation of the graded distance across evaluator seeds."""
+    graded_lab = srgb_to_oklab(lut.apply_numpy(src_pool.srgb))
+    values = [
+        Evaluator.build(src_pool, tgt_pool, tgt_weights, seed=s).distance(graded_lab) for s in seeds
+    ]
+    return float(np.mean(values)), float(np.std(values))
+
+
+def _grey_ramp(n: int = 256) -> np.ndarray:
+    return np.repeat(np.linspace(0, 1, n, dtype=np.float32)[:, None], 3, axis=1)
+
+
+def grey_axis_is_monotone(lut: LUT3D, tolerance: float = 1e-3) -> bool:
+    """Luminance must never fall as neutral input rises."""
+    lum = luminance(srgb_to_linear(lut.apply_numpy(_grey_ramp())))
+    return bool(np.all(np.diff(lum) >= -tolerance))
+
+
+def channels_are_monotone(lut: LUT3D, tolerance: float = 1e-3) -> bool:
+    """Each output channel must not fall as its own input axis rises.
+
+    The grey-axis check alone passes a LUT whose red channel folds back while
+    total luminance keeps climbing, which shows up as posterised or inverted
+    colour in a gradient.
+    """
+    table = lut.table
+    for axis in range(3):
+        moved = np.moveaxis(table[..., axis], axis, 0)
+        if np.min(np.diff(moved, axis=0)) < -tolerance:
+            return False
+    return True
+
+
+def neutral_axis_max_chroma(lut: LUT3D) -> float:
+    """Largest Oklab chroma the LUT gives a neutral input: a tint detector."""
+    return float(oklab_to_lch(srgb_to_oklab(lut.apply_numpy(_grey_ramp())))[:, 1].max())
+
+
+def clipped_volume_fraction(lut: LUT3D, eps: float = 1e-4) -> float:
+    """Fraction of grid nodes with any channel pinned at 0 or 1."""
+    t = lut.table
+    pinned = (t <= eps) | (t >= 1.0 - eps)
+    return float(np.any(pinned, axis=-1).mean())
+
+
+def hue_bin_shifts(
+    src_srgb: np.ndarray, lut: LUT3D, n_bins: int = 24, chroma_floor: float = 0.03
+) -> list[dict]:
+    """Per-hue-bin mean change in lightness, chroma and hue, in plain units."""
+    before = srgb_to_oklab(src_srgb)
+    after = srgb_to_oklab(lut.apply_numpy(src_srgb))
+    idx = hue_bin_index(before, n_bins, chroma_floor)
+    lch_b, lch_a = oklab_to_lch(before), oklab_to_lch(after)
+    d_hue = np.degrees(np.angle(np.exp(1j * (lch_a[:, 2] - lch_b[:, 2]))))
+    out = []
+    for b in range(n_bins + 1):
+        sel = idx == b
+        count = int(sel.sum())
+        centre = (b + 0.5) * 360.0 / n_bins if b < n_bins else None
+        if count == 0:
+            out.append(
+                {"bin": b, "hue_deg": centre, "count": 0, "delta_L": 0.0,
+                 "chroma_ratio": 1.0, "delta_hue_deg": 0.0}
+            )
+            continue
+        chroma_before = max(float(lch_b[sel, 1].mean()), 1e-6)
+        out.append(
+            {
+                "bin": b,
+                "hue_deg": centre,
+                "count": count,
+                "delta_L": round(float((lch_a[sel, 0] - lch_b[sel, 0]).mean()), 4),
+                "chroma_ratio": round(float(lch_a[sel, 1].mean()) / chroma_before, 3),
+                "delta_hue_deg": round(float(d_hue[sel].mean()), 2) if b < n_bins else 0.0,
+            }
+        )
+    return out
+
+
+def hue_hist_residual(
+    src_lab: np.ndarray,
+    tgt_lab: np.ndarray,
+    weights: np.ndarray,
+    n_bins: int,
+    chroma_floor: float,
+) -> float:
+    """How well reweighting actually equalised the hue histograms (0 = perfectly)."""
+    h_src = hue_histogram(src_lab, n_bins, chroma_floor)
+    h_tgt = hue_histogram(tgt_lab, n_bins, chroma_floor, weights=weights)
+    return float(np.abs(h_src - h_tgt).max())
+
+
+@dataclass
+class Gate:
+    name: str
+    value: float | bool
+    threshold: float | bool
+    passed: bool
+    detail: str
+
+
+def check_gates(metrics: dict) -> list[Gate]:
+    """The numeric bar an artifact must clear, fixed before tuning."""
+    margin = NOISE_MARGIN * float(metrics.get("swd_seed_spread", 0.0))
+    improvement = float(metrics["swd_before"]) - float(metrics["swd_after"])
+    gates = [
+        Gate(
+            "improvement_exceeds_noise",
+            round(improvement, 6),
+            round(margin, 6),
+            improvement > margin,
+            f"held-out distance fell by {improvement:.5f}; needs to beat "
+            f"{NOISE_MARGIN}x the seed spread ({margin:.5f})",
+        ),
+        Gate(
+            "grey_axis_monotone",
+            bool(metrics["grey_axis_monotone"]),
+            True,
+            bool(metrics["grey_axis_monotone"]),
+            "neutral greys must not darken as input brightens",
+        ),
+        Gate(
+            "channel_monotone",
+            bool(metrics["channel_monotone"]),
+            True,
+            bool(metrics["channel_monotone"]),
+            "each output channel must rise with its own input",
+        ),
+        Gate(
+            "neutral_axis_chroma",
+            round(float(metrics["neutral_axis_max_chroma"]), 5),
+            MAX_NEUTRAL_CHROMA,
+            float(metrics["neutral_axis_max_chroma"]) < MAX_NEUTRAL_CHROMA,
+            "neutral input must stay close to neutral output",
+        ),
+        Gate(
+            "clipped_volume",
+            round(float(metrics["clipped_volume_fraction"]), 5),
+            MAX_CLIPPED_VOLUME,
+            float(metrics["clipped_volume_fraction"]) < MAX_CLIPPED_VOLUME,
+            "too much of the colour cube is pinned to the gamut boundary",
+        ),
+    ]
+    return gates
+
+
+def evaluate(
+    lut: LUT3D,
+    val_src: PixelPool,
+    val_tgt: PixelPool,
+    val_weights: np.ndarray | None,
+    train_src: PixelPool,
+    train_tgt: PixelPool,
+    train_weights: np.ndarray | None,
+    transported_lab: np.ndarray,
+    n_bins: int = 24,
+    chroma_floor: float = 0.03,
+    seed: int = 0,
+) -> dict:
+    """The metrics block of params.json. Primary numbers are held-out."""
+    identity = LUT3D.identity(lut.size)
+
+    val_ev = Evaluator.build(val_src, val_tgt, val_weights, seed=seed)
+    swd_before = val_ev.distance(val_src.lab)
+    swd_after = val_ev.distance(srgb_to_oklab(lut.apply_numpy(val_src.srgb)))
+    swd_identity = val_ev.distance(srgb_to_oklab(identity.apply_numpy(val_src.srgb)))
+    _mean, spread = swd_seed_spread(val_src, val_tgt, val_weights, lut)
+
+    train_ev = Evaluator.build(train_src, train_tgt, train_weights, seed=seed)
+    train_before = train_ev.distance(train_src.lab)
+    train_after = train_ev.distance(srgb_to_oklab(lut.apply_numpy(train_src.srgb)))
+
+    # Separate "the transport wanted out-of-gamut colours" from "the LUT could not fit".
+    clipped_partners_lab = srgb_to_oklab(np.clip(oklab_to_srgb(transported_lab), 0.0, 1.0))
+    clip_error = float(
+        np.sqrt(np.mean(np.sum((clipped_partners_lab - transported_lab) ** 2, axis=1)))
+    )
+    graded_train_lab = srgb_to_oklab(lut.apply_numpy(train_src.srgb))
+    fit_error = float(
+        np.sqrt(np.mean(np.sum((graded_train_lab - clipped_partners_lab) ** 2, axis=1)))
+    )
+
+    return {
+        "swd_before": round(swd_before, 6),
+        "swd_after": round(swd_after, 6),
+        "swd_identity": round(swd_identity, 6),
+        "swd_seed_spread": round(spread, 6),
+        "train_swd_before": round(train_before, 6),
+        "train_swd_after": round(train_after, 6),
+        "transport_gamut_clip_deltaE": round(clip_error, 6),
+        "lut_fit_rms_deltaE": round(fit_error, 6),
+        "grey_axis_monotone": grey_axis_is_monotone(lut),
+        "channel_monotone": channels_are_monotone(lut),
+        "neutral_axis_max_chroma": round(neutral_axis_max_chroma(lut), 6),
+        "clipped_volume_fraction": round(clipped_volume_fraction(lut), 6),
+        "hue_bins": hue_bin_shifts(val_src.srgb, lut, n_bins, chroma_floor),
+        "n_val_source_pixels": int(len(val_src.srgb)),
+        "n_val_target_pixels": int(len(val_tgt.srgb)),
+    }
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `.venv/bin/pytest tests/test_evaluate.py -q` → all pass.
+
+`test_identity_lut_gives_identical_before_and_after` is the load-bearing one. If it fails, the evaluator is not truly paired: check that `Evaluator.build` stores the sorted **target** projections once and that `distance` re-projects only the source. Do not relax its tolerance.
+
+If `test_clipped_volume_fraction`'s identity bound of 0.35 proves wrong, compute the true value for an identity LUT (the six cube faces are legitimately pinned) and set the test bound just above it, recording the number in `docs/decisions.md`. Do not change `MAX_CLIPPED_VOLUME`, which is a gate on real fits, not on the identity.
+
+- [ ] **Step 5: Commit**
+
+```bash
+.venv/bin/ruff check kodachrome tests
+git add kodachrome/train/evaluate.py tests/test_evaluate.py
+git commit -m "feat: paired held-out evaluator, seed spread and numeric LUT safety gates
+
+Fixes a metric that previously drew a fresh seed per measurement, so part of
+any reported improvement was sampling noise. Adds per-channel monotonicity,
+neutral-axis chroma and clipped-volume checks with thresholds fixed before
+tuning.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 18: Training report (`train/report.py`)
+
+Implements spec 6.5's rendered output. The report is how a human judges a fit, so it must be readable, not merely present.
 
 **Files:**
 - Create: `kodachrome/train/report.py`, `tests/test_report.py`
 
 **Interfaces:**
-- Consumes: `LUT3D`, `NormalizeParams`, `SampleConfig`, `prepare_image`, `load_rgb`, `PixelPool`, `hue_bin_index`, `sliced_wasserstein`, `srgb_to_oklab`, `oklab_to_srgb`, `oklab_to_lch`, `lch_to_oklab`, `srgb_to_linear`, `luminance`
+- Consumes: `LUT3D`, `NormalizeParams`, `SampleConfig`, `prepare_image`, `load_rgb`, `CorpusSplit`, `Gate`, colour conversions
 - Produces:
   - `render_contact_sheet(source_paths, target_paths, lut, source_normalize, target_normalize, cfg, out_path, n=8, thumb=240, rng=None) -> Path`
-  - `render_ramps(lut, out_path) -> Path`
-  - `grey_axis_is_monotone(lut) -> bool`
-  - `hue_bin_shifts(src_srgb, lut, n_bins=24, chroma_floor=0.03) -> list[dict]` with keys `bin`, `hue_deg`, `count`, `delta_L`, `chroma_ratio`, `delta_hue_deg`
-  - `compute_metrics(source_pool, target_pool, target_weights, transported_lab, lut, n_bins, chroma_floor, rng=None) -> dict`
-  - `write_report(out_dir, lut, source_pool, target_pool, target_weights, transported_lab, source_paths, target_paths, source_normalize, target_normalize, cfg, n_bins, chroma_floor) -> dict` (the metrics; writes `contact_sheet.png`, `ramps.png`, `metrics.json`)
+  - `render_ramps(lut, out_path, width=768, band=36) -> Path`
+  - `render_diagnostics(source_pool, target_pool, out_path) -> Path`
+  - `write_report(out_dir, lut, metrics, gates, source_split, target_split, source_normalize, target_normalize, cfg) -> Path`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3587,18 +5386,18 @@ from PIL import Image
 from kodachrome.imageio import save_jpeg
 from kodachrome.lut import LUT3D
 from kodachrome.normalize import NormalizeParams
-from kodachrome.train.dataset import PixelPool, SampleConfig
+from kodachrome.train.dataset import CorpusSplit, PixelPool, SampleConfig
+from kodachrome.train.evaluate import check_gates
 from kodachrome.train.report import (
-    compute_metrics,
-    grey_axis_is_monotone,
-    hue_bin_shifts,
+    render_contact_sheet,
+    render_diagnostics,
     render_ramps,
     write_report,
 )
 
 
 def _images(dir_path, n, seed):
-    dir_path.mkdir()
+    dir_path.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     paths = []
     for i in range(n):
@@ -3608,98 +5407,107 @@ def _images(dir_path, n, seed):
     return paths
 
 
+def _pool(seed, n_images=3):
+    rng = np.random.default_rng(seed)
+    return PixelPool(
+        srgb=rng.random((1500, 3), dtype=np.float32),
+        n_images=n_images,
+        clamp_rate=0.25,
+        wb_gains=[[0.9, 1.0, 1.1]] * n_images,
+        exposure_gains=[1.1] * n_images,
+        profiles={"sRGB (assumed)": n_images},
+    )
+
+
+def _split(tmp_path, name, seed):
+    paths = _images(tmp_path / name, 4, seed)
+    return CorpusSplit(paths[:3], paths[3:], _pool(seed), _pool(seed + 1, 1), "abc123")
+
+
 def _darkening_lut(n=9):
-    t = LUT3D.identity(n).table.copy()
-    t[..., :] = t[..., :] ** 1.5
-    return LUT3D(t)
+    return LUT3D(LUT3D.identity(n).table**1.5)
 
 
-def test_grey_axis_monotone_detects_inversion():
-    assert grey_axis_is_monotone(LUT3D.identity(9))
-    t = LUT3D.identity(9).table.copy()
-    t[4, 4, 4] = 0.05  # dip in the middle of the grey axis
-    assert not grey_axis_is_monotone(LUT3D(t))
-
-
-def test_hue_bin_shifts_report_darkening():
-    rng = np.random.default_rng(0)
-    src = rng.random((5000, 3), dtype=np.float32) * 0.6 + 0.2
-    shifts = hue_bin_shifts(src, _darkening_lut(), n_bins=12)
-    assert len(shifts) == 13
-    populated = [s for s in shifts if s["count"] > 0]
-    assert all(s["delta_L"] < 0 for s in populated)
-    assert {"bin", "hue_deg", "count", "delta_L", "chroma_ratio", "delta_hue_deg"} <= set(shifts[0])
-
-
-def test_render_ramps_writes_png(tmp_path):
+def test_render_ramps_writes_a_readable_png(tmp_path):
     out = render_ramps(LUT3D.identity(9), tmp_path / "ramps.png")
     with Image.open(out) as im:
         assert im.size[0] >= 512 and im.size[1] > 100
 
 
-def test_compute_metrics_keys(tmp_path):
-    rng = np.random.default_rng(1)
-    src = PixelPool(rng.random((2000, 3), dtype=np.float32), n_images=2)
-    tgt = PixelPool(rng.random((2000, 3), dtype=np.float32) * 0.8, n_images=2)
-    w = np.ones(2000)
-    metrics = compute_metrics(src, tgt, w, tgt.lab, LUT3D.identity(9), 12, 0.03, rng=np.random.default_rng(0))
-    assert {"swd_before", "swd_after", "lut_fit_rms_deltaE", "grey_axis_monotone", "hue_bins"} <= set(metrics)
-    assert metrics["grey_axis_monotone"] is True
+def test_render_diagnostics_writes_a_png(tmp_path):
+    out = render_diagnostics(_pool(0), _pool(1), tmp_path / "diag.png")
+    with Image.open(out) as im:
+        assert im.size[0] > 200 and im.size[1] > 100
 
 
-def test_write_report_produces_files(tmp_path):
-    src_paths = _images(tmp_path / "src", 3, 0)
-    tgt_paths = _images(tmp_path / "tgt", 3, 1)
-    rng = np.random.default_rng(2)
-    src = PixelPool(rng.random((1000, 3), dtype=np.float32), n_images=3)
-    tgt = PixelPool(rng.random((1000, 3), dtype=np.float32), n_images=3)
+def test_contact_sheet_shows_three_rows(tmp_path):
+    src = _images(tmp_path / "src", 3, 0)
+    tgt = _images(tmp_path / "tgt", 3, 1)
+    out = render_contact_sheet(
+        src, tgt, _darkening_lut(), NormalizeParams(), NormalizeParams(white_balance=False),
+        SampleConfig(crop_frac=0.0, max_side=80), tmp_path / "sheet.png", n=3, thumb=64,
+    )
+    with Image.open(out) as im:
+        assert im.height > 3 * 64  # three labelled rows stacked
+
+
+def test_write_report_produces_every_artifact(tmp_path):
+    metrics = {
+        "swd_before": 0.1, "swd_after": 0.05, "swd_identity": 0.1, "swd_seed_spread": 0.001,
+        "train_swd_before": 0.1, "train_swd_after": 0.04,
+        "transport_gamut_clip_deltaE": 0.001, "lut_fit_rms_deltaE": 0.01,
+        "grey_axis_monotone": True, "channel_monotone": True,
+        "neutral_axis_max_chroma": 0.004, "clipped_volume_fraction": 0.01,
+        "hue_bins": [{"bin": 0, "hue_deg": 7.5, "count": 10, "delta_L": -0.01,
+                      "chroma_ratio": 1.1, "delta_hue_deg": 0.5}],
+    }
     out_dir = tmp_path / "report"
-    metrics = write_report(
+    write_report(
         out_dir,
         _darkening_lut(),
-        src,
-        tgt,
-        np.ones(1000),
-        tgt.lab,
-        src_paths,
-        tgt_paths,
+        metrics,
+        check_gates(metrics),
+        _split(tmp_path, "src", 0),
+        _split(tmp_path, "tgt", 5),
         NormalizeParams(),
         NormalizeParams(white_balance=False),
         SampleConfig(crop_frac=0.0, max_side=80),
-        n_bins=12,
-        chroma_floor=0.03,
     )
     assert (out_dir / "contact_sheet.png").exists()
     assert (out_dir / "ramps.png").exists()
+    assert (out_dir / "diagnostics.png").exists()
     saved = json.loads((out_dir / "metrics.json").read_text())
-    assert saved["swd_before"] == metrics["swd_before"]
+    assert saved["swd_after"] == 0.05
+    assert saved["gates"][0]["passed"] in (True, False)
+    summary = (out_dir / "summary.txt").read_text()
+    assert "held-out" in summary and "PASS" in summary
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_report.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_report.py -q` → FAIL, no module `kodachrome.train.report`.
 
-- [ ] **Step 3: Implement report.py**
+- [ ] **Step 3: Implement `report.py`**
 
 ```python
-"""Human-readable evidence that a fitted LUT is sane and does what we wanted.
+"""Human-readable evidence that a fitted LUT does what we claim and is safe.
 
-Three artefacts land in ``artifacts/report/``:
+Numbers alone do not tell you whether a grade looks right, and pictures alone
+do not tell you whether it generalises. The report gives both:
 
-* ``contact_sheet.png``: for a handful of source images, the normalised
-  input beside the graded output, and below them a strip of real Kodachrome
-  scans. The question to ask: do the graded shots sit naturally in the strip?
-* ``ramps.png``: a grey ramp and three hue sweeps, before and after the LUT.
-  The grey ramp shows the learned tone curve (Kodachrome should deepen
-  shadows and hold highlights). The hue sweeps show saturation and hue
-  shifts per hue. Banding or a wobble here means the smoothness weight is
-  too low.
-* ``metrics.json``: sliced Wasserstein distance to the Kodachrome cloud
-  before and after grading (lower after is the whole point), the RMS Oklab
-  error between the LUT and the transported partners (how much of the
-  transport the smooth LUT could express), per-hue-bin shifts in plain
-  numbers, and a flag that the grey axis stays monotone.
+* ``contact_sheet.png`` - **held-out** source images, normalised beside
+  graded, with a strip of real Kodachrome scans underneath. The question to
+  ask is whether the graded row belongs in the same family as the strip.
+  Held-out matters: showing training images would flatter the fit.
+* ``ramps.png`` - grey ramp and three hue sweeps, before over after. The
+  grey ramp shows the learned tone curve; the sweeps show saturation and hue
+  movement. Banding or a wobble here means the smoothness weight is too low.
+* ``diagnostics.png`` - white balance and exposure gain histograms per
+  corpus with the clamp rate. If normalisation is clamping often, the LUT was
+  fitted on input the Pi will rarely reproduce.
+* ``metrics.json`` and ``summary.txt`` - the full metric block plus the
+  pass/fail gates in plain language, so nobody has to interpret a number to
+  learn whether the artifact is acceptable.
 """
 
 from __future__ import annotations
@@ -3711,23 +5519,26 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ..color import lch_to_oklab, luminance, oklab_to_lch, oklab_to_srgb, srgb_to_linear, srgb_to_oklab
+from ..color import lch_to_oklab, oklab_to_srgb
 from ..imageio import load_rgb
 from ..lut import LUT3D
 from ..normalize import NormalizeParams
-from .dataset import PixelPool, SampleConfig, prepare_image
-from .transport import hue_bin_index, sliced_wasserstein
+from .dataset import CorpusSplit, PixelPool, SampleConfig, prepare_image
+from .evaluate import Gate
+
+_BG = (16, 16, 16)
+_FG = (220, 220, 220)
 
 
 def _to_u8(rgb_float: np.ndarray) -> np.ndarray:
     return np.clip(np.round(rgb_float * 255.0), 0, 255).astype(np.uint8)
 
 
-def _fit_thumb(rgb_u8: np.ndarray, thumb: int) -> Image.Image:
+def _thumb(rgb_u8: np.ndarray, size: int) -> Image.Image:
     im = Image.fromarray(rgb_u8, "RGB")
-    im.thumbnail((thumb, thumb))
-    canvas = Image.new("RGB", (thumb, thumb), (24, 24, 24))
-    canvas.paste(im, ((thumb - im.width) // 2, (thumb - im.height) // 2))
+    im.thumbnail((size, size))
+    canvas = Image.new("RGB", (size, size), (24, 24, 24))
+    canvas.paste(im, ((size - im.width) // 2, (size - im.height) // 2))
     return canvas
 
 
@@ -3744,63 +5555,78 @@ def render_contact_sheet(
     rng: np.random.Generator | None = None,
 ) -> Path:
     rng = rng if rng is not None else np.random.default_rng(0)
-    pick_src = [source_paths[i] for i in rng.choice(len(source_paths), min(n, len(source_paths)), replace=False)]
-    pick_tgt = [target_paths[i] for i in rng.choice(len(target_paths), min(n, len(target_paths)), replace=False)]
-    filt = lut.to_pillow()
-    pad, label_h = 8, 18
-    cols = max(len(pick_src), len(pick_tgt), 1)
-    width = pad + cols * (thumb + pad)
-    height = 3 * (label_h + thumb + pad) + pad
-    sheet = Image.new("RGB", (width, height), (16, 16, 16))
-    draw = ImageDraw.Draw(sheet)
 
-    def row(y: int, label: str, images: list[Image.Image]) -> None:
-        draw.text((pad, y), label, fill=(220, 220, 220))
+    def pick(paths: Sequence[Path]) -> list[Path]:
+        if not paths:
+            return []
+        idx = rng.choice(len(paths), min(n, len(paths)), replace=False)
+        return [paths[i] for i in idx]
+
+    filt = lut.to_pillow()
+    normalised, graded = [], []
+    for p in pick(source_paths):
+        prepared, _gains = prepare_image(load_rgb(p)[0], source_normalize, cfg)
+        norm_u8 = _to_u8(prepared)
+        normalised.append(_thumb(norm_u8, thumb))
+        graded.append(_thumb(lut.apply_pillow(norm_u8, filt), thumb))
+    kodachrome = [
+        _thumb(_to_u8(prepare_image(load_rgb(p)[0], target_normalize, cfg)[0]), thumb)
+        for p in pick(target_paths)
+    ]
+
+    pad, label_h = 8, 18
+    cols = max(len(normalised), len(kodachrome), 1)
+    sheet = Image.new(
+        "RGB",
+        (pad + cols * (thumb + pad), 3 * (label_h + thumb + pad) + pad),
+        _BG,
+    )
+    draw = ImageDraw.Draw(sheet)
+    rows = [
+        ("Held-out source, normalised", normalised),
+        ("Held-out source, graded with the fitted LUT", graded),
+        ("Real Kodachrome scans (exposure-normalised)", kodachrome),
+    ]
+    for r, (label, images) in enumerate(rows):
+        y = pad + r * (label_h + thumb + pad)
+        draw.text((pad, y), label, fill=_FG)
         for j, im in enumerate(images):
             sheet.paste(im, (pad + j * (thumb + pad), y + label_h))
 
-    normalised, graded = [], []
-    for p in pick_src:
-        norm_u8 = _to_u8(prepare_image(load_rgb(p), source_normalize, cfg))
-        normalised.append(_fit_thumb(norm_u8, thumb))
-        graded.append(_fit_thumb(lut.apply_pillow(norm_u8, filt), thumb))
-    kodachrome = [_fit_thumb(_to_u8(prepare_image(load_rgb(p), target_normalize, cfg)), thumb) for p in pick_tgt]
-
-    row(pad, "Source, normalised", normalised)
-    row(pad + (label_h + thumb + pad), "Source, graded with the fitted LUT", graded)
-    row(pad + 2 * (label_h + thumb + pad), "Real Kodachrome scans (exposure-normalised)", kodachrome)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out_path)
     return out_path
 
 
-def _grey_ramp(width: int) -> np.ndarray:
+def _grey_ramp_strip(width: int) -> np.ndarray:
     return np.repeat(np.linspace(0, 1, width, dtype=np.float32)[None, :, None], 3, axis=2)
 
 
 def _hue_sweep(width: int, lightness: float, chroma: float) -> np.ndarray:
     hue = np.linspace(-np.pi, np.pi, width, dtype=np.float32)
-    lch = np.stack([np.full(width, lightness, np.float32), np.full(width, chroma, np.float32), hue], axis=1)
+    lch = np.stack(
+        [np.full(width, lightness, np.float32), np.full(width, chroma, np.float32), hue], axis=1
+    )
     return np.clip(oklab_to_srgb(lch_to_oklab(lch)), 0, 1)[None, :, :]
 
 
 def render_ramps(lut: LUT3D, out_path: str | Path, width: int = 768, band: int = 36) -> Path:
-    strips = [("grey ramp", _grey_ramp(width))] + [
+    strips = [("grey ramp", _grey_ramp_strip(width))] + [
         (f"hue sweep L={lum:.1f} C=0.12", _hue_sweep(width, lum, 0.12)) for lum in (0.4, 0.6, 0.8)
     ]
     label_h, pad = 16, 6
-    height = len(strips) * (label_h + 2 * band + pad) + pad
-    img = Image.new("RGB", (width, height), (16, 16, 16))
+    img = Image.new("RGB", (width, len(strips) * (label_h + 2 * band + pad) + pad), _BG)
     draw = ImageDraw.Draw(img)
     y = pad
     for label, line in strips:
-        draw.text((4, y), f"{label}: before (top) / after (bottom)", fill=(220, 220, 220))
+        draw.text((4, y), f"{label}: before (top) / after (bottom)", fill=_FG)
         y += label_h
-        before = np.repeat(_to_u8(line), band, axis=0)
-        after = np.repeat(_to_u8(lut.apply_numpy(line)), band, axis=0)
-        img.paste(Image.fromarray(before, "RGB"), (0, y))
-        img.paste(Image.fromarray(after, "RGB"), (0, y + band))
+        img.paste(Image.fromarray(np.repeat(_to_u8(line), band, axis=0), "RGB"), (0, y))
+        img.paste(
+            Image.fromarray(np.repeat(_to_u8(lut.apply_numpy(line)), band, axis=0), "RGB"),
+            (0, y + band),
+        )
         y += 2 * band + pad
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3808,120 +5634,125 @@ def render_ramps(lut: LUT3D, out_path: str | Path, width: int = 768, band: int =
     return out_path
 
 
-def grey_axis_is_monotone(lut: LUT3D, tolerance: float = 1e-3) -> bool:
-    greys = np.repeat(np.linspace(0, 1, 256, dtype=np.float32)[:, None], 3, axis=1)
-    lum = luminance(srgb_to_linear(lut.apply_numpy(greys)))
-    return bool(np.all(np.diff(lum) >= -tolerance))
-
-
-def hue_bin_shifts(
-    src_srgb: np.ndarray, lut: LUT3D, n_bins: int = 24, chroma_floor: float = 0.03
-) -> list[dict]:
-    before = srgb_to_oklab(src_srgb)
-    after = srgb_to_oklab(lut.apply_numpy(src_srgb))
-    idx = hue_bin_index(before, n_bins, chroma_floor)
-    lch_b, lch_a = oklab_to_lch(before), oklab_to_lch(after)
-    d_hue = np.degrees(np.angle(np.exp(1j * (lch_a[:, 2] - lch_b[:, 2]))))
-    out = []
-    for b in range(n_bins + 1):
-        sel = idx == b
-        count = int(sel.sum())
-        centre = (b + 0.5) * 360.0 / n_bins if b < n_bins else None
-        if count == 0:
-            out.append({"bin": b, "hue_deg": centre, "count": 0, "delta_L": 0.0, "chroma_ratio": 1.0, "delta_hue_deg": 0.0})
-            continue
-        chroma_b = max(float(lch_b[sel, 1].mean()), 1e-6)
-        out.append(
-            {
-                "bin": b,
-                "hue_deg": centre,
-                "count": count,
-                "delta_L": round(float((lch_a[sel, 0] - lch_b[sel, 0]).mean()), 4),
-                "chroma_ratio": round(float(lch_a[sel, 1].mean()) / chroma_b, 3),
-                "delta_hue_deg": round(float(d_hue[sel].mean()), 2) if b < n_bins else 0.0,
-            }
+def _histogram_bars(
+    draw: ImageDraw.ImageDraw, values: Sequence[float], x: int, y: int, w: int, h: int, label: str
+) -> None:
+    draw.text((x, y), label, fill=_FG)
+    y += 14
+    draw.rectangle([x, y, x + w, y + h], outline=(90, 90, 90))
+    if not len(values):
+        return
+    counts, _edges = np.histogram(np.asarray(values, dtype=float), bins=20)
+    peak = max(int(counts.max()), 1)
+    bar_w = max(1, w // len(counts))
+    for i, c in enumerate(counts):
+        bh = int(h * c / peak)
+        draw.rectangle(
+            [x + i * bar_w, y + h - bh, x + (i + 1) * bar_w - 1, y + h], fill=(120, 170, 220)
         )
-    return out
 
 
-def compute_metrics(
-    source_pool: PixelPool,
-    target_pool: PixelPool,
-    target_weights: np.ndarray,
-    transported_lab: np.ndarray,
-    lut: LUT3D,
-    n_bins: int,
-    chroma_floor: float,
-    rng: np.random.Generator | None = None,
-) -> dict:
-    rng = rng if rng is not None else np.random.default_rng(0)
-    graded_lab = srgb_to_oklab(lut.apply_numpy(source_pool.srgb))
-    fit_err = np.sqrt(np.mean(np.sum((graded_lab - transported_lab) ** 2, axis=1)))
-    return {
-        "swd_before": round(sliced_wasserstein(source_pool.lab, target_pool.lab, rng=np.random.default_rng(rng.integers(1 << 30)), b_weights=target_weights), 5),
-        "swd_after": round(sliced_wasserstein(graded_lab, target_pool.lab, rng=np.random.default_rng(rng.integers(1 << 30)), b_weights=target_weights), 5),
-        "lut_fit_rms_deltaE": round(float(fit_err), 5),
-        "grey_axis_monotone": grey_axis_is_monotone(lut),
-        "hue_bins": hue_bin_shifts(source_pool.srgb, lut, n_bins, chroma_floor),
-    }
+def render_diagnostics(
+    source_pool: PixelPool, target_pool: PixelPool, out_path: str | Path
+) -> Path:
+    width, height = 760, 420
+    img = Image.new("RGB", (width, height), _BG)
+    draw = ImageDraw.Draw(img)
+    draw.text((8, 8), "Normalisation diagnostics", fill=_FG)
+
+    for col, (name, pool) in enumerate((("source", source_pool), ("target", target_pool))):
+        x = 8 + col * 380
+        draw.text((x, 30), f"{name}: {pool.n_images} images, clamp rate {pool.clamp_rate:.0%}", fill=_FG)
+        wb = [g for gains in pool.wb_gains for g in gains]
+        _histogram_bars(draw, wb, x, 50, 340, 120, "white balance gains")
+        _histogram_bars(draw, pool.exposure_gains, x, 200, 340, 120, "exposure gains")
+        profiles = ", ".join(f"{k}: {v}" for k, v in sorted(pool.profiles.items())) or "none"
+        draw.text((x, 340), f"ICC profiles: {profiles}"[:70], fill=_FG)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return out_path
 
 
 def write_report(
     out_dir: str | Path,
     lut: LUT3D,
-    source_pool: PixelPool,
-    target_pool: PixelPool,
-    target_weights: np.ndarray,
-    transported_lab: np.ndarray,
-    source_paths: Sequence[Path],
-    target_paths: Sequence[Path],
+    metrics: dict,
+    gates: Sequence[Gate],
+    source_split: CorpusSplit,
+    target_split: CorpusSplit,
     source_normalize: NormalizeParams,
     target_normalize: NormalizeParams,
     cfg: SampleConfig,
-    n_bins: int,
-    chroma_floor: float,
-) -> dict:
+) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    render_contact_sheet(source_paths, target_paths, lut, source_normalize, target_normalize, cfg, out_dir / "contact_sheet.png")
+
+    render_contact_sheet(
+        source_split.val_paths or source_split.train_paths,
+        target_split.val_paths or target_split.train_paths,
+        lut,
+        source_normalize,
+        target_normalize,
+        cfg,
+        out_dir / "contact_sheet.png",
+    )
     render_ramps(lut, out_dir / "ramps.png")
-    metrics = compute_metrics(source_pool, target_pool, target_weights, transported_lab, lut, n_bins, chroma_floor)
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-    return metrics
+    render_diagnostics(source_split.train_pool, target_split.train_pool, out_dir / "diagnostics.png")
+
+    payload = {**metrics, "gates": [vars(g) for g in gates]}
+    (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+    lines = [
+        "Kodachrome fit summary",
+        "",
+        f"held-out distance to Kodachrome: {metrics['swd_before']:.5f} before "
+        f"-> {metrics['swd_after']:.5f} after "
+        f"(seed spread {metrics['swd_seed_spread']:.5f})",
+        f"training-pool distance:          {metrics['train_swd_before']:.5f} -> "
+        f"{metrics['train_swd_after']:.5f}",
+        f"transport clipped out of gamut:  {metrics['transport_gamut_clip_deltaE']:.5f} dE",
+        f"LUT fit residual:                {metrics['lut_fit_rms_deltaE']:.5f} dE",
+        "",
+        "Gates:",
+    ]
+    for g in gates:
+        lines.append(f"  [{'PASS' if g.passed else 'FAIL'}] {g.name}: {g.value} - {g.detail}")
+    (out_dir / "summary.txt").write_text("\n".join(lines) + "\n")
+    return out_dir
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run and commit**
 
-Run: `.venv/bin/pytest tests/test_report.py -q` → all pass. Lines longer than 100 characters will fail ruff; wrap the two `sliced_wasserstein(...)` calls in `compute_metrics` and the `render_contact_sheet(...)` call in `write_report` across lines.
-
-- [ ] **Step 5: Commit**
+Run: `.venv/bin/pytest tests/test_report.py -q` → all pass. Watch ruff's 100-column limit in the long f-strings.
 
 ```bash
 .venv/bin/ruff check kodachrome tests
 git add kodachrome/train/report.py tests/test_report.py
-git commit -m "feat: training report with contact sheet, ramps and metrics
+git commit -m "feat: training report with held-out contact sheet, ramps, diagnostics and gates
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 16: Trainer orchestration (`train/fit.py`, `kodachrome-train`)
+### Task 19: Trainer orchestration (`train/fit.py`)
 
-Implements spec 6.4 end to end and the `training` block of spec 5.6. Also updates the spec's file tree for the `transport.py`/`lutfit.py` split.
+Implements spec 6.4 end to end and the `training` block of spec 5.8. Uses the atomic publish from Task 8 (F-07) and the gates from Task 17.
 
 **Files:**
 - Create: `kodachrome/train/fit.py`, `tests/test_fit.py`
-- Modify: `README.md` (Training section, part 2), `docs/superpowers/specs/2026-09-03-kodachrome-film-design.md` (section 4 tree and 6.4 file names)
+- Modify: `README.md`
 
 **Interfaces:**
-- Consumes: everything from Tasks 12 to 15, `write_cube`, `write_params`, `GrainParams`
+- Consumes: everything from Tasks 13 to 18, plus `write_artifact`, `publish`
 - Produces:
-  - `@dataclass FitConfig(lut_size=33, iterations=40, hue_bins=24, chroma_floor=0.03, lambda_smooth=1e-3, lambda_identity=1e-4, strength=1.0, seed=0)`
-  - `@dataclass FitResult(lut: LUT3D, transported_lab: np.ndarray, target_weights: np.ndarray)`
+  - `@dataclass FitConfig(lut_size=33, iterations=40, hue_bins=24, chroma_floor=0.03, lambda_smooth=1e-3, lambda_identity=1e-4, strength=1.0, seed=0)` with validation
+  - `@dataclass FitResult(lut, transported_lab, target_weights)`
   - `fit(source_pool, target_pool, cfg, progress=None) -> FitResult`
-  - `train(source_dir, target_dir, out_dir, cfg, sample_cfg, grain, proxy_source=False, progress=None) -> dict` (returns metrics; writes `.cube`, `params.json`, report)
-  - `main(argv=None) -> int`
+  - `train(source_dir, target_dir, out_dir, cfg, sample_cfg, grain, proxy_source=False, allow_small=False, command="", progress=None) -> (metrics, gates)`
+  - `main(argv=None) -> int` — returns 0 on pass, 3 when the artifact was written but a gate failed
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3932,38 +5763,58 @@ import json
 import numpy as np
 import pytest
 
+from kodachrome.artifacts import Artifacts
 from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
 from kodachrome.imageio import save_jpeg
-from kodachrome.pipeline import Artifacts
 from kodachrome.train.dataset import PixelPool, SampleConfig
 from kodachrome.train.fit import FitConfig, fit, main, train
 
 
-def _known_transform(lab):
-    """A convex-potential map: L -> L^1.15, chroma x1.25. Transport must recover it exactly."""
+def _curve_and_rotation(lab, gamma=1.15, chroma=1.25, degrees=10.0):
+    """A tone curve, a saturation boost, and a genuine hue rotation."""
     lch = oklab_to_lch(lab)
-    lch[..., 0] = lch[..., 0] ** 1.15
-    lch[..., 1] = lch[..., 1] * 1.25
+    lch[..., 0] = np.clip(lch[..., 0], 0, 1) ** gamma
+    lch[..., 1] = lch[..., 1] * chroma
+    lch[..., 2] = lch[..., 2] + np.deg2rad(degrees)
     return lch_to_oklab(lch)
 
 
-def test_fit_recovers_a_convex_transform():
+def _pool(rng, n=30000):
+    return (rng.random((n, 3), dtype=np.float32) * 0.7 + 0.15).astype(np.float32)
+
+
+def test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation():
+    """The spec claims this capability, so it is tested directly."""
     rng = np.random.default_rng(0)
-    src_srgb = (rng.random((30000, 3), dtype=np.float32) * 0.7 + 0.15).astype(np.float32)
-    tgt_srgb = np.clip(oklab_to_srgb(_known_transform(srgb_to_oklab(rng.random((30000, 3), dtype=np.float32) * 0.7 + 0.15))), 0, 1)
-    src, tgt = PixelPool(src_srgb, 1), PixelPool(tgt_srgb.astype(np.float32), 1)
-    result = fit(src, tgt, FitConfig(lut_size=17, iterations=30, seed=0))
-    held = (rng.random((3000, 3), dtype=np.float32) * 0.7 + 0.15).astype(np.float32)
-    expected = _known_transform(srgb_to_oklab(held))
+    src = _pool(rng)
+    tgt = np.clip(oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng)))), 0, 1).astype(np.float32)
+    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), FitConfig(lut_size=17, iterations=30, seed=0))
+
+    held = _pool(rng, 3000)
+    expected = _curve_and_rotation(srgb_to_oklab(held))
     got = srgb_to_oklab(result.lut.apply_numpy(held))
-    delta_e = np.sqrt(np.sum((got - expected) ** 2, axis=1)).mean()
-    assert delta_e < 0.02
-    assert result.transported_lab.shape == (30000, 3)
-    assert result.target_weights.shape == (30000,)
+    assert float(np.sqrt(np.sum((got - expected) ** 2, axis=1)).mean()) < 0.03
 
 
-def test_strength_zero_gives_identity_lut():
+def test_a_large_hue_rotation_is_only_partly_recovered():
+    """Pins the documented limit: reweighting damps rotations beyond about one bin."""
     rng = np.random.default_rng(1)
+    src = _pool(rng)
+    tgt = np.clip(
+        oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng)), gamma=1.0, chroma=1.0, degrees=90.0)),
+        0, 1,
+    ).astype(np.float32)
+    result = fit(PixelPool(src, 1), PixelPool(tgt, 1), FitConfig(lut_size=17, iterations=30, seed=0))
+
+    held = _pool(rng, 3000)
+    before = oklab_to_lch(srgb_to_oklab(held))[:, 2]
+    after = oklab_to_lch(srgb_to_oklab(result.lut.apply_numpy(held)))[:, 2]
+    achieved = np.degrees(np.angle(np.exp(1j * (after - before)))).mean()
+    assert abs(achieved) < 60.0, "a 90 degree rotation must not be fully learned"
+
+
+def test_strength_zero_gives_an_identity_lut():
+    rng = np.random.default_rng(2)
     src = PixelPool(rng.random((5000, 3), dtype=np.float32), 1)
     tgt = PixelPool((rng.random((5000, 3), dtype=np.float32) * 0.5).astype(np.float32), 1)
     result = fit(src, tgt, FitConfig(lut_size=9, iterations=5, strength=0.0))
@@ -3971,110 +5822,180 @@ def test_strength_zero_gives_identity_lut():
     assert np.abs(result.lut.apply_numpy(x) - x).max() < 0.02
 
 
+@pytest.mark.parametrize(
+    "kwargs, field",
+    [
+        ({"lut_size": 1}, "lut_size"),
+        ({"iterations": 0}, "iterations"),
+        ({"hue_bins": 0}, "hue_bins"),
+        ({"strength": 1.5}, "strength"),
+        ({"lambda_smooth": -1.0}, "lambda_smooth"),
+    ],
+)
+def test_invalid_fit_config_names_the_field(kwargs, field):
+    with pytest.raises(ValueError, match=field):
+        FitConfig(**kwargs)
+
+
 def _image_dir(dir_path, n, seed, transform=None):
-    dir_path.mkdir(parents=True)
+    dir_path.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     for i in range(n):
-        base = np.linspace(0.2, 0.8, 64, dtype=np.float32)[None, :, None] * rng.uniform(0.7, 1.0, 3).astype(np.float32)
+        base = np.linspace(0.2, 0.8, 64, dtype=np.float32)[None, :, None] * rng.uniform(
+            0.7, 1.0, 3
+        ).astype(np.float32)
         img = np.repeat(base, 48, axis=0)
         if transform:
             img = transform(img)
-        save_jpeg((np.clip(img, 0, 1) * 255).astype(np.uint8), dir_path / f"{i}.jpg")
+        save_jpeg((np.clip(img, 0, 1) * 255).astype(np.uint8), dir_path / f"{i:02d}.jpg")
 
 
-def test_train_end_to_end_writes_loadable_artifacts(tmp_path):
-    _image_dir(tmp_path / "src", 4, 0)
-    _image_dir(tmp_path / "tgt", 4, 1, transform=lambda im: im**1.3)
-    metrics = train(
+def test_train_end_to_end_publishes_a_loadable_artifact(tmp_path):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    out = tmp_path / "artifacts"
+    metrics, gates = train(
         tmp_path / "src",
         tmp_path / "tgt",
-        tmp_path / "artifacts",
+        out,
         FitConfig(lut_size=9, iterations=5),
-        SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500),
+        SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25),
         grain=None,
         proxy_source=True,
+        allow_small=True,
+        command="test",
     )
-    art = Artifacts.load(tmp_path / "artifacts")
+    art = Artifacts.load(out)
     assert art.lut.size == 9
-    assert art.training["proxy_source"] is True
-    assert art.training["n_source_images"] == 4
-    assert art.training["lut_size"] == 9
+    assert art.training["source"]["proxy"] is True
+    assert art.training["source"]["corpus_sha1"] and art.training["target"]["corpus_sha1"]
+    assert art.training["split"]["n_source_val_images"] == 2
+    assert art.training["fit"]["lut_size"] == 9
     assert art.training["metrics"]["swd_after"] == metrics["swd_after"]
-    assert (tmp_path / "artifacts" / "report" / "contact_sheet.png").exists()
-    assert (tmp_path / "artifacts" / "report" / "metrics.json").exists()
+    assert art.training["code_revision"]
+    assert (out / "report" / "contact_sheet.png").exists()
+    assert (out / "report" / "summary.txt").exists()
+    assert isinstance(gates, list) and gates
 
 
-def test_main_rejects_identical_dirs_and_missing_dirs(tmp_path, capsys):
+def test_train_leaves_the_previous_artifact_intact_if_publication_fails(tmp_path, monkeypatch):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    out = tmp_path / "artifacts"
+    cfg = FitConfig(lut_size=9, iterations=5)
+    sample = SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25)
+    train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True)
+    good = (out / "params.json").read_text()
+
+    monkeypatch.setattr(
+        "kodachrome.train.fit.publish", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    with pytest.raises(OSError):
+        train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True)
+    assert (out / "params.json").read_text() == good
+
+
+def test_main_rejects_identical_and_missing_dirs(tmp_path, capsys):
     _image_dir(tmp_path / "src", 2, 0)
-    assert main(["--source", str(tmp_path / "src"), "--target", str(tmp_path / "src"), "--out", str(tmp_path / "o")]) == 1
+    assert main(["--source", str(tmp_path / "src"), "--target", str(tmp_path / "src"),
+                 "--out", str(tmp_path / "o")]) == 1
     assert "same" in capsys.readouterr().err
-    assert main(["--source", str(tmp_path / "missing"), "--target", str(tmp_path / "src"), "--out", str(tmp_path / "o")]) == 1
+    assert main(["--source", str(tmp_path / "missing"), "--target", str(tmp_path / "src"),
+                 "--out", str(tmp_path / "o")]) == 1
 
 
-def test_main_runs_small(tmp_path):
+def test_main_refuses_a_small_corpus_then_accepts_the_flag(tmp_path, capsys):
     _image_dir(tmp_path / "src", 3, 0)
     _image_dir(tmp_path / "tgt", 3, 1, transform=lambda im: im**1.2)
-    code = main(
-        [
-            "--source", str(tmp_path / "src"), "--target", str(tmp_path / "tgt"), "--out", str(tmp_path / "o"),
-            "--lut-size", "9", "--iterations", "5", "--max-side", "64", "--pixels-per-image", "300", "--proxy-source",
-        ]
-    )
-    assert code == 0
+    args = ["--source", str(tmp_path / "src"), "--target", str(tmp_path / "tgt"),
+            "--out", str(tmp_path / "o"), "--lut-size", "9", "--iterations", "5",
+            "--max-side", "64", "--pixels-per-image", "300", "--proxy-source"]
+    assert main(args) == 1
+    assert "--allow-small" in capsys.readouterr().err
+    assert main([*args, "--allow-small"]) in (0, 3)
     data = json.loads((tmp_path / "o" / "params.json").read_text())
-    assert data["training"]["strength"] == 1.0
+    assert data["training"]["fit"]["strength"] == 1.0
     assert data["grain"]["strength"] == pytest.approx(0.025)
+
+
+def test_main_reports_a_failed_gate_with_exit_code_3(tmp_path, monkeypatch, capsys):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    from kodachrome.train import fit as fit_module
+    from kodachrome.train.evaluate import Gate
+
+    monkeypatch.setattr(
+        fit_module, "check_gates",
+        lambda m: [Gate("improvement_exceeds_noise", 0.0, 0.1, False, "forced failure")],
+    )
+    code = main(["--source", str(tmp_path / "src"), "--target", str(tmp_path / "tgt"),
+                 "--out", str(tmp_path / "o"), "--lut-size", "9", "--iterations", "5",
+                 "--max-side", "64", "--allow-small"])
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "improvement_exceeds_noise" in err
+    assert Artifacts.load(tmp_path / "o").lut.size == 9  # written despite the failure
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run and watch it fail**
 
-Run: `.venv/bin/pytest tests/test_fit.py -q`
-Expected: FAIL with `ModuleNotFoundError`
+Run: `.venv/bin/pytest tests/test_fit.py -q` → FAIL, no module `kodachrome.train.fit`.
 
-- [ ] **Step 3: Implement fit.py**
+- [ ] **Step 3: Implement `fit.py`**
 
 ```python
 """``kodachrome-train``: fit the Kodachrome LUT from two folders of images.
 
-Pipeline (spec section 6):
+The sequence (spec section 6):
 
-1. ``dataset.build_pool`` turns the source folder (camera shots, white
-   balanced) and the target folder (Kodachrome scans, exposure-normalised
-   only) into pixel pools.
-2. ``transport.hue_weights`` reweights the target so its hue histogram
-   matches the source's (content-bias control).
-3. ``transport.iterative_distribution_transfer`` gives every source pixel a
-   Kodachrome partner; ``strength`` blends between staying put (0) and the
-   full transport (1).
-4. ``lutfit.fit_lut`` fits a smooth LUT to the (source, partner) pairs.
-5. ``report.write_report`` renders the evidence; ``params.json`` records
-   every setting and metric so the artifact is reproducible.
+1. ``dataset.build_corpus`` splits each corpus **by image** and samples the
+   halves separately, so the evaluation later is genuinely held out.
+2. ``transport.hue_weights`` reweights the target's hues toward the
+   source's, reducing content bias. This is a heuristic; see the note in
+   ``transport.py`` about what it does not guarantee.
+3. ``transport.iterative_distribution_transfer`` gives every training source
+   pixel a Kodachrome partner. ``strength`` blends between identity and the
+   full transport.
+4. ``lutfit.fit_lut`` fits a smooth LUT to those pairs.
+5. ``evaluate.evaluate`` measures the result on the held-out images with a
+   paired evaluator, and ``check_gates`` turns the numbers into pass or fail.
+6. Everything is written into a staging directory and published atomically,
+   so an interrupted run can never leave a new LUT beside old parameters.
 
-Why ``--proxy-source`` is a flag
---------------------------------
-The trainer cannot tell whether a folder of photos came from the U20CAM.
-Pass the flag when training on stand-in photos so ``params.json`` says so
-and users know to retrain with real camera shots.
+A failing gate does not delete the artifact: you may want to inspect it. It
+sets exit code 3 and names the gate, so a script cannot mistake it for
+success.
+
+``--proxy-source`` exists because the trainer cannot tell whether a folder of
+photographs came from the U20CAM. Passing it records the fact so users of
+the shipped artifact know to retrain.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
 
+from .. import __version__
+from ..artifacts import publish, write_artifact
 from ..color import oklab_to_srgb
 from ..grain import GrainParams
 from ..imageio import list_images
-from ..lut import LUT3D, write_cube
+from ..lut import LUT3D
 from ..normalize import NormalizeParams
-from ..pipeline import write_params
-from .dataset import PixelPool, SampleConfig, build_pool, dir_fingerprint
+from .dataset import CorpusTooSmall, PixelPool, SampleConfig, build_corpus
+from .evaluate import check_gates, evaluate
 from .lutfit import fit_lut
 from .report import write_report
 from .transport import hue_weights, iterative_distribution_transfer
@@ -4094,6 +6015,22 @@ class FitConfig:
     strength: float = 1.0
     seed: int = 0
 
+    def __post_init__(self) -> None:
+        if not 2 <= self.lut_size <= 65:
+            raise ValueError(f"lut_size must be in 2..65, got {self.lut_size}")
+        if self.iterations < 1:
+            raise ValueError(f"iterations must be positive, got {self.iterations}")
+        if self.hue_bins < 1:
+            raise ValueError(f"hue_bins must be positive, got {self.hue_bins}")
+        if not 0.0 <= self.chroma_floor < 0.5:
+            raise ValueError(f"chroma_floor must be in [0, 0.5), got {self.chroma_floor}")
+        for name in ("lambda_smooth", "lambda_identity"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        if not 0.0 <= self.strength <= 1.0:
+            raise ValueError(f"strength must be in [0, 1], got {self.strength}")
+
 
 @dataclass
 class FitResult:
@@ -4112,7 +6049,7 @@ def fit(
     rng = np.random.default_rng(cfg.seed)
     src_lab, tgt_lab = source_pool.lab, target_pool.lab
 
-    say("reweighting target hues to match the source hue histogram")
+    say("reweighting target hues toward the source histogram")
     weights = hue_weights(src_lab, tgt_lab, cfg.hue_bins, cfg.chroma_floor)
 
     say(f"iterative distribution transfer, {cfg.iterations} rounds")
@@ -4127,7 +6064,27 @@ def fit(
         lambda_smooth=cfg.lambda_smooth,
         lambda_identity=cfg.lambda_identity,
     )
-    return FitResult(lut=lut, transported_lab=partner_lab.astype(np.float32), target_weights=weights)
+    return FitResult(lut, partner_lab.astype(np.float32), weights)
+
+
+def _code_revision() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _dependency_versions() -> dict:
+    out = {}
+    for name in ("numpy", "scipy", "Pillow", "opencv-python"):
+        try:
+            out[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            out[name] = "not installed"
+    return out
 
 
 def train(
@@ -4138,69 +6095,95 @@ def train(
     sample_cfg: SampleConfig,
     grain: GrainParams | None,
     proxy_source: bool = False,
+    allow_small: bool = False,
+    command: str = "",
     progress: Callable[[str], None] | None = None,
-) -> dict:
+) -> tuple[dict, list]:
     say = progress or (lambda _m: None)
     source_dir, target_dir, out_dir = Path(source_dir), Path(target_dir), Path(out_dir)
-    source_paths, target_paths = list_images(source_dir), list_images(target_dir)
-    if len(source_paths) < MIN_SOURCE_IMAGES:
-        say(f"warning: only {len(source_paths)} source images; {MIN_SOURCE_IMAGES}+ recommended")
-    if len(target_paths) < MIN_TARGET_IMAGES:
-        say(f"warning: only {len(target_paths)} target images; {MIN_TARGET_IMAGES}+ recommended")
 
     source_normalize = NormalizeParams()
     target_normalize = NormalizeParams(white_balance=False)
-    say(f"sampling {len(source_paths)} source images")
-    source_pool = build_pool(source_paths, source_normalize, sample_cfg, say)
-    say(f"sampling {len(target_paths)} target images")
-    target_pool = build_pool(target_paths, target_normalize, sample_cfg, say)
+    source = build_corpus(source_dir, source_normalize, sample_cfg, MIN_SOURCE_IMAGES,
+                          "source", allow_small, say)
+    target = build_corpus(target_dir, target_normalize, sample_cfg, MIN_TARGET_IMAGES,
+                          "target", allow_small, say)
 
     t0 = time.perf_counter()
-    result = fit(source_pool, target_pool, cfg, say)
+    result = fit(source.train_pool, target.train_pool, cfg, say)
     fit_seconds = time.perf_counter() - t0
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_cube(result.lut, out_dir / "kodachrome.cube", title=f"kodachrome strength={cfg.strength}")
-    say("writing report")
-    metrics = write_report(
-        out_dir / "report",
-        result.lut,
-        source_pool,
-        target_pool,
-        result.target_weights,
-        result.transported_lab,
-        source_paths,
-        target_paths,
-        source_normalize,
-        target_normalize,
-        sample_cfg,
-        cfg.hue_bins,
-        cfg.chroma_floor,
+    say("evaluating on held-out images")
+    val_weights = hue_weights(
+        source.val_pool.lab, target.val_pool.lab, cfg.hue_bins, cfg.chroma_floor
+    ) if len(target.val_pool.srgb) else None
+    metrics = evaluate(
+        lut=result.lut,
+        val_src=source.val_pool if len(source.val_pool.srgb) else source.train_pool,
+        val_tgt=target.val_pool if len(target.val_pool.srgb) else target.train_pool,
+        val_weights=val_weights,
+        train_src=source.train_pool,
+        train_tgt=target.train_pool,
+        train_weights=result.target_weights,
+        transported_lab=result.transported_lab,
+        n_bins=cfg.hue_bins,
+        chroma_floor=cfg.chroma_floor,
+        seed=cfg.seed,
     )
+    gates = check_gates(metrics)
+
     training = {
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "target_dir": str(target_dir),
-        "n_target_images": len(target_paths),
-        "n_target_pixels": int(len(target_pool.srgb)),
-        "source_dir": str(source_dir),
-        "source_dir_sha1": dir_fingerprint(source_paths),
-        "n_source_images": len(source_paths),
-        "n_source_pixels": int(len(source_pool.srgb)),
-        "proxy_source": proxy_source,
-        **asdict(cfg),
+        "code_revision": _code_revision(),
+        "package_version": __version__,
+        "dependency_versions": _dependency_versions(),
+        "command": command,
+        "target": {
+            "dir": str(target_dir),
+            "n_images": len(target.train_paths) + len(target.val_paths),
+            "corpus_sha1": target.corpus_sha1,
+            "n_pixels": int(len(target.train_pool.srgb)),
+            "clamp_rate": target.train_pool.clamp_rate,
+            "profiles": target.train_pool.profiles,
+        },
+        "source": {
+            "dir": str(source_dir),
+            "n_images": len(source.train_paths) + len(source.val_paths),
+            "corpus_sha1": source.corpus_sha1,
+            "n_pixels": int(len(source.train_pool.srgb)),
+            "proxy": proxy_source,
+            "clamp_rate": source.train_pool.clamp_rate,
+            "profiles": source.train_pool.profiles,
+        },
+        "split": {
+            "val_fraction": sample_cfg.val_fraction,
+            "n_source_val_images": len(source.val_paths),
+            "n_target_val_images": len(target.val_paths),
+            "seed": sample_cfg.seed,
+        },
+        "fit": {**asdict(cfg), "fit_seconds": round(fit_seconds, 1)},
         "sample": asdict(sample_cfg),
-        "fit_seconds": round(fit_seconds, 1),
         "metrics": {k: v for k, v in metrics.items() if k != "hue_bins"},
     }
-    write_params(out_dir, source_normalize, grain or GrainParams(), training=training)
-    say(f"wrote {out_dir / 'kodachrome.cube'} and params.json; report in {out_dir / 'report'}")
-    return metrics
+
+    staging = Path(tempfile.mkdtemp(prefix=".kodachrome-staging-", dir=out_dir.parent))
+    try:
+        write_artifact(staging, result.lut, source_normalize, grain or GrainParams(), training)
+        say("writing report")
+        write_report(staging / "report", result.lut, metrics, gates, source, target,
+                     source_normalize, target_normalize, sample_cfg)
+        publish(staging, out_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    say(f"published {out_dir}; report in {out_dir / 'report'}")
+    return metrics, gates
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="kodachrome-train", description="Fit the Kodachrome LUT.")
     parser.add_argument("--source", type=Path, required=True, help="folder of camera photos")
-    parser.add_argument("--target", type=Path, default=Path("data/kodachrome"), help="folder of Kodachrome scans")
+    parser.add_argument("--target", type=Path, default=Path("data/kodachrome"))
     parser.add_argument("--out", type=Path, default=Path("artifacts"))
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--lut-size", type=int, default=33)
@@ -4208,12 +6191,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hue-bins", type=int, default=24)
     parser.add_argument("--lambda-smooth", type=float, default=1e-3)
     parser.add_argument("--lambda-identity", type=float, default=1e-4)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grain-strength", type=float, default=0.025)
     parser.add_argument("--max-side", type=int, default=512)
     parser.add_argument("--pixels-per-image", type=int, default=3000)
     parser.add_argument("--max-pixels", type=int, default=400_000)
-    parser.add_argument("--proxy-source", action="store_true", help="mark the source as stand-in photos, not U20CAM shots")
+    parser.add_argument("--proxy-source", action="store_true",
+                        help="mark the source as stand-in photos, not U20CAM shots")
+    parser.add_argument("--allow-small", action="store_true",
+                        help="proceed with a corpus below the recommended minimum")
     args = parser.parse_args(argv)
 
     for label, path in (("source", args.source), ("target", args.target)):
@@ -4223,39 +6210,47 @@ def main(argv: list[str] | None = None) -> int:
     if args.source.resolve() == args.target.resolve():
         print("error: source and target are the same folder", file=sys.stderr)
         return 1
-    if not 2 <= args.lut_size <= 65:
-        print("error: --lut-size must be in 2..65", file=sys.stderr)
+
+    try:
+        cfg = FitConfig(
+            lut_size=args.lut_size, iterations=args.iterations, hue_bins=args.hue_bins,
+            lambda_smooth=args.lambda_smooth, lambda_identity=args.lambda_identity,
+            strength=args.strength, seed=args.seed,
+        )
+        sample_cfg = SampleConfig(
+            max_side=args.max_side, pixels_per_image=args.pixels_per_image,
+            max_pixels=args.max_pixels, val_fraction=args.val_fraction, seed=args.seed,
+        )
+        grain = GrainParams(strength=args.grain_strength)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    cfg = FitConfig(
-        lut_size=args.lut_size,
-        iterations=args.iterations,
-        hue_bins=args.hue_bins,
-        lambda_smooth=args.lambda_smooth,
-        lambda_identity=args.lambda_identity,
-        strength=args.strength,
-        seed=args.seed,
-    )
-    sample_cfg = SampleConfig(
-        max_side=args.max_side,
-        pixels_per_image=args.pixels_per_image,
-        max_pixels=args.max_pixels,
-        seed=args.seed,
-    )
-    metrics = train(
-        args.source,
-        args.target,
-        args.out,
-        cfg,
-        sample_cfg,
-        GrainParams(strength=args.grain_strength),
-        proxy_source=args.proxy_source,
-        progress=print,
-    )
+    try:
+        metrics, gates = train(
+            args.source, args.target, args.out, cfg, sample_cfg, grain,
+            proxy_source=args.proxy_source, allow_small=args.allow_small,
+            command=" ".join(["kodachrome-train", *(argv or sys.argv[1:])]), progress=print,
+        )
+    except CorpusTooSmall as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     print(
-        f"distance to Kodachrome: {metrics['swd_before']:.4f} before -> {metrics['swd_after']:.4f} after; "
-        f"LUT fit RMS dE {metrics['lut_fit_rms_deltaE']:.4f}; grey axis monotone: {metrics['grey_axis_monotone']}"
+        f"held-out distance to Kodachrome: {metrics['swd_before']:.5f} -> "
+        f"{metrics['swd_after']:.5f} (seed spread {metrics['swd_seed_spread']:.5f})"
     )
+    failed = [g for g in gates if not g.passed]
+    for gate in gates:
+        print(f"  [{'PASS' if gate.passed else 'FAIL'}] {gate.name}: {gate.detail}")
+    if failed:
+        print(
+            "error: artifact written but "
+            + ", ".join(g.name for g in failed)
+            + " did not pass; see the report before using it",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
@@ -4263,28 +6258,21 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_fit.py -q` → all pass. `test_fit_recovers_a_convex_transform` is the acceptance test for the whole method. If `delta_e` lands between 0.02 and 0.04, first try `iterations=50` in the test and check whether it improves (transport not converged) before touching the lambdas; record whatever changes in `docs/decisions.md`. Do not loosen the bound above 0.03 without writing down why.
+Run: `.venv/bin/pytest tests/test_fit.py -q` → all pass.
 
-- [ ] **Step 5: Update the spec tree and the README, then commit**
+`test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation` is the acceptance test for the whole method, and it now includes the hue rotation the spec claims. If the mean error lands between 0.03 and 0.05, first raise `iterations` to 50 in the test and see whether it converges before touching any lambda; record whatever you change in `docs/decisions.md`. Do not relax the bound past 0.04 without writing down why.
 
-In the spec, section 4 tree: replace the `fit.py` line with three lines:
-```
-      transport.py          # hue reweighting, IDT, sliced Wasserstein
-      lutfit.py             # trilinear design matrix, smoothness, CG solve
-      fit.py                # orchestration and params writing  (CLI: kodachrome-train)
-```
-and in section 6.4 change the heading `### 6.4 \`fit.py\`` to `### 6.4 Fitting (\`transport.py\`, \`lutfit.py\`, \`fit.py\`)`. In section 6.2 add after the proxy paragraph: "The trainer cannot detect a proxy corpus; pass `--proxy-source` to mark it."
+- [ ] **Step 5: Document and commit**
 
-In `README.md`, Training section, add:
+Add to `README.md` under Training:
 
 ````markdown
 ### 2. Collect camera samples
 
 Take 50 or more shots with the U20CAM across varied scenes: indoors and out,
-sky, foliage, skin, neutral walls, mixed lighting. `kodachrome-capture` saves
-originals under `~/Pictures/kodachrome/<date>/`; copy those `*_original.jpg`
+sky, foliage, skin, neutral walls, mixed lighting. Copy the `*_original.jpg`
 files into one folder, for example `data/source/`.
 
 ### 3. Fit the LUT
@@ -4293,65 +6281,155 @@ files into one folder, for example `data/source/`.
 .venv/bin/kodachrome-train --source data/source --target data/kodachrome
 ```
 
-Runs in a minute or two. Writes `artifacts/kodachrome.cube`,
-`artifacts/params.json` and `artifacts/report/`. Useful knobs:
+Writes `artifacts/` (LUT, `params.json`, `report/`) and prints the held-out
+result plus a pass or fail line per gate. Exit code 3 means the artifact was
+written but a gate failed; read the report before using it.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--strength` | 1.0 | 0 = no change, 1 = full Kodachrome; 0.7 for a lighter touch |
-| `--lambda-smooth` | 1e-3 | raise if the ramps show banding or the fit looks noisy |
+| `--strength` | 1.0 | 0 = no change, 1 = full; 0.7 for a lighter touch |
+| `--val-fraction` | 0.2 | share of images held out of training for the metrics |
+| `--lambda-smooth` | 1e-3 | raise if the ramps band or the fit looks noisy |
 | `--lambda-identity` | 1e-4 | raise if colours the camera never produced go strange |
-| `--grain-strength` | 0.025 | film grain, in luminance units at mid-grey |
-| `--proxy-source` | off | mark the source folder as stand-in photos, not U20CAM shots |
+| `--grain-strength` | 0.025 | grain, in luminance units at mid-grey |
+| `--proxy-source` | off | mark the source as stand-in photos |
+| `--allow-small` | off | proceed with a corpus below the recommended minimum |
 
 ### 4. Read the report
 
-- `report/contact_sheet.png`: normalised source, graded source, and real
-  scans. The graded row should sit naturally next to the scans.
-- `report/ramps.png`: grey ramp and hue sweeps, before over after. Expect
-  deeper shadows and stronger reds; do not accept banding or a grey ramp
-  that goes backwards.
-- `report/metrics.json`: `swd_after` must be well below `swd_before`
-  (distance to the Kodachrome colour cloud). `lut_fit_rms_deltaE` around
-  0.01 to 0.02 means the smooth LUT captured the transport; much higher
-  means the transport asked for something a smooth LUT cannot do.
-  `hue_bins` lists the learned lightness, chroma and hue change per hue.
+`report/summary.txt` is the short version: the held-out distance before and
+after, the seed spread it must beat, and each gate. `contact_sheet.png`
+shows held-out images normalised, graded, and beside real scans.
+`ramps.png` shows the tone curve and hue movement. `diagnostics.png` shows
+how often normalisation clamped. `metrics.json` has everything.
 
-Commit `artifacts/` when you are happy; the Pi just pulls the repo.
+Promote a fit you like to the shipped default by copying it into the
+package:
+
+```bash
+cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
+```
 ````
 
 ```bash
 .venv/bin/ruff check kodachrome tests
-git add kodachrome/train/fit.py tests/test_fit.py README.md docs/superpowers/specs/2026-09-03-kodachrome-film-design.md
-git commit -m "feat: kodachrome-train orchestration writing LUT, params and report
+git add kodachrome/train/fit.py tests/test_fit.py README.md
+git commit -m "feat: kodachrome-train orchestration with held-out evaluation and atomic publish
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 17: Fetch the data and train the default artifact
+### Task 20: Packaging smoke test
 
-Implements spec 6.2 (proxy corpus) and replaces the identity placeholder from Task 6. This task uses the network and takes 10 to 20 minutes, mostly downloading.
+Implements spec 9's `test_packaging.py`. Proves F-03 is actually fixed rather than merely intended.
 
 **Files:**
-- Modify: `artifacts/kodachrome.cube`, `artifacts/params.json`, `docs/decisions.md`, `README.md`
-- Create (git-ignored): `data/kodachrome/`, `data/proxy-source/`
+- Create: `tests/test_packaging.py`
 
-**Interfaces:**
-- Consumes: `kodachrome-fetch`, `kodachrome-train`
-- Produces: a trained default artifact with `training.proxy_source == true`
+- [ ] **Step 1: Write the test**
+
+`tests/test_packaging.py`:
+```python
+"""Build a wheel, install it into a clean venv, and run a command from elsewhere.
+
+This is the only test that proves the shipped artifact really travels with
+the package: everything else imports from the source tree, where
+`kodachrome/data/` happens to be on disk anyway.
+"""
+
+import subprocess
+import sys
+import venv
+
+import numpy as np
+import pytest
+
+from kodachrome.imageio import save_jpeg
+
+pytestmark = pytest.mark.slow
+
+
+def test_wheel_installs_and_runs_from_another_directory(tmp_path, repo_root):
+    dist = tmp_path / "dist"
+    build = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(dist), str(repo_root)],
+        capture_output=True, text=True,
+    )
+    assert build.returncode == 0, build.stderr[-3000:]
+    wheels = list(dist.glob("*.whl"))
+    assert len(wheels) == 1
+
+    env_dir = tmp_path / "env"
+    venv.create(env_dir, with_pip=True)
+    python = env_dir / "bin" / "python"
+    install = subprocess.run(
+        [str(python), "-m", "pip", "install", "--quiet", f"{wheels[0]}[opencv]"],
+        capture_output=True, text=True,
+    )
+    assert install.returncode == 0, install.stderr[-3000:]
+
+    work = tmp_path / "elsewhere"
+    (work / "in").mkdir(parents=True)
+    save_jpeg(
+        np.random.default_rng(0).integers(0, 256, (32, 48, 3), dtype=np.uint8),
+        work / "in" / "a.jpg",
+    )
+    run = subprocess.run(
+        [str(env_dir / "bin" / "kodachrome-process"), "in", "out"],
+        cwd=work, capture_output=True, text=True,
+    )
+    assert run.returncode == 0, run.stderr[-3000:]
+    assert (work / "out" / "a_kodachrome.jpg").exists(), "the bundled artifact was not found"
+```
+
+- [ ] **Step 2: Register the marker**
+
+Add to `pyproject.toml` under `[tool.pytest.ini_options]`:
+
+```toml
+markers = ["slow: builds a wheel and installs it into a temporary venv"]
+```
+
+- [ ] **Step 3: Run it**
+
+Run: `.venv/bin/pytest tests/test_packaging.py -q`
+Expected: passes in roughly one to three minutes (a wheel build plus an install).
+
+If `build` is missing, it is in the `[dev]` extra from Task 3; run `.venv/bin/pip install -e ".[dev]"`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+.venv/bin/pytest -q -m "not slow"
+.venv/bin/ruff check kodachrome tests
+git add tests/test_packaging.py pyproject.toml
+git commit -m "test: prove the wheel carries the artifact and runs from any directory
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 21: Fetch the corpora and train the shipped artifact
+
+Implements spec 6.2. Replaces the identity placeholder from Task 8. Uses the network and takes 10 to 20 minutes, mostly downloading.
+
+**Files:**
+- Modify: `kodachrome/data/kodachrome.cube`, `kodachrome/data/params.json`, `docs/decisions.md`, `README.md`
+- Create (git-ignored): `data/kodachrome/`, `data/proxy-source/`
 
 - [ ] **Step 1: Fetch the Kodachrome scans**
 
 ```bash
 .venv/bin/kodachrome-fetch --out data/kodachrome
 ```
-Expected: progress lines, then `done: N files` with N around 900 to 1,000 and `manifest.json` present. If N is below 200 the command exits 1; check network and the category name before retrying. The command is resumable.
+Expected: `done: N files` with N around 900 to 1,000, plus a `rejected` list in the manifest. Below 200 accepted files it exits 1; read the rejection reasons before retrying.
 
-- [ ] **Step 2: Choose a proxy source category that meets the spec's criteria**
+- [ ] **Step 2: Choose a proxy source category meeting the spec 6.2 criteria**
 
-Criteria (spec 6.2): public domain or CC0, modern digital cameras, varied everyday subjects, at least 60 images. Probe candidates with the Commons API; take the first that exists with at least 200 files:
+Public domain or CC0, modern digital cameras, varied everyday subjects, 60+ images. Probe candidates:
 
 ```bash
 for cat in "Category:Photographs by Lance Cheung" "Category:Photographs by Preston Keres" "Category:Photographs by the United States Department of Agriculture"; do
@@ -4359,99 +6437,107 @@ for cat in "Category:Photographs by Lance Cheung" "Category:Photographs by Prest
 import sys, requests
 from kodachrome.train.fetch import API_URL, USER_AGENT
 cat = sys.argv[1]
-r = requests.get(API_URL, params={"action": "query", "prop": "categoryinfo", "titles": cat, "format": "json"},
+r = requests.get(API_URL, params={"action": "query", "prop": "categoryinfo",
+                                  "titles": cat, "format": "json"},
                  headers={"User-Agent": USER_AGENT}, timeout=60).json()
-page = next(iter(r["query"]["pages"].values()))
-print(cat, "->", page.get("categoryinfo", "MISSING"))
+print(cat, "->", next(iter(r["query"]["pages"].values())).get("categoryinfo", "MISSING"))
 EOF
 done
 ```
-Pick the first with `files >= 200`. If none qualifies, search Commons for another US federal photographer category (USDA, NPS, NASA "Johnson Space Center" everyday photos) and apply the same probe. Record the chosen category and its file count.
+Take the first with 200 or more files. If none qualifies, search Commons for another US federal photographer category and probe it the same way. Record the choice and its count.
 
 - [ ] **Step 3: Fetch a seeded sample of the proxy corpus**
 
 ```bash
-.venv/bin/kodachrome-fetch --category "<chosen category>" --out data/proxy-source --sample 80 --seed 0 --min-files 60
+.venv/bin/kodachrome-fetch --category "<chosen category>" --out data/proxy-source \
+  --sample 80 --seed 0 --min-files 60
 ```
-Expected: 60 to 80 files. Open a dozen thumbnails (`open data/proxy-source`) and confirm they are photographs of everyday scenes, not diagrams or documents. If more than a handful are not photographs, delete them and re-check the count stays at or above 60.
+Expected: 60 to 80 accepted. Open the folder and confirm they are everyday photographs, not diagrams or documents. The licence and greyscale filters catch most non-photographs; delete anything that slips through, then re-run the command so the manifest and `corpus_sha1` match what is on disk.
 
-- [ ] **Step 4: Train the default artifact**
+- [ ] **Step 4: Train into a working directory**
 
 ```bash
-.venv/bin/kodachrome-train --source data/proxy-source --target data/kodachrome --out artifacts --proxy-source
+.venv/bin/kodachrome-train --source data/proxy-source --target data/kodachrome \
+  --out artifacts --proxy-source --allow-small
 ```
-Expected: warnings about source count are acceptable if 60 to 80 images; a summary line with `swd_after` clearly below `swd_before` and `grey axis monotone: True`.
+Expected: a held-out improvement line and a PASS for every gate. Exit code 3 means a gate failed; go to step 5 before doing anything else.
 
-- [ ] **Step 5: Inspect the report and tune if needed**
+- [ ] **Step 5: Read the report and tune only if a gate failed**
 
 ```bash
-open artifacts/report/contact_sheet.png artifacts/report/ramps.png
-.venv/bin/python -c "import json; m=json.load(open('artifacts/report/metrics.json')); print({k:v for k,v in m.items() if k!='hue_bins'}); [print(b) for b in m['hue_bins'] if b['count']>0]"
+cat artifacts/report/summary.txt
+open artifacts/report/contact_sheet.png artifacts/report/ramps.png artifacts/report/diagnostics.png
 ```
-Acceptance:
-- grey ramp after is smooth and darker in the shadows than before, no banding;
-- hue sweeps show no discontinuities;
-- `grey_axis_monotone` is true;
-- `lut_fit_rms_deltaE` below 0.03;
-- graded row on the contact sheet reads as the same family as the scans.
 
-If banding appears, rerun with `--lambda-smooth 3e-3`. If any hue sweep wobbles, rerun with `--lambda-smooth 1e-2`. If the look is too strong for taste, that is a `--strength` question for the user, not a fitting problem; keep 1.0 for the default. Record the final flags used.
+Acceptance is the gate list, not an impression. If a gate failed:
 
-- [ ] **Step 6: Run the whole test suite and try the artifact end to end**
+| Failed gate | First remedy |
+|---|---|
+| `improvement_exceeds_noise` | raise `--iterations` to 60; if still failing, the corpora may be too similar or too small to learn from |
+| `channel_monotone` or `grey_axis_monotone` | raise `--lambda-smooth` to 3e-3, then 1e-2 |
+| `neutral_axis_chroma` | raise `--lambda-identity` to 1e-3 |
+| `clipped_volume` | lower `--strength` to 0.85 |
+
+Change one flag at a time and re-run. Record the final flags and the reason for each change. Do not edit the thresholds in `evaluate.py`; they were fixed before tuning on purpose.
+
+- [ ] **Step 6: Promote the artifact and verify end to end**
 
 ```bash
+cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
 .venv/bin/pytest -q
-.venv/bin/kodachrome-process data/proxy-source /tmp/proxy-graded --artifacts artifacts
+.venv/bin/kodachrome-process data/proxy-source /tmp/proxy-graded
 open /tmp/proxy-graded
 ```
-Expected: all tests pass (the committed-artifact test now loads the trained LUT); regraded proxy images look like the contact sheet's graded row.
+Expected: the full suite passes, and the regraded images match the contact sheet's graded row.
 
 - [ ] **Step 7: Document provenance and commit**
 
 Append to `docs/decisions.md`:
 
 ```markdown
-## <today's date>: Default artifact trained on a proxy source corpus
+## <today's date>: Shipped artifact trained on a proxy source corpus
 
-**Decided:** the committed `artifacts/` were fitted with `--source` =
-<chosen category> (<N> files, seed 0, sampled via `kodachrome-fetch --sample 80`)
-and `--target` = <M> FSA Kodachrome scans, flags: <final flags>.
-**Why:** the repository must work on a fresh Pi before anyone has taken
-U20CAM shots. The proxy photos are public domain, modern digital and varied,
-but they are not the U20CAM's rendering; `params.json` carries
-`"proxy_source": true` and the README tells users to retrain with 50+ of
-their own shots.
+**Decided:** the artifact in `kodachrome/data/` was fitted with `--source` =
+<chosen category> (<N> files, `--sample 80 --seed 0`) and `--target` = <M>
+FSA Kodachrome scans; final flags: <flags>. Held-out distance <before> ->
+<after>, seed spread <spread>; all gates passed.
+**Why:** the package must work on a fresh Pi before anyone has taken U20CAM
+shots. These photographs are public domain, modern and varied, but they are
+not the U20CAM's rendering, so `params.json` carries `"proxy": true` and the
+README tells users to retrain with 50 or more of their own shots.
 ```
 
-In `README.md`, add under "How it works":
+In `README.md` under "How it works", add:
 
 ```markdown
-The committed `artifacts/` were trained against a stand-in source corpus
-(see `docs/decisions.md`), so `params.json` says `"proxy_source": true`.
-Retrain with your own U20CAM shots for the best match; see Training.
+The bundled artifact was trained against a stand-in source corpus (see
+`docs/decisions.md`), so `params.json` records `"proxy": true`. Retrain with
+your own U20CAM shots for the closest match.
 ```
 
 ```bash
-git add artifacts docs/decisions.md README.md
-git commit -m "feat: default Kodachrome LUT trained on FSA scans with a proxy source corpus
+git add kodachrome/data docs/decisions.md README.md
+git commit -m "feat: ship a Kodachrome LUT trained on FSA scans with a proxy source corpus
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 18: Pi deployment documentation and on-hardware measurement
+### Task 22: Pi deployment documentation and on-hardware measurement
 
-Implements spec 7.4 and the performance numbers promised in 7.2. Steps 1 and 2 run on the Mac; steps 3 to 5 need the Pi and the camera, so they are written for the user (or an agent with SSH access) to run.
+Implements spec 7.4, 7.5 and the performance numbers of 7.2. Steps 1 and 2 run on the Mac; steps 3 to 6 need the Pi and the camera.
 
 **Files:**
-- Modify: `README.md` (Pi setup, measured performance, known limitations)
+- Modify: `README.md`
 
 - [ ] **Step 1: Write the Pi setup section**
 
-Replace "Written in a later step." in `README.md` with:
+Replace the Pi placeholder in `README.md` with:
 
 ````markdown
+## Pi setup
+
 On Raspberry Pi OS (Bookworm or newer, 64-bit):
 
 ```bash
@@ -4464,73 +6550,140 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/kodachrome-capture            # real camera
 ```
 
-Why `--system-site-packages`: OpenCV comes from apt so the preview window
-works. Pip's `opencv-python-headless` wheel has no GUI support and would
-silently force headless mode. Do not `pip install opencv-python` on the Pi.
+`--system-site-packages` is what lets the venv see apt's OpenCV, which is
+built with GTK so the preview window works. Do not `pip install
+opencv-python` on the Pi: the wheel most likely to be selected is the
+headless one, which silently disables the preview.
 
-Plug the U20CAM into a USB port directly on the Pi 400, not through an
-unpowered hub; the vendor FAQ blames hubs for dropped frames. Check it is
-seen with `ls /dev/video*` (the first node is usually the capture stream).
+Plug the U20CAM directly into the Pi rather than an unpowered hub; the
+vendor FAQ attributes dropped frames to hub power. `ls /dev/v4l/by-id/`
+gives a stable path you can pass to `--device`, which is worth using if
+another camera is ever attached.
 ````
 
-- [ ] **Step 2: Write the known-limitations section**
+- [ ] **Step 2: Write the limitations section**
 
 Append to `README.md`:
 
 ```markdown
-## Known limitations
+## What this is, and is not
 
-- The look is learned from Library of Congress scans of 1940s Kodachrome,
-  including their scanner and colour management. Later Kodachrome (K-14,
-  1974 onwards) looks different. Point `--target` at your own scans to
+The look is an **aesthetic colour match** to Library of Congress scans of
+1939-1944 Kodachrome. It is not an estimate of the film's response to a
+scene, and it cannot be: the camera and the film photographed different
+subjects in different decades, so matching their colour distributions cannot
+separate "how the film rendered colour" from "what the 1940s looked like".
+The honest fix would be to photograph one colour chart on both, which is
+impossible now that Kodachrome has been discontinued since 2009 and
+unprocessable since 2010.
+
+What the numbers do show is that graded images sit measurably closer to the
+Kodachrome colour distribution than the originals, on images held out of
+training, by a margin larger than an identity transform and larger than the
+measurement's own noise. `artifacts/report/summary.txt` states it per fit.
+
+Other limits:
+
+- The scans carry LoC's scanner and colour management, and 1940s Kodachrome
+  differs from later K-14 stock. Point `--target` at your own scans to
   change the reference.
-- Unpaired matching cannot learn hue rotations larger than about one hue
-  bin (15 degrees at 24 bins); the hue reweighting that prevents content
-  bias also damps them. Saturation, lightness and tone curve per hue are
+- Hue reweighting damps learned hue rotations beyond roughly one bin
+  (15 degrees at 24 bins). Saturation, lightness and tone curve per hue are
   learned fully.
-- White balance is grey-world with clamped gains. A scene that is
-  legitimately all one colour will be partially neutralised.
-- No lens, halation or vignette modelling; the camera's 121-degree lens
-  distortion is left as is.
+- White balance is grey-world with clamped gains, so a scene legitimately
+  dominated by one colour is partially neutralised. The capture log records
+  when a gain clamped.
+- The camera's own auto exposure and white balance are recorded but not
+  locked; see `docs/decisions.md`. Locking is the first item of future work.
+- No lens, halation or vignette modelling; the 121-degree lens distortion is
+  left alone.
 ```
 
-- [ ] **Step 3 (on the Pi): install and run the smoke test**
+- [ ] **Step 3 (on the Pi): install and smoke test**
 
-Follow the Pi setup section exactly. Expected: `kodachrome-capture --fake` opens a window with the synthetic frame (or reports headless mode over SSH), SPACE writes two JPEGs under `~/Pictures/kodachrome/<date>/`.
+Follow the setup section. Expected: `--fake` opens a window (or reports headless over SSH) and SPACE writes two files under `~/Pictures/kodachrome/<date>/`.
 
-- [ ] **Step 4 (on the Pi): capture five real shots and read the timings**
+- [ ] **Step 4 (on the Pi): confirm byte-exact capture works on this hardware**
 
 ```bash
 .venv/bin/kodachrome-capture
-# press SPACE five times, then Q
-python3 -c "import json,glob; rows=[json.loads(l) for f in glob.glob('$HOME/Pictures/kodachrome/*/captures.jsonl') for l in open(f)]; print([r['processing_ms'] for r in rows[-5:]])"
+# take one shot, then Q
+ls ~/Pictures/kodachrome/*/ | head
+python3 -c "
+import glob, json
+rows=[json.loads(l) for f in glob.glob('$HOME/Pictures/kodachrome/*/captures.jsonl') for l in open(f)]
+print('frame_source:', rows[-1]['frame_source'], '| fourcc:', rows[-1]['fourcc'], '| fps:', rows[-1]['fps'])
+"
 ```
-Expected: five numbers, each under 1000 ms (spec target), typically 300 to 600 ms.
+Expected: `frame_source: raw-mjpeg` and a file named `*_original.jpg`. If it reports `decoded` and `*_ungraded.jpg`, raw mode is unavailable on this device or OpenCV build: record that fact in `docs/decisions.md`, since it is exactly the fallback the design anticipated, and note whether the user wants the `linuxpy`/`v4l2py` route pursued as follow-up work.
 
-- [ ] **Step 5: Record the numbers and commit**
+- [ ] **Step 5 (on the Pi): measure**
+
+```bash
+.venv/bin/kodachrome-capture
+# press SPACE ten times at a comfortable pace, then Q
+python3 -c "
+import glob, json, statistics as s
+rows=[json.loads(l) for f in glob.glob('$HOME/Pictures/kodachrome/*/captures.jsonl') for l in open(f)][-10:]
+p=[r['pipeline_ms'] for r in rows]; e=[r['shutter_to_saved_ms'] for r in rows]
+print(f'pipeline   median {s.median(p):.0f} ms  range {min(p):.0f}-{max(p):.0f}')
+print(f'shutter->saved median {s.median(e):.0f} ms  range {min(e):.0f}-{max(e):.0f}')
+"
+```
+Expected: shutter-to-saved comfortably under 1000 ms.
+
+- [ ] **Step 6: Record the numbers and commit**
 
 Add to `README.md` under "How it works":
 
 ```markdown
-Measured on a Raspberry Pi 400 at 1920x1080: about <median> ms per capture
-(five shots, <min> to <max> ms), of which the LUT and grain dominate. Preview
-runs at camera frame rate at 640x360.
+Measured on a Raspberry Pi 400 at 1920x1080 over ten captures: pipeline
+<median> ms (<min>-<max>), shutter to both files on disk <median> ms
+(<min>-<max>). Preview runs at 640x360.
 ```
 
 ```bash
-git add README.md
-git commit -m "docs: Pi setup, measured performance, known limitations
+git add README.md docs/decisions.md
+git commit -m "docs: Pi setup, measured performance and an honest limitations section
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
-If the Pi is not available when the rest of the plan is done, commit steps 1 and 2 with the sentence "Performance on the Pi 400 has not been measured yet" in place of the numbers, and leave steps 3 to 5 unchecked for the user.
+If the Pi is unavailable when the rest of the plan finishes, commit steps 1 and 2 with "Performance on the Pi 400 has not been measured yet" in place of the numbers, and leave steps 3 to 6 unchecked for the user.
 
 ---
 
-## Plan self-review notes
+## Plan self-review notes (revision 2)
 
-- **Spec coverage:** sections 3 and 6.1 → Task 11; 4 → Tasks 1, 7; 5.1 to 5.6 → Tasks 2 to 6; 6.2, 6.3 → Tasks 12, 17; 6.4 → Tasks 13, 14, 16; 6.5 → Task 15; 7.1 → Task 8; 7.2 → Task 10; 7.3 → Task 9; 7.4 → Task 18; 8 (error table) → Tasks 6, 8, 9, 10, 11, 16; 9 (tests) → each task's Step 1; 10 (docs) → every task's final step; 11 and 12 → Task 18 limitations.
-- **Deviation from spec, recorded:** `fit.py` split into `transport.py`, `lutfit.py`, `fit.py` (Task 16 updates the spec tree); `--proxy-source` is an explicit flag (Task 16 updates spec 6.2).
-- **Type consistency checked:** `Gains.combined`, `normalize_u8` return order `(image, gains)`, `LUT3D.apply_pillow(rgb_u8, filt)`, `PixelPool.lab`, `FitResult` field names, `write_report` argument order all match between defining and consuming tasks.
+**Spec coverage.** Spec 1 (goal and honest claim) → Tasks 19, 22 and the
+`transport.py` docstring in 15. Spec 2 → Task 11. Spec 3 and 6.1 → Task 13.
+Spec 4 → Tasks 3, 8. Spec 5.1 → Task 2 (done). 5.2 → Task 4. 5.3 → Task 5.
+5.4 → Task 6. 5.5 → Task 7. 5.6 and 5.8 → Task 8. 5.7 → Task 9. 6.2 → Tasks
+19, 21. 6.3 → Task 14. 6.4 → Tasks 15, 16, 19. 6.5 → Tasks 17, 18. 7.1 →
+Task 11. 7.2 → Task 12. 7.3 → Task 10. 7.4 → Tasks 3, 22. 7.5 → Tasks 11,
+12, 22. Spec 8 error table → Tasks 5, 8, 10, 11, 12, 13, 19. Spec 9 → each
+task's Step 1 plus Task 20. Spec 10 → every task's documentation step.
+Spec 12 → Task 22's limitations section.
 
+**Finding coverage.** F-01 → 14 (split), 15 (docstring), 17 (baseline and
+noise), 22 (README). F-02 → 11, 12. F-03 → 3, 8, 20. F-04 → 3. F-05 → 17.
+F-06 → 13, 14, 19. F-07 → 8, 19. F-08 → 11, 12. F-09 → 11, 12, 22. F-10 →
+7, 14, 18. F-11 → 10. F-12 → 4, 5, 6, 8, 14, 19. F-13 → 13. F-14 → 5, 12.
+F-15 → 12. F-16 → 4, 14, 18. F-17 → 8 (`Artifacts` shape), 19 (hue-rotation
+test), this plan's file table. F-18 → 17.
+
+**Type consistency checked across task boundaries:** `require_cv2`,
+`Gains.clamped`, `normalize_u8` returning `(image, Gains)`,
+`LUT3D.apply_pillow(rgb_u8, filt)`, `sha1_hex`, `load_rgb` returning
+`(array, ImageMeta)`, `Artifacts.resolve`, `Frame(rgb, jpeg, source)`,
+`StreamInfo.to_dict`, `PixelPool` fields, `CorpusSplit` fields,
+`Evaluator.build`/`distance`, `Gate` fields, `write_report` argument order,
+`publish(staging, dest)`. Each name is produced by exactly one task and
+consumed with the same signature everywhere else.
+
+**Known deviation from revision 1, recorded:** Tasks 1 and 2 were built
+against revision 1 and are not re-done; Task 3 retrofits the two things
+revision 2 changes about Task 1 (extras and package data). Revision 1's
+`artifacts/` directory at the repository root remains as the trainer's
+default output location, but it is no longer where the runtime looks by
+default.
