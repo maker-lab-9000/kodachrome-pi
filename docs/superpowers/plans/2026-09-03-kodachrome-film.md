@@ -2924,7 +2924,6 @@ from __future__ import annotations
 import glob
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -5524,7 +5523,7 @@ Implements spec 6.5. Fixes F-05 and F-18. This is the task that makes the projec
 import numpy as np
 import pytest
 
-from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
+from kodachrome.color import lch_to_oklab, srgb_to_oklab
 from kodachrome.lut import LUT3D
 from kodachrome.train.dataset import PixelPool
 from kodachrome.train.evaluate import (
