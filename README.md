@@ -46,3 +46,15 @@ Until training has run, the bundled LUT is an identity placeholder and its
 | `kodachrome-train` | Mac | fit the LUT and write `artifacts/` |
 | `kodachrome-capture` | Pi | live preview, SPACE to capture |
 | `kodachrome-process` | either | regrade a folder of originals |
+
+### Regrade a folder
+
+```bash
+kodachrome-process ~/Pictures/kodachrome/2026-09-03 /tmp/regraded
+```
+
+Pointed at a capture folder, it grades only the `*_original.jpg` files and
+skips the `*_kodachrome.jpg` siblings, so running it twice cannot
+double-grade. Pointed at any other folder it grades everything. Existing
+outputs are kept unless `--overwrite`; an output directory inside the input
+is refused. `--all` overrides the originals-only default.
