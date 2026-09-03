@@ -50,7 +50,5 @@ def require_cv2() -> ModuleType:
             raise ImportError(_BROKEN.format(error=exc)) from exc
         raise ImportError(_MISSING) from exc
     except ImportError as exc:
-        if "cv2" in str(exc):
-            raise ImportError(_MISSING) from exc
         raise ImportError(_BROKEN.format(error=exc)) from exc
     return cv2
