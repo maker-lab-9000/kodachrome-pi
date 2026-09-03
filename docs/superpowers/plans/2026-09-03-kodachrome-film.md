@@ -435,6 +435,15 @@ def test_u8_subsampling_branch_matches_the_reference():
     assert np.abs(out_u8.astype(int) - np.round(reference * 255).astype(int)).max() <= 1
 
 
+def test_the_float_path_refuses_uint8_input():
+    """uint8 would be clipped to 1.0 by srgb_to_linear and silently destroyed."""
+    u8 = np.full((16, 16, 3), 128, dtype=np.uint8)
+    with pytest.raises(ValueError, match="float image"):
+        normalize_float(u8, NormalizeParams())
+    with pytest.raises(ValueError, match="float image"):
+        compute_gains(u8, NormalizeParams())
+
+
 def test_luts_are_monotone():
     luts = gains_to_luts(
         Gains(wb=np.array([0.8, 1.0, 1.5], dtype=np.float32), exposure=1.3,
@@ -583,8 +592,27 @@ class Gains:
         }
 
 
+def _require_float_image(rgb: np.ndarray, caller: str) -> np.ndarray:
+    """Guard the float path against uint8 input, which it would destroy silently.
+
+    ``srgb_to_linear`` clips to [0, 1], so every uint8 value from 1 to 255
+    collapses to 1.0 and the image's entire content is lost with no error
+    raised — a trainer handing over the result of ``load_rgb`` would get a
+    flat frame and never know. Every other public entry point in this package
+    validates its input; this one must too.
+    """
+    rgb = np.asarray(rgb)
+    if not np.issubdtype(rgb.dtype, np.floating):
+        raise ValueError(
+            f"{caller} expects a float image in [0, 1], got dtype {rgb.dtype}. "
+            "Divide a uint8 array by 255 first, or use normalize_u8."
+        )
+    return rgb
+
+
 def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
     """Grey-world white balance and median-to-target exposure from an sRGB float image."""
+    rgb = _require_float_image(rgb, "compute_gains")
     lin = srgb_to_linear(rgb).reshape(-1, 3)
     lum = lin @ LUMA_709
     mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
@@ -619,6 +647,7 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
 
 
 def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
+    rgb = _require_float_image(rgb, "apply_gains_float")
     return linear_to_srgb(np.clip(srgb_to_linear(rgb) * gains.combined, 0.0, 1.0))
 
 
@@ -741,6 +770,14 @@ def test_numpy_and_pillow_agree():
     diff = np.abs(ref - lut.apply_pillow(u8).astype(int))
     assert diff.max() <= 1
     assert diff.mean() < 0.3
+
+
+def test_an_unsupported_keyword_is_named_not_parsed_as_data(tmp_path):
+    """Resolve emits LUT_3D_INPUT_RANGE, which has three tokens like a data row."""
+    path = tmp_path / "resolve.cube"
+    path.write_text("LUT_3D_SIZE 2\nLUT_3D_INPUT_RANGE 0.0 1.0\n" + "0 0 0\n" * 8)
+    with pytest.raises(CubeError, match=re.escape("unsupported keyword")):
+        read_cube(path)
 
 
 def test_sha1_is_stable_and_content_sensitive():
@@ -901,7 +938,11 @@ class LUT3D:
         """Fast path. Build ``filt`` once with ``to_pillow()`` when processing many frames."""
         filt = filt if filt is not None else self.to_pillow()
         im = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
-        return np.asarray(im.filter(filt))
+        # np.array, not np.asarray: the result must be writeable. Otherwise
+        # Pipeline.process(grain=False) returns a read-only frame while
+        # grain=True returns a writeable one, because the grain path happens to
+        # allocate a fresh array in cvtColor.
+        return np.array(im.filter(filt))
 
 
 def sha1_hex(lut: LUT3D) -> str:
@@ -957,6 +998,14 @@ def read_cube(path: str | Path) -> LUT3D:
             domain_max = _parse_triplet(line.split()[1:], path, lineno, "DOMAIN_MAX")
             continue
         parts = line.split()
+        # A keyword we do not handle must be named, not parsed as data. Resolve
+        # emits LUT_3D_INPUT_RANGE, which has exactly three tokens and would
+        # otherwise reach float() and fail as "non-numeric value".
+        if parts[0][0].isalpha() or parts[0][0] == "_":
+            raise CubeError(
+                f"{path}: unsupported keyword {parts[0]!r} on line {lineno}; "
+                "this reader handles TITLE, LUT_3D_SIZE, DOMAIN_MIN and DOMAIN_MAX"
+            )
         if len(parts) != 3:
             raise CubeError(f"{path}: expected 3 values on line {lineno}, got {len(parts)}")
         try:
@@ -1418,6 +1467,30 @@ def test_load_converts_modes(tmp_path):
     assert load_rgb(tmp_path / "rgba.png")[0].shape == (8, 8, 3)
 
 
+def test_saved_jpeg_keeps_full_chroma_resolution(tmp_path):
+    """4:2:0 would destroy chroma detail in the project's only output writer."""
+    columns = np.zeros((64, 64, 3), dtype=np.uint8)
+    columns[:, ::2] = (220, 30, 30)
+    columns[:, 1::2] = (30, 200, 60)
+    path = save_jpeg(columns, tmp_path / "chroma.jpg")
+
+    with Image.open(path) as im:
+        # layer[0] carries the luma sampling factors; (1, 1, 1, 0) means 4:4:4.
+        assert im.layer[0][1:3] == (1, 1), f"expected 4:4:4, got layers {im.layer}"
+
+    back, _ = load_rgb(path)
+    # Measured: 4:2:0 gives a max error of about 118 here; 4:4:4 gives 2.
+    assert np.abs(back.astype(int) - columns.astype(int)).max() <= 8
+
+
+def test_loaded_arrays_are_writeable(tmp_path):
+    """Callers draw on preview frames; a read-only return value breaks them."""
+    save_jpeg(np.full((8, 8, 3), 120, dtype=np.uint8), tmp_path / "w.jpg")
+    arr, _ = load_rgb(tmp_path / "w.jpg")
+    assert arr.flags.writeable
+    arr[0, 0, 0] = 5  # must not raise
+
+
 def test_list_images_filters_and_sorts(tmp_path):
     for name in ["b.JPG", "a.jpeg", "c.png", "notes.txt", "d.tif"]:
         (tmp_path / name).write_bytes(b"")
@@ -1531,7 +1604,10 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
         elif raw_profile:
             profile_name = "sRGB (assumed, colour management off)"
 
-        rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+        # np.asarray on a PIL image is read-only. Callers legitimately draw on
+        # what they get back (overlays on a preview frame), and the writability
+        # of a public return value must not depend on which branch produced it.
+        rgb = np.array(im.convert("RGB"), dtype=np.uint8)
 
     return rgb, ImageMeta(
         profile=profile_name,
@@ -1543,15 +1619,32 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
 
 
 def save_jpeg(
-    rgb_u8: np.ndarray, path: str | Path, quality: int = 95, embed_srgb: bool = True
+    rgb_u8: np.ndarray,
+    path: str | Path,
+    quality: int = 95,
+    embed_srgb: bool = True,
+    subsampling: int = 0,
 ) -> Path:
+    """Write an sRGB JPEG. ``subsampling=0`` means 4:4:4, full chroma resolution.
+
+    Pillow's default is 4:2:0, which halves chroma resolution in both axes.
+    On a natural frame that costs little on average (mean Oklab dE 0.0126
+    against 0.0102) but a great deal at saturated edges: the 99th-percentile
+    error is 0.032 dE, which exceeds the fitted LUT's own 0.025 accuracy
+    floor. In other words, on the pixels where Kodachrome's character
+    actually lives, the file format would introduce more error than the
+    learned grade itself carries. The cost is about twice the bytes — 2.4 MB
+    against 4.9 MB for a 1080p frame — which is the right trade for a project
+    whose entire purpose is colour, and for files that double as the archival
+    record. Pass ``subsampling=2`` for 4:2:0 if storage matters more.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
     kwargs = {}
     if embed_srgb:
         kwargs["icc_profile"] = ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
-    image.save(path, "JPEG", quality=quality, **kwargs)
+    image.save(path, "JPEG", quality=quality, subsampling=subsampling, **kwargs)
     return path
 
 
@@ -1689,6 +1782,45 @@ def test_packaged_default_loads_from_any_directory(tmp_path, monkeypatch):
     art = Artifacts.default()
     assert art.lut.size >= 2
     assert art.lut_sha1 == sha1_hex(art.lut)
+
+
+def test_the_default_artifacts_path_still_exists(tmp_path, monkeypatch):
+    """`path` is provenance: it must name a directory that is still there.
+
+    Resolving the packaged data as its own package yields a MultiplexedPath,
+    which `as_file` materialises into a temp directory deleted before the call
+    returns — so `path` pointed at nothing and every startup copied 950 KB.
+    """
+    monkeypatch.chdir(tmp_path)
+    art = Artifacts.default()
+    assert art.path.is_dir(), f"{art.path} does not exist after default() returned"
+    assert (art.path / "params.json").is_file()
+    assert Artifacts.default().path == art.path
+
+
+@pytest.mark.parametrize(
+    "lut_file, message",
+    [
+        (5, "'lut_file' must be a non-empty string"),
+        (None, "'lut_file' must be a non-empty string"),
+        ("", "'lut_file' must be a non-empty string"),
+        ("../escape.cube", "must be a plain name"),
+        ("/etc/passwd.cube", "must be a plain name"),
+    ],
+)
+def test_lut_file_is_validated(tmp_path, lut_file, message):
+    """A bad lut_file must not escape as TypeError, nor read outside the directory."""
+    (tmp_path / "params.json").write_text(json.dumps({"version": 2, "lut_file": lut_file}))
+    with pytest.raises(ArtifactsError, match=re.escape(message)):
+        Artifacts.load(tmp_path)
+
+
+@pytest.mark.parametrize("version", [True, 0, -1, 3])
+def test_bad_version_values_are_refused(tmp_path, version):
+    """`True` is an int subclass, so isinstance would have let it through."""
+    (tmp_path / "params.json").write_text(json.dumps({"version": version}))
+    with pytest.raises(ArtifactsError, match=re.escape("unsupported params version")):
+        Artifacts.load(tmp_path)
 
 
 def test_resolve_prefers_the_override(staged, tmp_path, monkeypatch):
@@ -1917,10 +2049,12 @@ class Artifacts:
             raise ArtifactsError(f"{params_path}: top level must be a JSON object")
 
         version = raw.get("version")
-        if not isinstance(version, int) or version > PARAMS_VERSION:
+        # `type(...) is int`, not isinstance: bool subclasses int, so
+        # {"version": true} would otherwise pass and then compare as 1.
+        if type(version) is not int or not 1 <= version <= PARAMS_VERSION:
             raise ArtifactsError(
                 f"{params_path}: unsupported params version {version!r} "
-                f"(this build reads up to {PARAMS_VERSION})"
+                f"(this build reads 1 to {PARAMS_VERSION})"
             )
 
         # Structural checks before file I/O, so a malformed section is reported as
@@ -1939,7 +2073,21 @@ class Artifacts:
             # which would otherwise escape unwrapped past this loader.
             raise ArtifactsError(f"{params_path}: {exc}") from exc
 
-        lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
+        lut_file = raw.get("lut_file", DEFAULT_LUT_FILE)
+        # Validated before use: `path / 5` raises TypeError, which would escape
+        # this loader unwrapped, and a name like "../../x.cube" would read
+        # outside the artifact directory.
+        if not isinstance(lut_file, str) or not lut_file:
+            raise ArtifactsError(
+                f"{params_path}: 'lut_file' must be a non-empty string, "
+                f"got {type(lut_file).__name__}"
+            )
+        if Path(lut_file).is_absolute() or ".." in Path(lut_file).parts:
+            raise ArtifactsError(
+                f"{params_path}: 'lut_file' must be a plain name inside the artifact "
+                f"directory, got {lut_file!r}"
+            )
+        lut_path = path / lut_file
         if not lut_path.is_file():
             raise ArtifactsError(f"LUT file {lut_path} not found (named in {params_path})")
         try:
@@ -1975,9 +2123,23 @@ class Artifacts:
 
     @classmethod
     def default(cls) -> Artifacts:
-        """The artifact shipped inside the package."""
-        with resources.as_file(resources.files("kodachrome.data")) as data_dir:
-            return cls.load(data_dir)
+        """The artifact shipped inside the package.
+
+        Resolved as a sub-path of ``kodachrome`` rather than as the package
+        ``kodachrome.data``. ``kodachrome/data`` has no ``__init__.py``, so
+        ``resources.files("kodachrome.data")`` yields a ``MultiplexedPath``,
+        and ``as_file`` on one of those materialises a *temporary* copy that
+        is deleted when the context exits — leaving ``Artifacts.path``
+        pointing at a directory that no longer exists, and copying the
+        950 KB table on every startup. A sub-path of a real package is a real
+        directory, so it survives and costs nothing.
+        """
+        data_dir = Path(str(resources.files("kodachrome") / "data"))
+        if not data_dir.is_dir():
+            raise ArtifactsError(
+                f"packaged artifact directory {data_dir} is missing; reinstall the package"
+            )
+        return cls.load(data_dir)
 
     @classmethod
     def resolve(cls, dir_path: str | Path | None) -> Artifacts:
@@ -2156,6 +2318,15 @@ def test_same_seed_reproduces_the_output(pipeline):
     a, _ = pipeline.process(frame, rng=np.random.default_rng(11))
     b, _ = pipeline.process(frame, rng=np.random.default_rng(11))
     assert np.array_equal(a, b)
+
+
+def test_process_returns_a_writeable_array_either_way(pipeline):
+    """Writability must not depend on whether grain happened to run."""
+    frame = np.full((32, 32, 3), 128, dtype=np.uint8)
+    for grain in (False, True):
+        out, _ = pipeline.process(frame, grain=grain, rng=np.random.default_rng(0))
+        assert out.flags.writeable, f"grain={grain} returned a read-only array"
+        out[0, 0, 0] = 7
 
 
 def test_process_rejects_wrong_input(pipeline):
