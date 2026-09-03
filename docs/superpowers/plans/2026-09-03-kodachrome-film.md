@@ -286,6 +286,7 @@ from kodachrome import color
 from kodachrome.normalize import (
     Gains,
     NormalizeParams,
+    apply_gains_float,
     compute_gains,
     gains_to_luts,
     normalize_float,
@@ -400,6 +401,37 @@ def test_float_and_u8_paths_agree():
     assert out_u8.dtype == np.uint8 and out_u8.shape == img_u8.shape
     assert np.allclose(gains_f.combined, gains_u8.combined, atol=1e-6)
     assert np.abs(out_u8.astype(int) - np.round(out_f * 255).astype(int)).max() <= 1
+
+
+def test_u8_subsampling_branch_matches_the_reference():
+    """At 1080p the Pi always subsamples for statistics, so prove that path.
+
+    The 48x64 fixture above gives ``step == 1``, which quietly skips the
+    strided branch entirely — the branch every real capture takes. A
+    1920x1080 frame gives ``step == 3``, so the gains come from about a ninth
+    of the pixels.
+
+    Two claims, kept apart because they can fail independently: the table
+    must apply exactly the gains it computed, and gains from a subsample must
+    be close enough to full-image statistics that the result is
+    indistinguishable at 8-bit precision. Measured: relative gain difference
+    1.4e-4, table exact, fast path within one level.
+    """
+    img_u8 = (_gradient_image(1080, 1920) * 255).round().astype(np.uint8)
+    p = NormalizeParams()
+    out_u8, gains_u8 = normalize_u8(img_u8, p)
+    reference, gains_full = normalize_float(img_u8.astype(np.float32) / 255.0, p)
+
+    # The subsample really was taken: fewer pixels give slightly different gains.
+    assert not np.array_equal(gains_u8.combined, gains_full.combined)
+    assert np.allclose(gains_u8.combined, gains_full.combined, rtol=1e-3)
+
+    # The table applies its own gains faithfully.
+    own = apply_gains_float(img_u8.astype(np.float32) / 255.0, gains_u8)
+    assert np.abs(out_u8.astype(int) - np.round(own * 255).astype(int)).max() <= 1
+
+    # And the fast path is indistinguishable from the full-statistics path.
+    assert np.abs(out_u8.astype(int) - np.round(reference * 255).astype(int)).max() <= 1
 
 
 def test_luts_are_monotone():
@@ -619,6 +651,8 @@ def normalize_u8(
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/pytest tests/test_normalize.py -q` → all pass. A max diff of 2 in `test_float_and_u8_paths_agree` almost always means the `cv2.LUT` table shape is wrong; it must be `(256, 1, 3)`.
+
+`test_u8_subsampling_branch_matches_the_reference` builds a full 1920x1080 frame and takes about a second — that is expected and worth it, because it is the only test covering the strided-statistics branch that every real capture uses.
 
 - [ ] **Step 5: Commit**
 
