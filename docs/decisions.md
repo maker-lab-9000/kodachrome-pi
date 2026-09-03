@@ -146,5 +146,11 @@ spread across five seeds reported alongside.
 **Rejected:** drawing a fresh random seed per measurement.
 **Why:** the previous code seeded `swd_before` and `swd_after`
 independently, so part of any reported improvement was sampling variance,
-and both were computed on training pixels. A test now asserts that an
-identity LUT produces identical before and after values.
+and both were computed on training pixels.
+
+Measured on 4,000 random colours: the old unpaired code reported a 12.2%
+change in distance for an **identity LUT**, one that alters nothing. That is
+the same order as the improvement a real grade would be expected to show, so
+the metric could not have distinguished a working fit from a broken one. The
+paired evaluator returns a bit-identical value in the same test, and a test
+now asserts exactly that.
