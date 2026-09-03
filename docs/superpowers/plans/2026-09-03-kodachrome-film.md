@@ -2667,9 +2667,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("in_dir", type=Path)
     parser.add_argument("out_dir", type=Path)
-    parser.add_argument("--artifacts", type=Path, default=None, help="artifact dir (default: bundled)")
+    parser.add_argument(
+        "--artifacts", type=Path, default=None, help="artifact dir (default: bundled)"
+    )
     parser.add_argument("--no-grain", action="store_true", help="skip film grain")
-    parser.add_argument("--all", action="store_true", help="process every image, not just originals")
+    parser.add_argument(
+        "--all", action="store_true", help="process every image, not just originals"
+    )
     parser.add_argument("--overwrite", action="store_true", help="replace existing outputs")
     args = parser.parse_args(argv)
 
