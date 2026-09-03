@@ -227,19 +227,35 @@ class V4L2Camera:
             self.cap.read()
 
     def _enable_raw_mode(self) -> bool:
-        """Ask the backend for the compressed buffer; verify by reading one frame."""
+        """Ask the backend for the compressed buffer; verify by reading one frame.
+
+        Every failure path restores ``CAP_PROP_CONVERT_RGB``, including the
+        ones where the ``set`` call itself failed or raised. OpenCV gives no
+        guarantee that a failing ``set`` left the property untouched, and the
+        half-state is silently destructive: the object would believe it is in
+        decoded mode while the driver still hands back compressed buffers, so
+        ``read`` would run ``cvtColor`` over JPEG bytes as though they were a
+        BGR image and return plausible-looking garbage. Restoring
+        unconditionally costs one ignored call and removes the question.
+        """
+
+        def give_up() -> bool:
+            try:
+                self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            except cv2.error:
+                pass
+            return False
+
         try:
             if not self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0):
-                return False
+                return give_up()
         except cv2.error:
-            return False
+            return give_up()
         ok, buf = self.cap.read()
-        if not ok or buf is None or buf.ndim != 2 and buf.ndim != 1:
-            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-            return False
+        if not ok or buf is None or (buf.ndim != 2 and buf.ndim != 1):
+            return give_up()
         if not is_valid_jpeg(np.asarray(buf, dtype=np.uint8).tobytes()):
-            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-            return False
+            return give_up()
         return True
 
     def _negotiated(self, width: int, height: int, fps: int) -> StreamInfo:
