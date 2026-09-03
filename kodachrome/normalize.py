@@ -130,8 +130,27 @@ class Gains:
         }
 
 
+def _require_float_image(rgb: np.ndarray, caller: str) -> np.ndarray:
+    """Guard the float path against uint8 input, which it would destroy silently.
+
+    ``srgb_to_linear`` clips to [0, 1], so every uint8 value from 1 to 255
+    collapses to 1.0 and the image's entire content is lost with no error
+    raised — a trainer handing over the result of ``load_rgb`` would get a
+    flat frame and never know. Every other public entry point in this package
+    validates its input; this one must too.
+    """
+    rgb = np.asarray(rgb)
+    if not np.issubdtype(rgb.dtype, np.floating):
+        raise ValueError(
+            f"{caller} expects a float image in [0, 1], got dtype {rgb.dtype}. "
+            "Divide a uint8 array by 255 first, or use normalize_u8."
+        )
+    return rgb
+
+
 def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
     """Grey-world white balance and median-to-target exposure from an sRGB float image."""
+    rgb = _require_float_image(rgb, "compute_gains")
     lin = srgb_to_linear(rgb).reshape(-1, 3)
     lum = lin @ LUMA_709
     mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
@@ -166,6 +185,7 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
 
 
 def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
+    rgb = _require_float_image(rgb, "apply_gains_float")
     return linear_to_srgb(np.clip(srgb_to_linear(rgb) * gains.combined, 0.0, 1.0))
 
 

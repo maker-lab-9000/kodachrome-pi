@@ -106,7 +106,11 @@ class LUT3D:
         """Fast path. Build ``filt`` once with ``to_pillow()`` when processing many frames."""
         filt = filt if filt is not None else self.to_pillow()
         im = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
-        return np.asarray(im.filter(filt))
+        # np.array, not np.asarray: the result must be writeable. Otherwise
+        # Pipeline.process(grain=False) returns a read-only frame while
+        # grain=True returns a writeable one, because the grain path happens to
+        # allocate a fresh array in cvtColor.
+        return np.array(im.filter(filt))
 
 
 def sha1_hex(lut: LUT3D) -> str:
@@ -162,6 +166,14 @@ def read_cube(path: str | Path) -> LUT3D:
             domain_max = _parse_triplet(line.split()[1:], path, lineno, "DOMAIN_MAX")
             continue
         parts = line.split()
+        # A keyword we do not handle must be named, not parsed as data. Resolve
+        # emits LUT_3D_INPUT_RANGE, which has exactly three tokens and would
+        # otherwise reach float() and fail as "non-numeric value".
+        if parts[0][0].isalpha() or parts[0][0] == "_":
+            raise CubeError(
+                f"{path}: unsupported keyword {parts[0]!r} on line {lineno}; "
+                "this reader handles TITLE, LUT_3D_SIZE, DOMAIN_MIN and DOMAIN_MAX"
+            )
         if len(parts) != 3:
             raise CubeError(f"{path}: expected 3 values on line {lineno}, got {len(parts)}")
         try:

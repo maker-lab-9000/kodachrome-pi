@@ -78,10 +78,12 @@ class Artifacts:
             raise ArtifactsError(f"{params_path}: top level must be a JSON object")
 
         version = raw.get("version")
-        if not isinstance(version, int) or version > PARAMS_VERSION:
+        # `type(...) is int`, not isinstance: bool subclasses int, so
+        # {"version": true} would otherwise pass and then compare as 1.
+        if type(version) is not int or not 1 <= version <= PARAMS_VERSION:
             raise ArtifactsError(
                 f"{params_path}: unsupported params version {version!r} "
-                f"(this build reads up to {PARAMS_VERSION})"
+                f"(this build reads 1 to {PARAMS_VERSION})"
             )
 
         # Structural checks before file I/O, so a malformed section is reported as
@@ -100,7 +102,21 @@ class Artifacts:
             # which would otherwise escape unwrapped past this loader.
             raise ArtifactsError(f"{params_path}: {exc}") from exc
 
-        lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
+        lut_file = raw.get("lut_file", DEFAULT_LUT_FILE)
+        # Validated before use: `path / 5` raises TypeError, which would escape
+        # this loader unwrapped, and a name like "../../x.cube" would read
+        # outside the artifact directory.
+        if not isinstance(lut_file, str) or not lut_file:
+            raise ArtifactsError(
+                f"{params_path}: 'lut_file' must be a non-empty string, "
+                f"got {type(lut_file).__name__}"
+            )
+        if Path(lut_file).is_absolute() or ".." in Path(lut_file).parts:
+            raise ArtifactsError(
+                f"{params_path}: 'lut_file' must be a plain name inside the artifact "
+                f"directory, got {lut_file!r}"
+            )
+        lut_path = path / lut_file
         if not lut_path.is_file():
             raise ArtifactsError(f"LUT file {lut_path} not found (named in {params_path})")
         try:
@@ -136,9 +152,23 @@ class Artifacts:
 
     @classmethod
     def default(cls) -> Artifacts:
-        """The artifact shipped inside the package."""
-        with resources.as_file(resources.files("kodachrome.data")) as data_dir:
-            return cls.load(data_dir)
+        """The artifact shipped inside the package.
+
+        Resolved as a sub-path of ``kodachrome`` rather than as the package
+        ``kodachrome.data``. ``kodachrome/data`` has no ``__init__.py``, so
+        ``resources.files("kodachrome.data")`` yields a ``MultiplexedPath``,
+        and ``as_file`` on one of those materialises a *temporary* copy that
+        is deleted when the context exits — leaving ``Artifacts.path``
+        pointing at a directory that no longer exists, and copying the
+        950 KB table on every startup. A sub-path of a real package is a real
+        directory, so it survives and costs nothing.
+        """
+        data_dir = Path(str(resources.files("kodachrome") / "data"))
+        if not data_dir.is_dir():
+            raise ArtifactsError(
+                f"packaged artifact directory {data_dir} is missing; reinstall the package"
+            )
+        return cls.load(data_dir)
 
     @classmethod
     def resolve(cls, dir_path: str | Path | None) -> Artifacts:

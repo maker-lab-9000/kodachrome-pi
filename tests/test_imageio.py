@@ -116,6 +116,30 @@ def test_load_converts_modes(tmp_path):
     assert load_rgb(tmp_path / "rgba.png")[0].shape == (8, 8, 3)
 
 
+def test_saved_jpeg_keeps_full_chroma_resolution(tmp_path):
+    """4:2:0 would destroy chroma detail in the project's only output writer."""
+    columns = np.zeros((64, 64, 3), dtype=np.uint8)
+    columns[:, ::2] = (220, 30, 30)
+    columns[:, 1::2] = (30, 200, 60)
+    path = save_jpeg(columns, tmp_path / "chroma.jpg")
+
+    with Image.open(path) as im:
+        # layer[0] carries the luma sampling factors; (1, 1, 1, 0) means 4:4:4.
+        assert im.layer[0][1:3] == (1, 1), f"expected 4:4:4, got layers {im.layer}"
+
+    back, _ = load_rgb(path)
+    # Measured: 4:2:0 gives a max error of about 118 here; 4:4:4 gives 2.
+    assert np.abs(back.astype(int) - columns.astype(int)).max() <= 8
+
+
+def test_loaded_arrays_are_writeable(tmp_path):
+    """Callers draw on preview frames; a read-only return value breaks them."""
+    save_jpeg(np.full((8, 8, 3), 120, dtype=np.uint8), tmp_path / "w.jpg")
+    arr, _ = load_rgb(tmp_path / "w.jpg")
+    assert arr.flags.writeable
+    arr[0, 0, 0] = 5  # must not raise
+
+
 def test_list_images_filters_and_sorts(tmp_path):
     for name in ["b.JPG", "a.jpeg", "c.png", "notes.txt", "d.tif"]:
         (tmp_path / name).write_bytes(b"")

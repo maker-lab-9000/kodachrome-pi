@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import pytest
 
@@ -54,6 +56,14 @@ def test_numpy_and_pillow_agree():
     assert diff.mean() < 0.3
 
 
+def test_an_unsupported_keyword_is_named_not_parsed_as_data(tmp_path):
+    """Resolve emits LUT_3D_INPUT_RANGE, which has three tokens like a data row."""
+    path = tmp_path / "resolve.cube"
+    path.write_text("LUT_3D_SIZE 2\nLUT_3D_INPUT_RANGE 0.0 1.0\n" + "0 0 0\n" * 8)
+    with pytest.raises(CubeError, match=re.escape("unsupported keyword")):
+        read_cube(path)
+
+
 def test_sha1_is_stable_and_content_sensitive():
     a = sha1_hex(LUT3D.identity(9))
     assert a == sha1_hex(LUT3D.identity(9))
@@ -79,14 +89,8 @@ def test_sha1_is_stable_and_content_sensitive():
 def test_cube_errors(tmp_path, text, message):
     path = tmp_path / "bad.cube"
     path.write_text(text)
-    with pytest.raises(CubeError, match=re_escape(message)):
+    with pytest.raises(CubeError, match=re.escape(message)):
         read_cube(path)
-
-
-def re_escape(s):
-    import re
-
-    return re.escape(s)
 
 
 @pytest.mark.parametrize(
@@ -99,5 +103,5 @@ def re_escape(s):
     ],
 )
 def test_table_validation(table, message):
-    with pytest.raises(ValueError, match=re_escape(message)):
+    with pytest.raises(ValueError, match=re.escape(message)):
         LUT3D(table)

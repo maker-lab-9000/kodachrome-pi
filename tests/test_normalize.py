@@ -153,6 +153,15 @@ def test_u8_subsampling_branch_matches_the_reference():
     assert np.abs(out_u8.astype(int) - np.round(reference * 255).astype(int)).max() <= 1
 
 
+def test_the_float_path_refuses_uint8_input():
+    """uint8 would be clipped to 1.0 by srgb_to_linear and silently destroyed."""
+    u8 = np.full((16, 16, 3), 128, dtype=np.uint8)
+    with pytest.raises(ValueError, match="float image"):
+        normalize_float(u8, NormalizeParams())
+    with pytest.raises(ValueError, match="float image"):
+        compute_gains(u8, NormalizeParams())
+
+
 def test_luts_are_monotone():
     luts = gains_to_luts(
         Gains(wb=np.array([0.8, 1.0, 1.5], dtype=np.float32), exposure=1.3,

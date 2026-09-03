@@ -88,6 +88,45 @@ def test_packaged_default_loads_from_any_directory(tmp_path, monkeypatch):
     assert art.lut_sha1 == sha1_hex(art.lut)
 
 
+def test_the_default_artifacts_path_still_exists(tmp_path, monkeypatch):
+    """`path` is provenance: it must name a directory that is still there.
+
+    Resolving the packaged data as its own package yields a MultiplexedPath,
+    which `as_file` materialises into a temp directory deleted before the call
+    returns — so `path` pointed at nothing and every startup copied 950 KB.
+    """
+    monkeypatch.chdir(tmp_path)
+    art = Artifacts.default()
+    assert art.path.is_dir(), f"{art.path} does not exist after default() returned"
+    assert (art.path / "params.json").is_file()
+    assert Artifacts.default().path == art.path
+
+
+@pytest.mark.parametrize(
+    "lut_file, message",
+    [
+        (5, "'lut_file' must be a non-empty string"),
+        (None, "'lut_file' must be a non-empty string"),
+        ("", "'lut_file' must be a non-empty string"),
+        ("../escape.cube", "must be a plain name"),
+        ("/etc/passwd.cube", "must be a plain name"),
+    ],
+)
+def test_lut_file_is_validated(tmp_path, lut_file, message):
+    """A bad lut_file must not escape as TypeError, nor read outside the directory."""
+    (tmp_path / "params.json").write_text(json.dumps({"version": 2, "lut_file": lut_file}))
+    with pytest.raises(ArtifactsError, match=re.escape(message)):
+        Artifacts.load(tmp_path)
+
+
+@pytest.mark.parametrize("version", [True, 0, -1, 3])
+def test_bad_version_values_are_refused(tmp_path, version):
+    """`True` is an int subclass, so isinstance would have let it through."""
+    (tmp_path / "params.json").write_text(json.dumps({"version": version}))
+    with pytest.raises(ArtifactsError, match=re.escape("unsupported params version")):
+        Artifacts.load(tmp_path)
+
+
 def test_resolve_prefers_the_override(staged, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert Artifacts.resolve(staged).lut.size == 9

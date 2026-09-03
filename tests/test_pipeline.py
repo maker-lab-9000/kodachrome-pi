@@ -38,6 +38,15 @@ def test_same_seed_reproduces_the_output(pipeline):
     assert np.array_equal(a, b)
 
 
+def test_process_returns_a_writeable_array_either_way(pipeline):
+    """Writability must not depend on whether grain happened to run."""
+    frame = np.full((32, 32, 3), 128, dtype=np.uint8)
+    for grain in (False, True):
+        out, _ = pipeline.process(frame, grain=grain, rng=np.random.default_rng(0))
+        assert out.flags.writeable, f"grain={grain} returned a read-only array"
+        out[0, 0, 0] = 7
+
+
 def test_process_rejects_wrong_input(pipeline):
     with pytest.raises(ValueError):
         pipeline.process(np.zeros((4, 4, 3), dtype=np.float32))
