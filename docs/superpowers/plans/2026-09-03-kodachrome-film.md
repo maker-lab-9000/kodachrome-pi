@@ -4948,10 +4948,16 @@ def test_neutral_axis_chroma_catches_a_tinting_lut():
     assert neutral_axis_max_chroma(LUT3D(t)) > 0.05
 
 
-def test_clipped_volume_fraction():
-    assert clipped_volume_fraction(LUT3D.identity(9)) < 0.35  # cube faces are legitimately at 0/1
-    t = np.clip(LUT3D.identity(9).table * 3.0, 0, 1)
-    assert clipped_volume_fraction(LUT3D(t)) > 0.6
+@pytest.mark.parametrize("size", [9, 17, 33])
+def test_identity_and_tone_curves_clip_nothing(size):
+    """Interior nodes only, so grid size must not change the answer."""
+    assert clipped_volume_fraction(LUT3D.identity(size)) == 0.0
+    assert clipped_volume_fraction(LUT3D(LUT3D.identity(size).table**1.5)) == 0.0
+
+
+def test_clipped_volume_fraction_catches_a_crushing_lut():
+    crushed = LUT3D(np.clip(LUT3D.identity(9).table * 3.0, 0, 1))
+    assert clipped_volume_fraction(crushed) > 0.9
 
 
 def test_hue_bin_shifts_report_darkening():
@@ -5172,9 +5178,21 @@ def neutral_axis_max_chroma(lut: LUT3D) -> float:
 
 
 def clipped_volume_fraction(lut: LUT3D, eps: float = 1e-4) -> float:
-    """Fraction of grid nodes with any channel pinned at 0 or 1."""
-    t = lut.table
-    pinned = (t <= eps) | (t >= 1.0 - eps)
+    """Fraction of **interior** input nodes whose output is pinned to the gamut boundary.
+
+    Interior only, deliberately. The six faces of the cube are inputs that
+    already sit at 0 or 1 in some channel, so an identity LUT pins them too:
+    counting them would report 53% clipping at size 9 and 17% at size 33 for
+    a LUT that changes nothing, and would make any fixed threshold depend on
+    the grid size. Restricting to interior nodes gives exactly 0.0 for the
+    identity and for an ordinary tone curve, and rises only when the LUT is
+    genuinely crushing colours onto the boundary.
+    """
+    n = lut.size
+    if n < 3:
+        return 0.0
+    inner = lut.table[1:-1, 1:-1, 1:-1]
+    pinned = (inner <= eps) | (inner >= 1.0 - eps)
     return float(np.any(pinned, axis=-1).mean())
 
 
@@ -5339,8 +5357,6 @@ def evaluate(
 Run: `.venv/bin/pytest tests/test_evaluate.py -q` → all pass.
 
 `test_identity_lut_gives_identical_before_and_after` is the load-bearing one. If it fails, the evaluator is not truly paired: check that `Evaluator.build` stores the sorted **target** projections once and that `distance` re-projects only the source. Do not relax its tolerance.
-
-If `test_clipped_volume_fraction`'s identity bound of 0.35 proves wrong, compute the true value for an identity LUT (the six cube faces are legitimately pinned) and set the test bound just above it, recording the number in `docs/decisions.md`. Do not change `MAX_CLIPPED_VOLUME`, which is a gate on real fits, not on the identity.
 
 - [ ] **Step 5: Commit**
 
@@ -5810,7 +5826,12 @@ def test_a_large_hue_rotation_is_only_partly_recovered():
     before = oklab_to_lch(srgb_to_oklab(held))[:, 2]
     after = oklab_to_lch(srgb_to_oklab(result.lut.apply_numpy(held)))[:, 2]
     achieved = np.degrees(np.angle(np.exp(1j * (after - before)))).mean()
-    assert abs(achieved) < 60.0, "a 90 degree rotation must not be fully learned"
+    # Measured: about +5 degrees out of the 90 requested, stable across seeds.
+    # A third of the request is a generous ceiling that still fails loudly if
+    # reweighting ever stops damping large rotations.
+    assert abs(achieved) < 30.0, (
+        f"a 90 degree rotation must be heavily damped, got {achieved:.1f} degrees"
+    )
 
 
 def test_strength_zero_gives_an_identity_lut():
@@ -6262,7 +6283,16 @@ if __name__ == "__main__":
 
 Run: `.venv/bin/pytest tests/test_fit.py -q` → all pass.
 
-`test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation` is the acceptance test for the whole method, and it now includes the hue rotation the spec claims. If the mean error lands between 0.03 and 0.05, first raise `iterations` to 50 in the test and see whether it converges before touching any lambda; record whatever you change in `docs/decisions.md`. Do not relax the bound past 0.04 without writing down why.
+`test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation` is the acceptance test for the whole method, and it includes the hue rotation the spec claims.
+
+The controller ran both hue tests against a scratch implementation of this exact algorithm before writing them, so the expected values are measured rather than guessed:
+
+| Test | Measured (seeds 0, 1, 2) | Bound |
+|---|---|---|
+| 10 degree recovery | mean dE 0.0253, 0.0246, 0.0249 | < 0.03 |
+| 90 degree damping | +5.2, +4.1, +4.8 degrees achieved | < 30 |
+
+The 0.025 floor is systematic, not noise: it barely moves between 30 and 50 transport iterations, and comes from LUT smoothing plus gamut clipping. So if you see roughly 0.025, the test is behaving. If it exceeds 0.03, something is genuinely wrong with the transport or the fit; do not raise the bound. Investigate, and record whatever you find in `docs/decisions.md`.
 
 - [ ] **Step 5: Document and commit**
 
