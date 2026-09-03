@@ -65,9 +65,10 @@ code. The Pi applies exactly the normalisation the trainer fitted against.
 
 ```
 kodachrome-film/
-  pyproject.toml            # base: numpy, opencv-python-headless, Pillow
+  pyproject.toml            # base: numpy, Pillow (OpenCV comes from apt on the Pi,
+                            #   see 7.4; from the [dev] extra on the Mac)
                             # extras: [train] scipy, requests, tqdm
-                            #         [dev] pytest, ruff
+                            #         [dev] opencv-python, pytest, ruff
   README.md                 # setup (Mac, Pi), usage, how it works, numbers
   docs/
     decisions.md            # dated log of non-obvious choices
@@ -152,11 +153,13 @@ Algorithm, in linear light:
 4. Multiply, clip to `[0, 1]`, convert back to sRGB.
 
 Because every step is a per-channel scalar gain in linear light, the whole
-map is three monotone 1D functions. `compute_gains` returns the three
-combined gains; `gains_to_luts` bakes them into a `(3, 256)` `uint8` table;
-`normalize_u8` applies them with `cv2.LUT` in milliseconds. `normalize_float`
-is the reference path used by the trainer. A test requires the two paths to
-agree within 1/255.
+map is three monotone 1D functions. `compute_gains` returns
+`Gains(wb: np.ndarray(3,), exposure: float)` with a `combined` property
+(`wb * exposure`) so the capture log can record both parts; `gains_to_luts`
+bakes the combined gains into a `(3, 256)` `uint8` table; `normalize_u8`
+applies them with `cv2.LUT` in milliseconds. `normalize_float` is the
+reference path used by the trainer. A test requires the two paths to agree
+within 1/255.
 
 ### 5.3 `lut.py`
 
@@ -264,9 +267,15 @@ scenes (indoor, outdoor, sky, foliage, skin, neutral walls), mixed lighting.
 
 If no camera shots exist yet, any folder of digital photos is accepted. The
 trainer then writes `"proxy_source": true` into `params.json` and warns that
-the LUT is fitted to that camera's rendering, not the U20CAM's. The default
-artifact committed to the repo is produced this way from public-domain modern
-photos, and the README says so.
+the LUT is fitted to that camera's rendering, not the U20CAM's.
+
+The default artifact committed to the repo is produced this way. Its proxy
+corpus must meet fixed criteria: public domain or CC0, shot on modern digital
+cameras, varied everyday subjects (people, interiors, streets, sky, foliage),
+at least 60 images, fetched by a reproducible script. The exact Commons
+category is chosen during implementation and recorded in
+`docs/decisions.md`, the fetch manifest and `params.json`. The README says
+the default is a proxy and tells users to retrain with their own shots.
 
 ### 6.3 `dataset.py`
 
@@ -413,6 +422,17 @@ Processes every `*.jpg`/`*.jpeg`/`*.png` in `IN_DIR` through the same
 `Pipeline`, writes `<stem>_kodachrome.jpg` to `OUT_DIR`, prints a summary.
 Used to regrade old originals after retraining and to test on the Mac.
 
+### 7.4 Dependencies on the Pi
+
+OpenCV is not a pip dependency of the package. On Raspberry Pi OS the apt
+package `python3-opencv` (built with GTK, so `cv2.imshow` works) is used
+through a venv created with `--system-site-packages`, alongside apt's
+`python3-numpy` and `python3-pil`. Pip's `opencv-python-headless` wheel has
+no window support and would silently disable the preview; the README
+explains this. On the Mac the `[dev]` extra installs `opencv-python`. If
+`cv2.imshow` raises because the build lacks GUI support, the app falls back
+to headless mode with a notice.
+
 ## 8. Error handling
 
 | Situation | Behaviour |
@@ -427,7 +447,8 @@ Used to regrade old originals after retraining and to test on the Mac.
 | Fetch: fewer than 200 files | Exit 1, do not proceed |
 | Train: fewer than 30 source or 200 target images | Warn, continue |
 | Train: source and target folders identical | Exit 1 |
-| Preview requested but no display | Fall back to headless with a notice |
+| Preview requested but no display, or OpenCV built without GUI | Fall back to headless with a notice |
+| Headless and stdin is not a TTY | Exit 2: keys cannot be read; suggest `kodachrome-process` or a terminal |
 
 ## 9. Testing
 
@@ -443,11 +464,14 @@ All tests run on the Mac with no hardware, via `pytest`.
   images; flat ordering (red fastest) pinned by a hand-built 2x2x2 case.
 - `test_grain.py`: mean luminance preserved within 0.5/255; no chroma bias;
   reproducible with a seeded generator; `enabled=False` is identity.
-- `test_fit.py`: source is a random colour cloud; target is the same cloud
-  through a known tone curve plus a 10 degree hue rotation. The fitted LUT
-  (size 17, fewer iterations) reproduces the transform within a mean
-  delta-E of 0.02 on held-out samples. Also: hue reweighting makes the
-  target hue histogram match the source's.
+- `test_fit.py`: source is a random colour cloud with roughly uniform hue
+  (so hue reweighting is close to a no-op and does not fight the known
+  transform); target is the same cloud through a known tone curve plus a
+  10 degree hue rotation. The fitted LUT (size 17, fewer iterations)
+  reproduces the transform within a mean Oklab delta-E of 0.02 on held-out
+  samples. Separately: given a source and target with different hue
+  histograms, reweighting makes the weighted target histogram match the
+  source's within 1% per bin.
 - `test_pipeline.py`: `Artifacts.load` on the committed files; `process`
   on a synthetic frame returns the right shape, dtype and info keys;
   `params.json` schema validation errors are clear.
