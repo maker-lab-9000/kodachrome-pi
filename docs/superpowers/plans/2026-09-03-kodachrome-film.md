@@ -2898,11 +2898,30 @@ def test_log_line_carries_full_provenance(tmp_path, pipeline):
 
 
 def test_recorded_seed_reproduces_the_graded_file(tmp_path, pipeline):
-    result = _session(tmp_path, pipeline).capture()
+    """The seed is the only randomness, so it must pin the grade exactly.
+
+    Two claims, checked separately, because conflating them hides which one
+    broke. In memory the reproduction is bit-exact. Through the saved files
+    it cannot be: both are quality-95 JPEGs, and grain is precisely the
+    high-frequency content JPEG discards, so the bounds below are what the
+    format allows (measured: mean 1.1, 99th percentile 4, worst pixel 8-12).
+    """
+    session = _session(tmp_path, pipeline)
+    result = session.capture()
+    seed = result.record["grain_seed"]
+    assert isinstance(seed, int)
+
+    frame = session.camera.read().rgb  # FakeCamera repeats the same frame
+    first, _ = pipeline.process(frame, rng=np.random.default_rng(seed))
+    second, _ = pipeline.process(frame, rng=np.random.default_rng(seed))
+    assert np.array_equal(first, second), "the same seed must give the same pixels"
+
     original = np.asarray(Image.open(result.original).convert("RGB"))
     saved = np.asarray(Image.open(result.kodachrome).convert("RGB"))
-    again, _ = pipeline.process(original, rng=np.random.default_rng(result.record["grain_seed"]))
-    assert np.abs(again.astype(int) - saved.astype(int)).max() <= 2
+    again, _ = pipeline.process(original, rng=np.random.default_rng(seed))
+    diff = np.abs(again.astype(int) - saved.astype(int))
+    assert diff.mean() < 3.0
+    assert np.percentile(diff, 99) <= 10
 
 
 def test_same_second_captures_do_not_collide(tmp_path, pipeline):
@@ -3295,6 +3314,8 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/pytest tests/test_app.py -q` → all pass.
+
+Note on `test_recorded_seed_reproduces_the_graded_file`: the through-JPEG bounds are measured, not guessed (mean 1.08 to 1.09 and 99th percentile 4.0 across eight seeds, worst single pixel 8 to 12). If the mean exceeds 3, something is genuinely wrong with the seed handling; do not raise the bound. The in-memory assertion above it must be exact — if that one fails, grain is drawing from somewhere other than the passed generator.
 
 - [ ] **Step 5: Try it by hand**
 
