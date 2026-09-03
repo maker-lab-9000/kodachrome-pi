@@ -13,5 +13,8 @@ dist/
 data/
 artifacts/report/
 
+# Agent scratch space (plans' ledgers, briefs, review packages)
+.superpowers/
+
 # OS
 .DS_Store
