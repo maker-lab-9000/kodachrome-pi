@@ -16,6 +16,11 @@ Status: under construction. See `docs/superpowers/specs/` for the design and
 .venv/bin/pytest -q
 ```
 
+OpenCV is not a base dependency: on the Pi it comes from apt, everywhere else
+from an extra. `pip install -e ".[train,dev]"` includes it. Installing the
+bare package and then importing a module that needs OpenCV raises an error
+naming both remedies.
+
 ## Pi setup
 
 Written in a later step.

@@ -14,8 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["scipy>=1.12", "requests>=2.31", "tqdm>=4.66"]
-dev = ["opencv-python>=4.8", "pytest>=7.4", "ruff>=0.4"]
+opencv = ["opencv-python>=4.8"]
+train = ["scipy>=1.12", "requests>=2.31", "tqdm>=4.66", "opencv-python>=4.8"]
+dev = ["opencv-python>=4.8", "pytest>=7.4", "ruff>=0.4", "build>=1.0"]
 
 [project.scripts]
 kodachrome-fetch = "kodachrome.train.fetch:main"
@@ -25,6 +26,9 @@ kodachrome-process = "kodachrome.capture.batch:main"
 
 [tool.setuptools.packages.find]
 include = ["kodachrome*"]
+
+[tool.setuptools.package-data]
+kodachrome = ["data/*.cube", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
