@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "lut_file": "kodachrome.cube",
+  "lut_sha1": "b07caa863bfda7585d2a61e81cdb60e293677181",
+  "normalize": {
+    "white_balance": true,
+    "wb_gain_min": 0.6,
+    "wb_gain_max": 1.6,
+    "exposure_target_median": 0.18,
+    "exposure_gain_min": 0.5,
+    "exposure_gain_max": 3.0,
+    "stats_lum_min": 0.02,
+    "stats_lum_max": 0.9
+  },
+  "grain": {
+    "strength": 0.025,
+    "blur_sigma": 0.7,
+    "enabled": true
+  },
+  "training": {
+    "note": "identity placeholder; replaced by Task 21",
+    "proxy_source": true
+  }
+}

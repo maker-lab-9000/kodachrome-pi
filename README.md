@@ -25,6 +25,19 @@ naming both remedies.
 
 Written in a later step.
 
+## How it works
+
+The look ships inside the package at `kodachrome/data/`, so every command
+works from any directory and a built wheel carries it. `--artifacts DIR`
+points at a directory instead, which is how you use a LUT you trained
+yourself. `params.json` records the normalisation, the grain settings, the
+LUT's SHA-1 and full training provenance; a LUT whose hash disagrees with
+its `params.json` is refused rather than silently graded with the wrong
+parameters.
+
+Until training has run, the bundled LUT is an identity placeholder and its
+`training.note` says so.
+
 ## Commands
 
 | Command | Where | What |

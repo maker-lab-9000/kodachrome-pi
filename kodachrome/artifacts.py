@@ -1,0 +1,177 @@
+"""Loading, validating and publishing the trained artifact.
+
+An artifact is a `.cube` LUT plus `params.json` holding the normalisation the
+LUT was fitted against, the grain settings, and training provenance. Three
+concerns live here.
+
+**Where the default comes from.** The shipped look is package data at
+``kodachrome/data/``, found with ``importlib.resources``. That makes every
+command work from any working directory and puts the look inside a built
+wheel. ``--artifacts DIR`` overrides it with a directory on disk.
+
+**Validating rather than trusting.** The JSON root must be an object with a
+known version; each section must be an object; the LUT file must exist,
+parse, and hash to the ``lut_sha1`` recorded beside it. That last check is
+what makes a mixed artifact impossible to load: if a training run wrote a
+new LUT and then failed before rewriting ``params.json``, the hashes
+disagree and loading fails loudly instead of grading with mismatched
+parameters.
+
+**Publishing atomically.** The trainer writes everything into a staging
+directory, this module loads and validates that directory, and only then is
+it moved into place with ``os.replace`` on the directory. A capture process
+reading concurrently sees either the whole old artifact or the whole new
+one.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass
+from importlib import resources
+from pathlib import Path
+
+from .grain import GrainParams
+from .lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
+from .normalize import NormalizeParams
+
+PARAMS_VERSION = 2
+DEFAULT_LUT_FILE = "kodachrome.cube"
+
+
+class ArtifactsError(Exception):
+    """Artifact directory missing, incomplete or invalid."""
+
+
+def _require_object(value: object, name: str, path: Path) -> dict:
+    if not isinstance(value, dict):
+        raise ArtifactsError(f"{path}: '{name}' must be a JSON object, got {type(value).__name__}")
+    return value
+
+
+@dataclass
+class Artifacts:
+    lut: LUT3D
+    normalize: NormalizeParams
+    grain: GrainParams
+    training: dict
+    path: Path
+    lut_sha1: str
+
+    @classmethod
+    def load(cls, dir_path: str | Path) -> Artifacts:
+        path = Path(dir_path)
+        params_path = path / "params.json"
+        if not params_path.is_file():
+            raise ArtifactsError(
+                f"{params_path} not found. Run kodachrome-train, pass --artifacts DIR, "
+                "or reinstall the package to restore the bundled default."
+            )
+        try:
+            raw = json.loads(params_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ArtifactsError(f"{params_path} is not valid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ArtifactsError(f"{params_path}: top level must be a JSON object")
+
+        version = raw.get("version")
+        if not isinstance(version, int) or version > PARAMS_VERSION:
+            raise ArtifactsError(
+                f"{params_path}: unsupported params version {version!r} "
+                f"(this build reads up to {PARAMS_VERSION})"
+            )
+
+        try:
+            normalize = NormalizeParams.from_dict(
+                _require_object(raw.get("normalize", {}), "normalize", params_path)
+            )
+            grain = GrainParams.from_dict(
+                _require_object(raw.get("grain", {}), "grain", params_path)
+            )
+        except ValueError as exc:
+            raise ArtifactsError(f"{params_path}: {exc}") from exc
+
+        lut_path = path / raw.get("lut_file", DEFAULT_LUT_FILE)
+        if not lut_path.is_file():
+            raise ArtifactsError(f"LUT file {lut_path} not found (named in {params_path})")
+        try:
+            lut = read_cube(lut_path)
+        except CubeError as exc:
+            raise ArtifactsError(str(exc)) from exc
+
+        actual = sha1_hex(lut)
+        recorded = raw.get("lut_sha1")
+        if recorded is not None and recorded != actual:
+            raise ArtifactsError(
+                f"{path}: lut_sha1 in params.json ({recorded}) does not match {lut_path.name} "
+                f"({actual}). The artifact is mixed; re-run training or restore it."
+            )
+
+        return cls(
+            lut=lut,
+            normalize=normalize,
+            grain=grain,
+            training=_require_object(raw.get("training", {}), "training", params_path),
+            path=path,
+            lut_sha1=actual,
+        )
+
+    @classmethod
+    def default(cls) -> Artifacts:
+        """The artifact shipped inside the package."""
+        with resources.as_file(resources.files("kodachrome.data")) as data_dir:
+            return cls.load(data_dir)
+
+    @classmethod
+    def resolve(cls, dir_path: str | Path | None) -> Artifacts:
+        return cls.load(dir_path) if dir_path is not None else cls.default()
+
+
+def write_artifact(
+    dir_path: str | Path,
+    lut: LUT3D,
+    normalize: NormalizeParams,
+    grain: GrainParams,
+    training: dict | None = None,
+    lut_file: str = DEFAULT_LUT_FILE,
+) -> Path:
+    """Write a complete artifact into ``dir_path`` (creating it) and return the directory."""
+    path = Path(dir_path)
+    path.mkdir(parents=True, exist_ok=True)
+    write_cube(lut, path / lut_file, title="kodachrome")
+    payload = {
+        "version": PARAMS_VERSION,
+        "lut_file": lut_file,
+        "lut_sha1": sha1_hex(lut),
+        "normalize": normalize.to_dict(),
+        "grain": grain.to_dict(),
+        "training": training or {},
+    }
+    (path / "params.json").write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
+def publish(staging_dir: str | Path, dest_dir: str | Path) -> Path:
+    """Validate ``staging_dir`` then replace ``dest_dir`` with it, atomically."""
+    staging = Path(staging_dir)
+    dest = Path(dest_dir)
+    Artifacts.load(staging)  # raises ArtifactsError before anything is moved
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if dest.exists():
+        backup = Path(tempfile.mkdtemp(prefix=f".{dest.name}.old.", dir=dest.parent))
+        os.rmdir(backup)
+        os.replace(dest, backup)
+    try:
+        os.replace(staging, dest)
+    except OSError:
+        if backup is not None:
+            os.replace(backup, dest)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+    return dest
