@@ -1114,6 +1114,7 @@ Implements spec 5.5. Fixes F-10.
 
 **Files:**
 - Create: `kodachrome/imageio.py`, `tests/test_imageio.py`
+- Modify: `tests/conftest.py` (add the `wide_gamut_icc` fixture from Step 0)
 
 **Interfaces:**
 - Produces:
@@ -1123,6 +1124,117 @@ Implements spec 5.5. Fixes F-10.
   - `save_jpeg(rgb_u8, path, quality=95, embed_srgb=True) -> Path`
   - `list_images(dir_path) -> list[Path]`
   - `srgb_profile() -> PIL.ImageCms.ImageCmsProfile` (cached)
+
+- [ ] **Step 0: Add the wide-gamut ICC fixture to `tests/conftest.py`**
+
+The ICC test needs an image tagged with a profile that is genuinely not sRGB.
+`ImageCms.createProfile` only makes sRGB, LAB and XYZ profiles, and a LAB or
+XYZ profile embedded in an RGB JPEG is invalid — littlecms rejects it with
+`PyCMSError: cannot build transform` (verified). Real Adobe RGB profiles exist
+on macOS but not on Raspberry Pi OS or in CI, so depending on one would make
+the test skip exactly where colour correctness matters most.
+
+So the fixture builds a minimal, valid ICC v2 matrix-shaper profile in memory
+with Adobe RGB (1998) primaries. It is verified: it converts (200, 60, 60) to
+(231, 57, 56) in sRGB, byte-identical to what the real Adobe RGB (1998)
+profile produces.
+
+Append to `tests/conftest.py`:
+
+```python
+import struct
+
+import pytest
+
+
+def _s15f16(x: float) -> int:
+    """ICC s15Fixed16Number."""
+    return int(round(x * 65536.0))
+
+
+def _xyz_tag(x: float, y: float, z: float) -> bytes:
+    return b"XYZ " + b"\0" * 4 + struct.pack(">3i", _s15f16(x), _s15f16(y), _s15f16(z))
+
+
+def _curv_tag(gamma: float) -> bytes:
+    """A one-entry curve tag, which ICC reads as a plain gamma value."""
+    return b"curv" + b"\0" * 4 + struct.pack(">I", 1) + struct.pack(">H", int(round(gamma * 256)))
+
+
+def _desc_tag(text: str) -> bytes:
+    body = text.encode("ascii") + b"\0"
+    return b"desc" + b"\0" * 4 + struct.pack(">I", len(body)) + body + b"\0" * 88
+
+
+def build_rgb_icc_profile(description: str, gamma: float, primaries) -> bytes:
+    """A minimal valid ICC v2 RGB matrix-shaper profile, built in memory.
+
+    Enough for littlecms to construct a transform: white point, three
+    colourant XYZ tags, three tone curves, a description and a copyright.
+    """
+    tags = {
+        b"desc": _desc_tag(description),
+        b"wtpt": _xyz_tag(0.9642, 1.0, 0.8249),  # D50, which ICC requires
+        b"rXYZ": _xyz_tag(*primaries[0]),
+        b"gXYZ": _xyz_tag(*primaries[1]),
+        b"bXYZ": _xyz_tag(*primaries[2]),
+        b"rTRC": _curv_tag(gamma),
+        b"gTRC": _curv_tag(gamma),
+        b"bTRC": _curv_tag(gamma),
+        b"cprt": _desc_tag("public domain"),
+    }
+    offset = 128 + 4 + len(tags) * 12
+    table, data = b"", b""
+    for sig, payload in tags.items():
+        padding = (-len(payload)) % 4
+        table += sig + struct.pack(">II", offset, len(payload))
+        data += payload + b"\0" * padding
+        offset += len(payload) + padding
+    body = struct.pack(">I", len(tags)) + table + data
+
+    header = bytearray(128)
+    struct.pack_into(">I", header, 0, 128 + len(body))  # total size
+    header[4:8] = b"none"                                # preferred CMM
+    header[8:12] = struct.pack(">I", 0x02100000)         # version 2.1
+    header[12:16] = b"mntr"                              # display device class
+    header[16:20] = b"RGB "                              # data colour space
+    header[20:24] = b"XYZ "                              # profile connection space
+    struct.pack_into(">6H", header, 24, 2026, 9, 3, 0, 0, 0)
+    header[36:40] = b"acsp"                              # required signature
+    header[64:68] = struct.pack(">I", 0)                 # perceptual intent
+    header[68:80] = struct.pack(">3i", _s15f16(0.9642), _s15f16(1.0), _s15f16(0.8249))
+    return bytes(header) + body
+
+
+@pytest.fixture(scope="session")
+def wide_gamut_icc() -> bytes:
+    """Adobe RGB (1998) primaries adapted to D50, gamma 2.2."""
+    return build_rgb_icc_profile(
+        "Test Wide Gamut RGB",
+        2.2,
+        [
+            (0.6097, 0.3111, 0.0195),
+            (0.2053, 0.6257, 0.0609),
+            (0.1492, 0.0632, 0.7448),
+        ],
+    )
+```
+
+Sanity-check it before writing the module under test:
+
+```bash
+.venv/bin/python -c "
+import io
+from PIL import ImageCms
+import sys; sys.path.insert(0, 'tests')
+from conftest import build_rgb_icc_profile
+data = build_rgb_icc_profile('Test Wide Gamut RGB', 2.2,
+    [(0.6097,0.3111,0.0195),(0.2053,0.6257,0.0609),(0.1492,0.0632,0.7448)])
+p = ImageCms.ImageCmsProfile(io.BytesIO(data))
+print(len(data), 'bytes,', repr(ImageCms.getProfileDescription(p).strip()))
+"
+```
+Expected: `604 bytes, 'Test Wide Gamut RGB'`. If littlecms rejects the profile, stop and report BLOCKED rather than weakening the ICC test — the whole point is proving a non-sRGB profile changes the pixels.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1166,23 +1278,28 @@ def test_exif_orientation_is_applied(tmp_path):
     assert meta.oriented is True
 
 
-def test_icc_profile_is_converted_not_ignored(tmp_path):
+def test_icc_profile_is_converted_not_ignored(tmp_path, wide_gamut_icc):
+    """The same bytes under a wide-gamut profile must not decode to the same pixels."""
     pixels = np.full((8, 8, 3), (200, 60, 60), dtype=np.uint8)
     srgb_path = tmp_path / "srgb.jpg"
-    adobe_path = tmp_path / "adobe.jpg"
+    wide_path = tmp_path / "wide.jpg"
     Image.fromarray(pixels).save(
-        srgb_path, icc_profile=ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
+        srgb_path, quality=100, icc_profile=ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
     )
-    adobe = ImageCms.createProfile("sRGB")  # stand-in profile object
-    # Build a genuinely different profile: a wide-gamut synthetic one.
-    wide = ImageCms.createProfile("LAB")
-    Image.fromarray(pixels).save(adobe_path, icc_profile=ImageCms.ImageCmsProfile(wide).tobytes())
+    Image.fromarray(pixels).save(wide_path, quality=100, icc_profile=wide_gamut_icc)
 
     srgb_arr, srgb_meta = load_rgb(srgb_path)
-    wide_arr, wide_meta = load_rgb(adobe_path)
-    assert not np.array_equal(srgb_arr, wide_arr), "a non-sRGB profile must change the pixels"
+    wide_arr, wide_meta = load_rgb(wide_path)
+
     assert wide_meta.profile_error is None
-    assert adobe is not None  # keep the import meaningful
+    assert "Wide Gamut" in wide_meta.profile
+    assert not np.array_equal(srgb_arr, wide_arr), "a non-sRGB profile must change the pixels"
+    # Verified against the real Adobe RGB (1998) profile: (200, 60, 60) lands on
+    # (231, 57, 56) in sRGB. Allow a little slack for JPEG and littlecms rounding.
+    assert abs(int(wide_arr[0, 0, 0]) - 231) <= 3
+    assert abs(int(wide_arr[0, 0, 2]) - 56) <= 3
+    # An sRGB-tagged image must come back essentially unchanged.
+    assert np.abs(srgb_arr.astype(int) - pixels.astype(int)).max() <= 2
 
 
 def test_malformed_profile_falls_back_and_reports(tmp_path):
@@ -1304,8 +1421,10 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
             try:
                 src = ImageCms.ImageCmsProfile(io.BytesIO(raw_profile))
                 profile_name = _describe(src)
-                if im.mode not in ("RGB", "L"):
-                    im = im.convert("RGB")
+                # Do not convert the mode first: littlecms needs the image in the
+                # colour space the profile describes. Pre-converting a LAB or CMYK
+                # image to RGB makes the transform unbuildable, and the fallback
+                # below would then silently mislabel a perfectly good profile.
                 im = ImageCms.profileToProfile(
                     im, src, srgb_profile(), renderingIntent=0, outputMode="RGB"
                 )
