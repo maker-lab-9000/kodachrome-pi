@@ -2791,6 +2791,13 @@ from kodachrome.capture.camera import (
 )
 
 
+def _tagged_frame(index):
+    """A synthetic frame with a unique first pixel, so frames are distinguishable."""
+    frame = synthetic_frame(48, 64).copy()
+    frame[0, 0] = (index, index, index)
+    return frame
+
+
 def _jpeg_bytes(rgb):
     buf = io.BytesIO()
     Image.fromarray(rgb).save(buf, "JPEG", quality=95)
@@ -2884,6 +2891,8 @@ class FakeCapture:
         set_convert_fails=False,
         set_raises=False,
         mutate_then_raise=False,
+        raise_on_restore=False,
+        buffer_ndim=1,
         props=None,
     ):
         self.buffers = list(buffers or [])
@@ -2891,6 +2900,8 @@ class FakeCapture:
         self.set_convert_fails = set_convert_fails
         self.set_raises = set_raises
         self.mutate_then_raise = mutate_then_raise
+        self.raise_on_restore = raise_on_restore
+        self.buffer_ndim = buffer_ndim
         self.props = props or {
             cv2.CAP_PROP_FRAME_WIDTH: 1920,
             cv2.CAP_PROP_FRAME_HEIGHT: 1080,
@@ -2900,6 +2911,7 @@ class FakeCapture:
         self.convert_rgb = 1
         self.released = False
         self.requested = []
+        self.grabs = 0
 
     def isOpened(self):
         return True
@@ -2916,6 +2928,8 @@ class FakeCapture:
         """
         self.requested.append((prop, val))
         if prop == cv2.CAP_PROP_CONVERT_RGB:
+            if self.raise_on_restore and val == 1 and self.convert_rgb == 0:
+                raise cv2.error("driver refused to leave raw mode")
             if self.mutate_then_raise:
                 self.convert_rgb = val
                 raise cv2.error("device rejected the mode after applying it")
@@ -2933,10 +2947,21 @@ class FakeCapture:
         if self.convert_rgb == 0:
             if not self.buffers:
                 return False, None
-            return True, np.frombuffer(self.buffers.pop(0), np.uint8)
+            buf = np.frombuffer(self.buffers.pop(0), np.uint8)
+            return True, buf.reshape(1, -1) if self.buffer_ndim == 2 else buf
         return True, self.decoded
 
     def grab(self):
+        """Advance the queue without decoding, as a real grab does.
+
+        An unconditional ``True`` here would make ``_drain`` untestable: it
+        would consume nothing, so a drain that grabbed the wrong number of
+        frames — or was deleted outright — would still pass every test.
+        """
+        self.grabs += 1
+        if not self.buffers:
+            return False
+        self.buffers.pop(0)
         return True
 
     def release(self):
@@ -3026,6 +3051,44 @@ def test_negotiation_mismatch_warns_but_does_not_abort(fake_capture, capsys):
     assert cam.stream_info.width == 1280 and cam.stream_info.fps == 15.0
     assert cam.read().rgb.shape == (720, 1280, 3)
     assert cap is not None
+
+
+def test_read_returns_the_newest_frame_not_a_stale_queued_one(fake_capture):
+    """`_drain` must discard queued frames, or the preview lags behind reality."""
+    buffers = [_jpeg_bytes(_tagged_frame(i)) for i in range(6)]
+    cap = fake_capture(buffers=list(buffers))
+    cam = V4L2Camera(device=0, warmup_frames=0)
+
+    frame = cam.read()
+    assert cap.grabs == 4, "the drain loop should grab up to four queued frames"
+    assert frame.jpeg == buffers[5], "read returned a stale frame instead of the newest"
+
+
+def test_a_two_dimensional_raw_buffer_is_accepted(fake_capture):
+    """Real V4L2 backends can hand back a 2-D buffer; 1-D is not the only shape."""
+    data = _jpeg_bytes(synthetic_frame(48, 64))
+    cap = fake_capture(buffers=[data] * 4, buffer_ndim=2)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.stream_info.raw_mjpeg is True
+    assert cam.read().jpeg == data
+    assert cap is not None
+
+
+def test_a_raising_restore_during_fallback_does_not_kill_the_session(fake_capture):
+    """The fallback exists to keep the session alive; it must not end it."""
+    good = _jpeg_bytes(synthetic_frame(48, 64))
+    cap = fake_capture(
+        buffers=[good, good, good[:-2]],
+        decoded=np.zeros((48, 64, 3), np.uint8),
+        raise_on_restore=True,
+    )
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.read().source == "raw-mjpeg"
+
+    frame = cam.read()  # truncated buffer triggers the fallback, whose restore raises
+    assert frame.source == "decoded"
+    assert cam.stream_info.raw_mjpeg is False
+    assert cap.convert_rgb == 0, "the fake refused the restore, as the scenario intends"
 
 
 def test_read_raises_after_three_failed_attempts(fake_capture):
@@ -3352,12 +3415,23 @@ class V4L2Camera:
                 break
 
     def _fallback_to_decoded(self, reason: str) -> None:
+        """Degrade to decoded frames. Must not itself be able to end the session.
+
+        The restore is guarded for the same reason ``_enable_raw_mode``'s is: a
+        driver that raises here would propagate the error out of ``read`` and
+        kill the capture session, which is precisely what this fallback exists
+        to prevent. Verified by simulation before the guard was added — a
+        ``cv2.error`` from this line escaped ``read`` uncaught.
+        """
         if not self._warned_fallback:
             print(f"warning: {reason}; falling back to decoded frames (_ungraded.jpg)")
             self._warned_fallback = True
         self._raw = False
         self.stream_info.raw_mjpeg = False
-        self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        try:
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        except cv2.error:
+            pass
 
     def read(self) -> Frame:
         for _ in range(3):
@@ -3442,6 +3516,13 @@ from kodachrome.grain import GrainParams
 from kodachrome.lut import LUT3D
 from kodachrome.normalize import NormalizeParams
 from kodachrome.pipeline import Pipeline
+
+
+def _tagged_frame(index):
+    """A synthetic frame with a unique first pixel, so frames are distinguishable."""
+    frame = synthetic_frame(48, 64).copy()
+    frame[0, 0] = (index, index, index)
+    return frame
 
 
 def _jpeg_bytes(rgb):
