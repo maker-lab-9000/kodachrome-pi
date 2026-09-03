@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -132,7 +133,9 @@ def test_a_missing_lut_sha1_is_refused(tmp_path):
     params.write_text(json.dumps(data))
     write_cube(LUT3D(np.clip(LUT3D.identity(9).table**1.7, 0, 1)), tmp_path / "kodachrome.cube")
 
-    with pytest.raises(ArtifactsError, match="lut_sha1"):
+    # Same hazard as above: this test's name contains "lut_sha1", so it appears
+    # in tmp_path. Match the sentence, not the token.
+    with pytest.raises(ArtifactsError, match=re.escape("'lut_sha1' is required")):
         Artifacts.load(tmp_path)
 
 
@@ -153,7 +156,10 @@ def test_a_malformed_training_section_is_named(tmp_path):
     (tmp_path / "params.json").write_text(
         json.dumps({"version": 2, "training": "not-an-object"})
     )
-    with pytest.raises(ArtifactsError, match="training"):
+    # Match the reason, not the word. `tmp_path` is named after the test
+    # function, so a bare match="training" also matches the directory in a
+    # "LUT file not found" message and passes for the wrong reason.
+    with pytest.raises(ArtifactsError, match=re.escape("'training' must be a JSON object")):
         Artifacts.load(tmp_path)
 
 
