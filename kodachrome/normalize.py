@@ -21,6 +21,16 @@ Kodachrome scans are normalised with ``white_balance=False``: the film's
 daylight balance and warm cast are part of the look being learned. Only the
 per-slide exposure lottery is removed.
 
+Idempotence, approximately
+--------------------------
+Normalising an already-normalised image is close to, but not exactly, a
+no-op. The statistics mask is recomputed on the transformed pixels, so the
+second pass averages a slightly different subset and applies a small
+correction. Repeated passes converge rather than drift. Nothing here
+normalises twice, so this is documented rather than engineered away:
+iterating to a fixed point would cost time on every frame to remove an
+error of about two 8-bit levels that no caller ever sees.
+
 Reporting clamps
 ----------------
 Both gains are clamped to sane ranges so a night shot is not amplified into
