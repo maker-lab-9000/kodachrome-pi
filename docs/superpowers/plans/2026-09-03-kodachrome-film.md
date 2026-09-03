@@ -99,6 +99,39 @@ def test_missing_cv2_names_both_remedies(monkeypatch):
     message = str(exc.value)
     assert "python3-opencv" in message      # the Pi remedy
     assert "[opencv]" in message            # the pip remedy
+
+
+def _patch_cv2_import(monkeypatch, error):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "cv2":
+            raise error
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_a_broken_native_install_is_not_reported_as_missing(monkeypatch):
+    """cv2 present but unable to load libGL must not advise reinstalling cv2."""
+    _patch_cv2_import(
+        monkeypatch, ImportError("libGL.so.1: cannot open shared object file")
+    )
+    with pytest.raises(ImportError) as exc:
+        require_cv2()
+    message = str(exc.value)
+    assert "libGL.so.1" in message
+    assert "failed to import" in message
+    assert "libgl1" in message
+    assert "is required but not installed" not in message
+
+
+def test_a_missing_dependency_of_cv2_is_not_reported_as_missing_cv2(monkeypatch):
+    """ModuleNotFoundError naming something else is an installation problem."""
+    _patch_cv2_import(monkeypatch, ModuleNotFoundError("No module named 'numpy'", name="numpy"))
+    with pytest.raises(ImportError) as exc:
+        require_cv2()
+    assert "failed to import" in str(exc.value)
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -125,7 +158,7 @@ from __future__ import annotations
 
 from types import ModuleType
 
-_MESSAGE = (
+_MISSING = (
     "OpenCV (cv2) is required but not installed.\n"
     "  On Raspberry Pi OS:  sudo apt install python3-opencv\n"
     "                       (then create the venv with --system-site-packages)\n"
@@ -133,13 +166,35 @@ _MESSAGE = (
     "                       (already included by the [train] and [dev] extras)"
 )
 
+_BROKEN = (
+    "OpenCV (cv2) is installed but failed to import: {error}\n"
+    "This is an installation problem, not a missing package, so reinstalling\n"
+    "cv2 will probably not help. A missing system library is the usual cause;\n"
+    "on Raspberry Pi OS or another Debian, try:\n"
+    "  sudo apt install libgl1 libglib2.0-0\n"
+    "or switch to the apt build:  sudo apt install python3-opencv"
+)
+
 
 def require_cv2() -> ModuleType:
-    """Import and return ``cv2``, or raise ``ImportError`` explaining both fixes."""
+    """Import and return ``cv2``, or raise ``ImportError`` naming the right fix.
+
+    The two failures need different advice and must not be conflated. A
+    genuinely absent package is fixed by installing one; a package that is
+    present but cannot load its native libraries (``libGL.so.1: cannot open
+    shared object file`` is the classic on a headless Debian, and the Pi is
+    a Debian) is not. Telling someone to install what they already have
+    sends them down the wrong path, so the message is chosen from the
+    exception rather than assumed.
+    """
     try:
         import cv2
-    except ImportError as exc:  # pragma: no cover - exercised via monkeypatch in tests
-        raise ImportError(_MESSAGE) from exc
+    except ModuleNotFoundError as exc:
+        if exc.name != "cv2":
+            raise ImportError(_BROKEN.format(error=exc)) from exc
+        raise ImportError(_MISSING) from exc
+    except ImportError as exc:
+        raise ImportError(_BROKEN.format(error=exc)) from exc
     return cv2
 ```
 
@@ -479,7 +534,11 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
         means = np.maximum(sel.mean(axis=0), _EPS)
         raw = float(means @ LUMA_709) / means
         wb = np.clip(raw, params.wb_gain_min, params.wb_gain_max).astype(np.float32)
-        wb_clamped = bool(np.any(raw != wb))
+        # Compare against the bounds, not against the clipped array: `raw` and
+        # `wb` can differ by a float32 cast alone, which is not a clamp.
+        wb_clamped = bool(
+            np.any(raw < params.wb_gain_min) or np.any(raw > params.wb_gain_max)
+        )
     else:
         wb = np.ones(3, dtype=np.float32)
 
@@ -489,7 +548,10 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
     return Gains(
         wb=wb,
         exposure=exposure,
-        clamped={"wb": wb_clamped, "exposure": raw_exposure != exposure},
+        clamped={
+            "wb": wb_clamped,
+            "exposure": not params.exposure_gain_min <= raw_exposure <= params.exposure_gain_max,
+        },
     )
 
 
