@@ -45,17 +45,25 @@ def test_missing_params_is_clear(tmp_path):
 @pytest.mark.parametrize(
     "payload, message",
     [
-        ("{not json", "JSON"),
-        ('{"version": 99}', "version"),
-        ('{"lut_file": "k.cube"}', "version"),
-        ('[1, 2, 3]', "object"),
-        ('{"version": 2, "normalize": 5}', "normalize"),
-        ('{"version": 2, "grain": "x"}', "grain"),
+        ("{not json", "is not valid JSON"),
+        ('{"version": 99}', "unsupported params version"),
+        ('{"lut_file": "k.cube"}', "unsupported params version"),
+        ("[1, 2, 3]", "top level must be a JSON object"),
+        ('{"version": 2, "normalize": 5}', "'normalize' must be a JSON object"),
+        ('{"version": 2, "grain": "x"}', "'grain' must be a JSON object"),
     ],
 )
 def test_schema_rejections(tmp_path, payload, message):
+    """Match whole phrases, not tokens.
+
+    These assertions read `tmp_path`, whose name pytest derives from the test
+    id — which for a parametrised case embeds the expected token. Bare tokens
+    like "version" survive today only because pytest truncates the directory
+    name before reaching them; that is an implementation detail, not a
+    guarantee. Phrases do not depend on it.
+    """
     (tmp_path / "params.json").write_text(payload)
-    with pytest.raises(ArtifactsError, match=message):
+    with pytest.raises(ArtifactsError, match=re.escape(message)):
         Artifacts.load(tmp_path)
 
 
