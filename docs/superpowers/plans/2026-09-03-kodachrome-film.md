@@ -1370,12 +1370,44 @@ def test_malformed_profile_falls_back_and_reports(tmp_path):
     assert meta.profile_error
 
 
-def test_colour_manage_can_be_disabled(tmp_path):
-    path = tmp_path / "x.jpg"
-    Image.fromarray(np.full((8, 8, 3), 90, dtype=np.uint8)).save(path)
-    arr, meta = load_rgb(path, colour_manage=False)
-    assert arr.shape == (8, 8, 3)
-    assert "assumed" in meta.profile
+def test_colour_manage_can_be_disabled(tmp_path, wide_gamut_icc):
+    """The toggle must be provable, so the fixture needs a profile that would change pixels.
+
+    An image with no embedded profile passes this test whether or not the
+    toggle does anything, which is no test at all.
+    """
+    path = tmp_path / "wide.jpg"
+    pixels = np.full((8, 8, 3), (200, 60, 60), dtype=np.uint8)
+    Image.fromarray(pixels).save(path, quality=100, icc_profile=wide_gamut_icc)
+
+    managed, _ = load_rgb(path)
+    unmanaged, meta = load_rgb(path, colour_manage=False)
+
+    assert not np.array_equal(managed, unmanaged), "the toggle did not suppress conversion"
+    # Measured: managed (231, 57, 56); unmanaged stays at the stored values.
+    assert np.abs(unmanaged.astype(int) - pixels.astype(int)).max() <= 2
+    assert "assumed" in meta.profile and "off" in meta.profile
+
+
+def test_a_lab_source_is_converted_not_mislabelled(tmp_path):
+    """Regression test for a bug an earlier draft of this module contained.
+
+    Converting the image to RGB before ``profileToProfile`` makes a LAB or
+    CMYK transform unbuildable, so littlecms raises and the fallback brands a
+    perfectly valid profile "invalid" — silently skipping colour management
+    on exactly the archival scans that need it. This pins that it does not
+    happen.
+    """
+    lab_profile = ImageCms.createProfile("LAB")
+    lab = Image.new("LAB", (8, 8))
+    lab.putdata([(180, 160, 140)] * 64)
+    path = tmp_path / "lab.tif"
+    lab.save(path, icc_profile=ImageCms.ImageCmsProfile(lab_profile).tobytes())
+
+    arr, meta = load_rgb(path)
+    assert arr.shape == (8, 8, 3) and arr.dtype == np.uint8
+    assert meta.profile != "invalid", "a valid LAB profile was mislabelled"
+    assert meta.profile_error is None
 
 
 def test_load_converts_modes(tmp_path):
@@ -1477,6 +1509,11 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
         profile_error: str | None = None
 
         if raw_profile and colour_manage:
+            # Built outside the try on purpose: if the working-space profile
+            # itself cannot be created, that is an environment fault, not a bad
+            # source profile, and it should surface rather than be reported as
+            # "invalid" against the image.
+            destination = srgb_profile()
             try:
                 src = ImageCms.ImageCmsProfile(io.BytesIO(raw_profile))
                 profile_name = _describe(src)
@@ -1485,7 +1522,7 @@ def load_rgb(path: str | Path, *, colour_manage: bool = True) -> tuple[np.ndarra
                 # image to RGB makes the transform unbuildable, and the fallback
                 # below would then silently mislabel a perfectly good profile.
                 im = ImageCms.profileToProfile(
-                    im, src, srgb_profile(), renderingIntent=0, outputMode="RGB"
+                    im, src, destination, renderingIntent=0, outputMode="RGB"
                 )
             except Exception as exc:  # noqa: BLE001 - any malformed profile falls back to sRGB
                 profile_name = "invalid"
