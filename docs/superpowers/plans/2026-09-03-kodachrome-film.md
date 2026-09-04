@@ -7784,7 +7784,7 @@ Expected: `done: N files` with N around 900 to 1,000, plus a `rejected` list in 
 Public domain or CC0, modern digital cameras, varied everyday subjects, 60+ images. Probe candidates:
 
 ```bash
-for cat in "Category:Photographs by Lance Cheung" "Category:Photographs by Preston Keres" "Category:Photographs by the United States Department of Agriculture"; do
+for cat in "Category:Photographs by the U.S. Department of Agriculture" "Category:Photographs by Lance Cheung" "Category:Photographs by Preston Keres"; do
   .venv/bin/python - "$cat" <<'EOF'
 import sys, requests
 from kodachrome.train.fetch import API_URL, USER_AGENT
@@ -7797,6 +7797,8 @@ EOF
 done
 ```
 Take the first with 200 or more files. If none qualifies, search Commons for another US federal photographer category and probe it the same way. Record the choice and its count.
+
+Probed 2026-09-04: `Category:Photographs by the U.S. Department of Agriculture` has **4,092 files** and is the one to use. Note the abbreviated "U.S."; the spelled-out "United States" form does not exist. The other two candidates fail — "Lance Cheung" has 2 files and "Preston Keres" does not exist.
 
 - [ ] **Step 3: Fetch a seeded sample of the proxy corpus**
 
