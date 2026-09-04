@@ -6693,6 +6693,44 @@ def test_contact_sheet_shows_three_rows(tmp_path):
         assert im.height > 3 * 64  # three labelled rows stacked
 
 
+def test_a_corpus_with_no_held_out_split_is_labelled_honestly(tmp_path):
+    """A sheet captioned "held-out" while showing training images would lie.
+
+    Reachable with any corpus under five images at the default validation
+    fraction, which `--allow-small` explicitly supports.
+    """
+    paths = _images(tmp_path / "tiny", 3, 0)
+    empty_val = CorpusSplit(paths, [], _pool(0), _pool(1, 1), "abc")
+    metrics = {
+        "swd_before": 0.1, "swd_after": 0.05, "swd_identity": 0.1, "swd_seed_spread": 0.001,
+        "train_swd_before": 0.1, "train_swd_after": 0.04,
+        "transport_gamut_clip_deltaE": 0.001, "lut_fit_rms_deltaE": 0.01,
+        "grey_axis_monotone": True, "channel_monotone": True,
+        "neutral_axis_max_chroma": 0.004, "clipped_volume_fraction": 0.01,
+        "hue_bins": [],
+    }
+    out_dir = tmp_path / "report"
+    write_report(
+        out_dir, _darkening_lut(), metrics, check_gates(metrics),
+        empty_val, _split(tmp_path, "tgt", 5),
+        NormalizeParams(), NormalizeParams(white_balance=False),
+        SampleConfig(crop_frac=0.0, max_side=80),
+    )
+    summary = (out_dir / "summary.txt").read_text()
+    assert "WARNING" in summary
+    assert "trained on" in summary
+
+    # And the ordinary case must carry no such warning.
+    ordinary = tmp_path / "ordinary"
+    write_report(
+        ordinary, _darkening_lut(), metrics, check_gates(metrics),
+        _split(tmp_path, "src", 0), _split(tmp_path, "tgt2", 6),
+        NormalizeParams(), NormalizeParams(white_balance=False),
+        SampleConfig(crop_frac=0.0, max_side=80),
+    )
+    assert "WARNING" not in (ordinary / "summary.txt").read_text()
+
+
 def test_write_report_produces_every_artifact(tmp_path):
     metrics = {
         "swd_before": 0.1, "swd_after": 0.05, "swd_identity": 0.1, "swd_seed_spread": 0.001,
@@ -6795,7 +6833,15 @@ def render_contact_sheet(
     n: int = 8,
     thumb: int = 240,
     rng: np.random.Generator | None = None,
+    held_out: bool = True,
 ) -> Path:
+    """Draw the sheet, labelling honestly which images it actually used.
+
+    ``held_out=False`` means the caller had no validation split and is showing
+    training images. The labels say so in full, because a sheet captioned
+    "held-out" while showing images the fit was trained on is exactly the
+    flattering picture this artifact exists to avoid.
+    """
     rng = rng if rng is not None else np.random.default_rng(0)
 
     def pick(paths: Sequence[Path]) -> list[Path]:
@@ -6824,9 +6870,10 @@ def render_contact_sheet(
         _BG,
     )
     draw = ImageDraw.Draw(sheet)
+    origin = "Held-out" if held_out else "TRAINING (corpus too small to hold any back)"
     rows = [
-        ("Held-out source, normalised", normalised),
-        ("Held-out source, graded with the fitted LUT", graded),
+        (f"{origin} source, normalised", normalised),
+        (f"{origin} source, graded with the fitted LUT", graded),
         ("Real Kodachrome scans (exposure-normalised)", kodachrome),
     ]
     for r, (label, images) in enumerate(rows):
@@ -6935,6 +6982,7 @@ def write_report(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    held_out = bool(source_split.val_paths)
     render_contact_sheet(
         source_split.val_paths or source_split.train_paths,
         target_split.val_paths or target_split.train_paths,
@@ -6943,6 +6991,7 @@ def write_report(
         target_normalize,
         cfg,
         out_dir / "contact_sheet.png",
+        held_out=held_out,
     )
     render_ramps(lut, out_dir / "ramps.png")
     render_diagnostics(
@@ -6965,6 +7014,13 @@ def write_report(
         "",
         "Gates:",
     ]
+    if not held_out:
+        lines.insert(
+            2,
+            "WARNING: the source corpus was too small to hold any images back, so the "
+            "contact sheet shows images the fit was trained on and the numbers above "
+            "measure memorisation rather than generalisation.",
+        )
     for g in gates:
         lines.append(f"  [{'PASS' if g.passed else 'FAIL'}] {g.name}: {g.value} - {g.detail}")
     (out_dir / "summary.txt").write_text("\n".join(lines) + "\n")
