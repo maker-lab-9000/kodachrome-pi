@@ -70,7 +70,13 @@ class Evaluator:
         src_pool: PixelPool,
         tgt_pool: PixelPool,
         tgt_weights: np.ndarray | None = None,
-        n_proj: int = 64,
+        # 256, not 64: at 64 the seed spread of the distance itself was 0.0007
+        # on a 0.0136 baseline, noisier than the improvement it was judging.
+        # A 0.0024 +- 0.0003 improvement (five seeds) failed the noise gate at
+        # 64 projections and passes at 256. This is instrument precision; the
+        # gate's rule -- improvement must exceed three times the spread -- is
+        # unchanged and re-applied to every fit.
+        n_proj: int = 256,
         max_points: int = 100_000,
         seed: int = 0,
     ) -> Evaluator:

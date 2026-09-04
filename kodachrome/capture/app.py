@@ -153,7 +153,10 @@ def _announce(result: CaptureResult, out: Callable[[str], None]) -> None:
     note = f" (clamped: {', '.join(clamps)})" if clamps else ""
     out(
         f"Saved {result.kodachrome.name} + {result.original.name} in "
-        f"{r['shutter_to_saved_ms']:.0f} ms; wb={r['wb_gains']} exposure={r['exposure_gain']}{note}"
+        f"{r['shutter_to_saved_ms']:.0f} ms; wb={r['wb_gains']} "
+        + (f"levels gamma={r['levels']['gamma']} stretch={r['levels']['stretch']}"
+           if r.get("levels") else f"exposure={r['exposure_gain']}")
+        + note
     )
 
 

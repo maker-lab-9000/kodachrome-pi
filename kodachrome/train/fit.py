@@ -175,14 +175,18 @@ def train(
     proxy_source: bool = False,
     allow_small: bool = False,
     target_levels: bool = True,
+    source_levels: bool = True,
+    target_median: float | None = None,
     command: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict, list]:
     say = progress or (lambda _m: None)
     source_dir, target_dir, out_dir = Path(source_dir), Path(target_dir), Path(out_dir)
 
-    source_normalize = NormalizeParams()
-    target_normalize = NormalizeParams(white_balance=False, levels=target_levels)
+    source_normalize = NormalizeParams(levels=source_levels)
+    target_normalize = NormalizeParams(
+        white_balance=False, levels=target_levels, levels_target_median=target_median
+    )
     source = build_corpus(source_dir, source_normalize, sample_cfg, MIN_SOURCE_IMAGES,
                           "source", allow_small, say)
     target = build_corpus(target_dir, target_normalize, sample_cfg, MIN_TARGET_IMAGES,
@@ -303,8 +307,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-side", type=int, default=512)
     parser.add_argument("--pixels-per-image", type=int, default=3000)
     parser.add_argument("--max-pixels", type=int, default=400_000)
+    parser.add_argument("--no-source-levels", dest="source_levels", action="store_false",
+                        help="normalise camera frames with a gain instead of levels (A/B only)")
     parser.add_argument("--no-target-levels", dest="target_levels", action="store_false",
                         help="skip the black/white-point stretch on target scans (A/B only)")
+    parser.add_argument("--target-median", type=float, default=None,
+                        help="median the target scans are gamma-normalised to; default = the "
+                             "exposure target. Lower keeps the film's density")
     parser.add_argument("--proxy-source", action="store_true",
                         help="mark the source as stand-in photos, not U20CAM shots")
     parser.add_argument("--allow-small", action="store_true",
@@ -343,7 +352,8 @@ def main(argv: list[str] | None = None) -> int:
         metrics, gates = train(
             args.source, args.target, args.out, cfg, sample_cfg, grain,
             proxy_source=args.proxy_source, allow_small=args.allow_small,
-            target_levels=args.target_levels,
+            target_levels=args.target_levels, target_median=args.target_median,
+            source_levels=args.source_levels,
             command=" ".join(["kodachrome-train", *(argv or sys.argv[1:])]), progress=print,
         )
     except CorpusTooSmall as exc:

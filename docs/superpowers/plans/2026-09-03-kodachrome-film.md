@@ -8091,3 +8091,12 @@ identity). See `docs/decisions.md`.
    filenames carry the Commons page id; a guard refuses colliding names.
 10. Shipped default retrained on `Category:Photographs taken on Kodachrome
     film` at strength 1.4. See `docs/decisions.md` for the four-way comparison.
+11. Symmetric normalisation: `NormalizeParams(levels=True)` for the source
+    too, at training (`train(source_levels=True)`, `--no-source-levels`) and
+    at runtime via the artifact's recorded params. `normalize_u8` bakes WB,
+    stretch and gamma into the same three tables; agreement with the float
+    path is tested. `levels_target_median` lets the target median differ
+    from the exposure target (`--target-median`).
+12. `lutfit.enforce_grey_axis` (joint least squares over affected cells),
+    applied between two `enforce_monotone` passes in `fit_lut`.
+    `Evaluator.build` default `n_proj` 64 → 256. Shipped strength 1.0.

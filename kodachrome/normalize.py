@@ -10,16 +10,28 @@ applies the same maths through three 256-entry lookup tables
 
 Why three 1D tables suffice
 ---------------------------
-White balance is a per-channel gain in linear light and exposure is a scalar
-gain in linear light, so their composite sRGB-to-sRGB map is three
-independent monotone functions of one byte. ``cv2.LUT`` applies that in
-milliseconds on a Pi 400.
+White balance is a per-channel gain in linear light; exposure is either a
+scalar gain (``levels=False``) or a black/white-point stretch followed by a
+gamma (``levels=True``). Every one of those is a monotone function of one
+channel, so the composite sRGB-to-sRGB map is three independent monotone
+functions of one byte. ``cv2.LUT`` applies that in milliseconds on a Pi 400.
+
+Levels, and why both sides get it
+---------------------------------
+``levels=True`` puts the 0.5th percentile of luminance at black and the
+99.5th at white, then a gamma puts the median on the exposure target
+without moving either end. It was added for scanned targets, which are
+flat. Giving it to targets only was a mistake found on the first outdoor
+captures: the target's white was pinned at 1.0 while the source's sat at
+gain x white, so the target pool was 0.03-0.045 L lighter from the first
+quartile up and the LUT learned to lift shadows, which read as haze. Both
+sides are now normalised the same way; the runtime bakes it into the same
+three tables.
 
 Targets versus sources
 ----------------------
 Kodachrome scans are normalised with ``white_balance=False``: the film's
-daylight balance and warm cast are part of the look being learned. Only the
-per-slide exposure lottery is removed.
+daylight balance and warm cast are part of the look being learned.
 
 Idempotence, approximately
 --------------------------
@@ -71,29 +83,31 @@ class NormalizeParams:
     exposure_gain_max: float = 3.0
     stats_lum_min: float = 0.02
     stats_lum_max: float = 0.90
-    # Levels: a training-side normaliser for scanned targets. Archival scans
-    # are deliberately flat -- across 150 LoC Kodachromes the white point sat
-    # at a median 0.72 linear luminance -- and learning from them unstretched
-    # taught the LUT to push white to 0.85. Levels puts p0.5 at black and
-    # p99.5 at white, then a gamma puts the median on the exposure target
-    # without moving either end (a gain would drag the white point again).
-    # Never used on the capture path; ``normalize_u8`` refuses it.
+    # Levels: black/white-point stretch plus a gamma to the median. Added for
+    # scanned targets -- across 150 LoC Kodachromes the white point sat at a
+    # median 0.72 linear luminance, and learning from them unstretched taught
+    # the LUT to push white to 0.85 -- and then applied to sources as well,
+    # because pinning only the target's white taught the LUT to lift shadows.
+    # See the module docstring. Off by default; the trainer turns it on for
+    # both corpora and records it in the artifact, which is what the Pi reads.
     levels: bool = False
     levels_low_pct: float = 0.5
     levels_high_pct: float = 99.5
     levels_max_stretch: float = 4.0
     levels_gamma_min: float = 0.5
     levels_gamma_max: float = 2.0
+    # Where the levels gamma puts the median. None means the exposure target,
+    # i.e. the same median as the source -- which assumes a well-exposed slide
+    # has the same median as a well-exposed digital frame. It does not: slides
+    # are exposed for highlights and are dense, and gamma-lifting them to the
+    # camera's median taught the LUT to lift shadows, which read as haze on
+    # outdoor shots. Set lower to keep the film's density in what is learned.
+    levels_target_median: float | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):
-            if f.name not in ("white_balance", "levels"):
+            if f.name not in ("white_balance", "levels") and getattr(self, f.name) is not None:
                 _check_finite(f.name, getattr(self, f.name))
-        if self.levels and self.white_balance:
-            raise ValueError(
-                "levels normalisation does not combine with white_balance; targets keep "
-                "their cast (see docs/decisions.md), so pass white_balance=False"
-            )
         if not 0.0 <= self.levels_low_pct < self.levels_high_pct <= 100.0:
             raise ValueError(
                 f"levels_low_pct ({self.levels_low_pct}) must be below "
@@ -102,6 +116,10 @@ class NormalizeParams:
         if self.levels_max_stretch < 1.0:
             raise ValueError(
                 f"levels_max_stretch must be at least 1, got {self.levels_max_stretch}"
+            )
+        if self.levels_target_median is not None and not 0.0 < self.levels_target_median < 1.0:
+            raise ValueError(
+                f"levels_target_median must be in (0, 1), got {self.levels_target_median}"
             )
         if not 0.0 < self.levels_gamma_min < self.levels_gamma_max:
             raise ValueError(
@@ -148,7 +166,8 @@ class Gains:
     exposure: float
     clamped: dict = field(default_factory=lambda: {"wb": False, "exposure": False})
     # Set only by the levels path: the black/white points found, the stretch
-    # and gamma applied. ``exposure`` stays 1.0 there, because no gain was.
+    # and gamma applied (after white balance). ``exposure`` stays 1.0 there,
+    # because no scalar gain was applied.
     levels: dict | None = None
 
     @property
@@ -186,99 +205,93 @@ def _require_float_image(rgb: np.ndarray, caller: str) -> np.ndarray:
     return rgb
 
 
+def _grey_world(sel_lin: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, bool]:
+    means = np.maximum(sel_lin.mean(axis=0), _EPS)
+    raw = float(means @ LUMA_709) / means
+    wb = np.clip(raw, params.wb_gain_min, params.wb_gain_max).astype(np.float32)
+    # Compare against the bounds, not against the clipped array: `raw` and
+    # `wb` can differ by a float32 cast alone, which is not a clamp.
+    clamped = bool(np.any(raw < params.wb_gain_min) or np.any(raw > params.wb_gain_max))
+    return wb, clamped
+
+
+def _stats_mask(lum: np.ndarray, params: NormalizeParams) -> np.ndarray:
+    mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
+    return mask if mask.mean() >= 0.01 else np.ones_like(mask)
+
+
 def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
-    """Grey-world white balance and median-to-target exposure from an sRGB float image."""
+    """Grey-world white balance, then either a median-to-target gain or levels.
+
+    Everything is in linear light. With ``levels`` the black and white points
+    and the stretch are shared by all three channels and the gamma is a
+    shared exponent, so a neutral input stays neutral; both are clamped and
+    the clamp is recorded, never silent.
+    """
     rgb = _require_float_image(rgb, "compute_gains")
     lin = srgb_to_linear(rgb).reshape(-1, 3)
     lum = lin @ LUMA_709
-    mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
-    if mask.mean() < 0.01:
-        mask = np.ones_like(mask)
-    sel = lin[mask]
+    sel = lin[_stats_mask(lum, params)]
 
-    wb_clamped = False
     if params.white_balance:
-        means = np.maximum(sel.mean(axis=0), _EPS)
-        raw = float(means @ LUMA_709) / means
-        wb = np.clip(raw, params.wb_gain_min, params.wb_gain_max).astype(np.float32)
-        # Compare against the bounds, not against the clipped array: `raw` and
-        # `wb` can differ by a float32 cast alone, which is not a clamp.
-        wb_clamped = bool(
-            np.any(raw < params.wb_gain_min) or np.any(raw > params.wb_gain_max)
-        )
+        wb, wb_clamped = _grey_world(sel, params)
     else:
-        wb = np.ones(3, dtype=np.float32)
+        wb, wb_clamped = np.ones(3, dtype=np.float32), False
 
-    median_lum = float(np.median((sel * wb) @ LUMA_709))
-    raw_exposure = params.exposure_target_median / max(median_lum, _EPS)
-    exposure = float(np.clip(raw_exposure, params.exposure_gain_min, params.exposure_gain_max))
+    if not params.levels:
+        median_lum = float(np.median((sel * wb) @ LUMA_709))
+        raw_exposure = params.exposure_target_median / max(median_lum, _EPS)
+        lo_g, hi_g = params.exposure_gain_min, params.exposure_gain_max
+        exposure = float(np.clip(raw_exposure, lo_g, hi_g))
+        return Gains(
+            wb=wb,
+            exposure=exposure,
+            clamped={"wb": wb_clamped, "exposure": not lo_g <= raw_exposure <= hi_g},
+        )
+
+    balanced = lin * wb
+    lum_b = balanced @ LUMA_709
+    pct = np.percentile(lum_b, [params.levels_low_pct, params.levels_high_pct])
+    lo, hi = float(pct[0]), float(pct[1])
+    lo_c = np.percentile(balanced, params.levels_low_pct, axis=0)
+    raw_stretch = 1.0 / max(hi - lo, _EPS)
+    stretch = min(raw_stretch, params.levels_max_stretch)
+    stretched = np.clip((balanced - lo) * stretch, 0.0, 1.0)
+    lum_s = stretched @ LUMA_709
+    median = float(np.clip(np.median(lum_s[_stats_mask(lum_s, params)]), _EPS, 1.0 - _EPS))
+    target = params.levels_target_median
+    if target is None:
+        target = params.exposure_target_median
+    raw_gamma = math.log(target) / math.log(median)
+    gamma = float(np.clip(raw_gamma, params.levels_gamma_min, params.levels_gamma_max))
+    clamped = raw_stretch > params.levels_max_stretch or not (
+        params.levels_gamma_min <= raw_gamma <= params.levels_gamma_max
+    )
     return Gains(
         wb=wb,
-        exposure=exposure,
-        clamped={
-            "wb": wb_clamped,
-            "exposure": not params.exposure_gain_min <= raw_exposure <= params.exposure_gain_max,
-        },
+        exposure=1.0,
+        clamped={"wb": wb_clamped, "exposure": False, "levels": bool(clamped)},
+        levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma,
+                "black_rgb_spread": float(lo_c.max() - lo_c.min())},
     )
+
+
+def _apply_levels_linear(lin: np.ndarray, levels: dict) -> np.ndarray:
+    low, stretch = np.float32(levels["low"]), np.float32(levels["stretch"])
+    out = np.clip((lin - low) * stretch, 0.0, 1.0)
+    return np.power(out, np.float32(levels["gamma"]))
 
 
 def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
     rgb = _require_float_image(rgb, "apply_gains_float")
-    return linear_to_srgb(np.clip(srgb_to_linear(rgb) * gains.combined, 0.0, 1.0))
-
-
-def levels_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
-    """Stretch p_low..p_high of luminance to 0..1, then gamma the median to target.
-
-    Everything happens in linear light with ONE black point and ONE stretch
-    shared by all three channels, so a neutral input stays neutral. The gamma
-    is likewise per channel with a shared exponent. Both the stretch and the
-    gamma are clamped and the clamp is recorded, never silent.
-    """
-    rgb = _require_float_image(rgb, "levels_float")
-    lin = srgb_to_linear(rgb)
-    lum = lin @ LUMA_709
-    # ONE black point and ONE stretch for all channels, both from luminance.
-    # A per-channel black point was tried (2026-09-04) because dark greys came
-    # out olive: it made the fit worse than identity. Subtracting a different
-    # offset per channel and clipping leaves 0.5% of pixels at zero in one
-    # channel but not the others -- saturated dark colours the film never
-    # produced, seeded straight into the target distribution. The spread of
-    # the per-channel black points is still measured and recorded, so a
-    # scan with a strongly coloured base is visible in the corpus report.
-    pct = np.percentile(lum, [params.levels_low_pct, params.levels_high_pct])
-    lo, hi = float(pct[0]), float(pct[1])
-    lo_c = np.percentile(lin.reshape(-1, 3), params.levels_low_pct, axis=0)
-    raw_stretch = 1.0 / max(hi - lo, _EPS)
-    stretch = min(raw_stretch, params.levels_max_stretch)
-    lin = np.clip((lin - lo) * stretch, 0.0, 1.0)
-
-    lum = lin @ LUMA_709
-    mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
-    if mask.mean() < 0.01:
-        mask = np.ones_like(mask)
-    median = float(np.clip(np.median(lum[mask]), _EPS, 1.0 - _EPS))
-    raw_gamma = math.log(params.exposure_target_median) / math.log(median)
-    gamma = float(np.clip(raw_gamma, params.levels_gamma_min, params.levels_gamma_max))
-    out = linear_to_srgb(np.power(lin, np.float32(gamma)))
-
-    clamped = raw_stretch > params.levels_max_stretch or not (
-        params.levels_gamma_min <= raw_gamma <= params.levels_gamma_max
-    )
-    gains = Gains(
-        wb=np.ones(3, dtype=np.float32),
-        exposure=1.0,
-        clamped={"wb": False, "exposure": False, "levels": bool(clamped)},
-        levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma,
-                "black_rgb_spread": float(lo_c.max() - lo_c.min())},
-    )
-    return out.astype(np.float32), gains
+    lin = srgb_to_linear(rgb) * gains.combined
+    if gains.levels is not None:
+        return linear_to_srgb(_apply_levels_linear(lin, gains.levels)).astype(np.float32)
+    return linear_to_srgb(np.clip(lin, 0.0, 1.0))
 
 
 def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
     """Reference path used by the trainer. ``rgb`` is float32 sRGB in [0, 1]."""
-    if params.levels:
-        return levels_float(rgb, params)
     gains = compute_gains(rgb, params)
     return apply_gains_float(rgb, gains), gains
 
@@ -288,8 +301,12 @@ def gains_to_luts(gains: Gains) -> np.ndarray:
     lin = srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
     luts = np.empty((3, 256), dtype=np.uint8)
     for c in range(3):
-        out = linear_to_srgb(np.clip(lin * gains.combined[c], 0.0, 1.0))
-        luts[c] = np.clip(np.round(out * 255.0), 0, 255).astype(np.uint8)
+        x = lin * gains.combined[c]
+        if gains.levels is not None:
+            x = _apply_levels_linear(x, gains.levels)
+        else:
+            x = np.clip(x, 0.0, 1.0)
+        luts[c] = np.clip(np.round(linear_to_srgb(x) * 255.0), 0, 255).astype(np.uint8)
     return luts
 
 
@@ -297,11 +314,6 @@ def normalize_u8(
     rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
 ) -> tuple[np.ndarray, Gains]:
     """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
-    if params.levels:
-        raise ValueError(
-            "levels normalisation is a training-side step for scanned targets; "
-            "the capture path does not support it"
-        )
     h, w = rgb_u8.shape[:2]
     step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
     gains = compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)

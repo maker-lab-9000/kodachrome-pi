@@ -65,7 +65,7 @@ written but a gate failed; read the report before using it.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--strength` | 1.0 | 0 = no change, 1 = the learned look, 0.7 lighter, up to 2 exaggerates it |
+| `--strength` | 1.0 | 0 = no change, 1 = the learned look, 0.7 lighter; above 1 extrapolates and has overshot in practice |
 | `--val-fraction` | 0.2 | share of images held out of training for the metrics |
 | `--lambda-smooth` | 0.01 | raise if the ramps band or the fit looks noisy |
 | `--lambda-identity` | 1.0 | raise if colours the camera never produced go strange |
@@ -102,7 +102,7 @@ The shipped default was produced by:
 
 ```bash
 .venv/bin/kodachrome-train --source data/proxy-source --target data/kodachrome-k14 \
-  --out artifacts --proxy-source --strength 1.4
+  --out artifacts --proxy-source
 ```
 
 ## Pi setup
@@ -134,7 +134,12 @@ another camera is ever attached.
 The look ships inside the package at `kodachrome/data/`, so every command
 works from any directory and a built wheel carries it. `--artifacts DIR`
 points at a directory instead, which is how you use a LUT you trained
-yourself. `params.json` records the normalisation, the grain settings, the
+yourself. Every capture is normalised before the LUT: grey-world white balance, then
+a black/white-point stretch (0.5th percentile to black, 99.5th to white,
+clamped) and a gamma that puts the median on the exposure target. Camera
+frames and reference scans get the same treatment, which is what lets a
+LUT fitted on one apply to the other. All of it is three 256-entry tables
+on the Pi. `params.json` records the normalisation, the grain settings, the
 LUT's SHA-1 and full training provenance; a LUT whose hash disagrees with
 its `params.json` is refused rather than silently graded with the wrong
 parameters.
@@ -228,10 +233,12 @@ Kodachrome colour distribution than the originals, on images held out of
 training, by a margin larger than an identity transform and larger than the
 measurement's own noise. `artifacts/report/summary.txt` states it per fit.
 The shipped default was fit on 64 proxy-source photographs and 761 K-14 era
-Kodachrome slides at strength 1.4, and moves the held-out distance from
-0.03172 to 0.02029 where the gate asks for 0.00231. On the author's own
-Pi captures that is a mean Oklab change of 0.042: whites at 0.978, blacks
-at 0.000, contrast +8%, skin chroma +6%, colours overall −2%.
+Kodachrome slides, both normalised the same way, and moves the held-out
+distance from 0.01313 to 0.01134 where the gate asks for 0.00156. On the
+author's own Pi captures that is a mean Oklab change of 0.065: whites at
+0.984, blacks at 0.000, contrast +25%, colours +10%, skin chroma +1%. On
+outdoor scenes the 5th-percentile lightness drops from 0.35 to 0.19–0.30
+where an earlier version lifted it to 0.40.
 
 Other limits:
 

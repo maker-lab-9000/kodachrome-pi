@@ -2,9 +2,14 @@ import numpy as np
 import pytest
 
 from kodachrome.lut import LUT3D
-from kodachrome.train.evaluate import channels_are_monotone, neutral_axis_max_chroma
+from kodachrome.train.evaluate import (
+    channels_are_monotone,
+    grey_axis_is_monotone,
+    neutral_axis_max_chroma,
+)
 from kodachrome.train.lutfit import (
     cap_neutral_axis,
+    enforce_grey_axis,
     enforce_monotone,
     fit_lut,
     node_index,
@@ -205,3 +210,23 @@ def test_cap_neutral_axis_zero_neutralises_and_none_is_a_no_op():
     default = fit_lut(x, y, n=9)
     assert neutral_axis_max_chroma(uncapped) > 0.012
     assert neutral_axis_max_chroma(default) <= 0.0105 + 1e-3     # monotone runs after the cap
+
+
+def test_enforce_grey_axis_removes_a_cross_term_dip_the_channel_projection_cannot_see():
+    """Darken the six off-diagonal corners of one cell by 3%: every channel is
+    still monotone along its own axis, yet the grey ramp dips inside that cell."""
+    n, i = 33, 27
+    table = LUT3D.identity(n).table.astype(np.float32).copy()
+    for dr, dg, db in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1)):
+        table[i + dr, i + dg, i + db] *= 0.97
+    dipped = LUT3D(table)
+    assert channels_are_monotone(dipped) and not grey_axis_is_monotone(dipped)
+    fixed = enforce_grey_axis(dipped)
+    assert grey_axis_is_monotone(fixed)
+    # Only near-diagonal corners of that cell and its neighbours moved (the
+    # isotonic pooling can extend a cell either side); saturated red untouched.
+    moved = np.argwhere(np.abs(fixed.table - table).max(axis=-1) > 1e-6)
+    assert len(moved)
+    assert all(i - 1 <= v <= i + 2 for r, g, b in moved for v in (r, g, b)), moved
+    red = np.array([[0.9, 0.1, 0.1]], dtype=np.float32)
+    assert np.allclose(fixed.apply_numpy(red), dipped.apply_numpy(red), atol=1e-6)

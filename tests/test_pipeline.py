@@ -18,7 +18,7 @@ def test_process_shapes_and_info(pipeline):
     frame = np.random.default_rng(0).integers(0, 256, (36, 64, 3), dtype=np.uint8)
     out, info = pipeline.process(frame, rng=np.random.default_rng(0))
     assert out.shape == frame.shape and out.dtype == np.uint8
-    assert set(info) == {"wb_gains", "exposure_gain", "clamped", "lut_sha1"}
+    assert set(info) == {"wb_gains", "exposure_gain", "levels", "clamped", "lut_sha1"}
     assert len(info["wb_gains"]) == 3
     assert info["lut_sha1"] == sha1_hex(LUT3D.identity(9))
     assert set(info["clamped"]) == {"wb", "exposure"}

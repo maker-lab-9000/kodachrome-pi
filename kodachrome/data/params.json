@@ -1,7 +1,7 @@
 {
   "version": 2,
   "lut_file": "kodachrome.cube",
-  "lut_sha1": "6e0cb8d193845058659859ccc69525c3b008db0b",
+  "lut_sha1": "95d08c5583724b97d578f405b7c67d2435e2be19",
   "normalize": {
     "white_balance": true,
     "wb_gain_min": 0.6,
@@ -11,12 +11,13 @@
     "exposure_gain_max": 3.0,
     "stats_lum_min": 0.02,
     "stats_lum_max": 0.9,
-    "levels": false,
+    "levels": true,
     "levels_low_pct": 0.5,
     "levels_high_pct": 99.5,
     "levels_max_stretch": 4.0,
     "levels_gamma_min": 0.5,
-    "levels_gamma_max": 2.0
+    "levels_gamma_max": 2.0,
+    "levels_target_median": null
   },
   "grain": {
     "strength": 0.01,
@@ -24,8 +25,8 @@
     "enabled": true
   },
   "training": {
-    "date": "2026-09-04T11:53:20Z",
-    "code_revision": "7026749",
+    "date": "2026-09-04T14:41:31Z",
+    "code_revision": "026a6ad",
     "package_version": "0.1.0",
     "dependency_versions": {
       "numpy": "2.5.2",
@@ -33,7 +34,7 @@
       "Pillow": "12.3.0",
       "opencv-python": "5.0.0.93"
     },
-    "command": "kodachrome-train --source data/proxy-source --target data/kodachrome-k14 --out artifacts --proxy-source --strength 1.4",
+    "command": "kodachrome-train --source data/proxy-source --target data/kodachrome-k14 --out artifacts --proxy-source --strength 1.0",
     "target": {
       "dir": "data/kodachrome-k14",
       "n_images": 761,
@@ -72,7 +73,8 @@
         "levels_high_pct": 99.5,
         "levels_max_stretch": 4.0,
         "levels_gamma_min": 0.5,
-        "levels_gamma_max": 2.0
+        "levels_gamma_max": 2.0,
+        "levels_target_median": null
       },
       "n_pixels": 400000,
       "clamp_rate": 0.1034,
@@ -103,7 +105,7 @@
       },
       "n_pixels": 156000,
       "proxy": true,
-      "clamp_rate": 0.2885,
+      "clamp_rate": 0.2308,
       "profiles": {
         "Adobe RGB (1998)": 19,
         "c2": 19,
@@ -124,10 +126,10 @@
       "chroma_floor": 0.03,
       "lambda_smooth": 0.01,
       "lambda_identity": 1.0,
-      "strength": 1.4,
+      "strength": 1.0,
       "seed": 0,
       "neutral_axis_cap": 0.01,
-      "fit_seconds": 16.5
+      "fit_seconds": 16.9
     },
     "sample": {
       "crop_frac": 0.06,
@@ -140,18 +142,18 @@
       "seed": 0
     },
     "metrics": {
-      "swd_before": 0.031719,
-      "swd_after": 0.020292,
-      "swd_identity": 0.031719,
-      "swd_seed_spread": 0.000775,
-      "train_swd_before": 0.022166,
-      "train_swd_after": 0.004088,
-      "transport_gamut_clip_deltaE": 0.003599,
-      "lut_fit_rms_deltaE": 0.018066,
+      "swd_before": 0.013133,
+      "swd_after": 0.01134,
+      "swd_identity": 0.013133,
+      "swd_seed_spread": 0.000515,
+      "train_swd_before": 0.016099,
+      "train_swd_after": 0.002886,
+      "transport_gamut_clip_deltaE": 0.00174,
+      "lut_fit_rms_deltaE": 0.009418,
       "grey_axis_monotone": true,
       "channel_monotone": true,
-      "neutral_axis_max_chroma": 0.010096,
-      "clipped_volume_fraction": 0.000504,
+      "neutral_axis_max_chroma": 0.010136,
+      "clipped_volume_fraction": 0.0,
       "n_val_source_pixels": 36000,
       "n_val_target_pixels": 400000,
       "held_out_eval": true

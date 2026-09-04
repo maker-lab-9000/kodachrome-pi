@@ -397,3 +397,80 @@ a guard refuses to proceed if selected filenames still collide; non-LCCN
 filenames carry the page id so genuinely different files with the same
 stem cannot share one either. The earlier commit message that said
 "79 files were lost" is superseded by this entry.
+
+## 2026-09-04: Outdoor haze traced to an asymmetric normaliser; both sides now get levels
+
+**Evidence:** the first outdoor captures came out flat. Stage by stage on
+one street shot (Oklab L): the exposure gain of 0.79 pulled the 95th
+percentile from 1.000 to 0.924, then the LUT lifted the 5th percentile
+from 0.328 to 0.396 — above the ungraded 0.354 — and took 7% of the
+colour. Range compressed 12%. White balance was not involved (gains
+0.96–1.02 on every outdoor frame).
+
+**Cause:** the pixel pools as the transport saw them. Source (WB + gain):
+L quartiles 0.352 / 0.552 / 0.714, p95 0.912. K-14 target (levels): 0.396 /
+0.582 / 0.747, p95 0.941. Same median by construction, but the target's
+white was pinned at 1.0 by the stretch while the source's sat at gain ×
+white, so the target was 0.03–0.045 L lighter from the first quartile up.
+The transport faithfully learned "lift everything above the shadows" and
+strength 1.4 amplified it. The earlier explanation offered for this — that
+the target gamma lifts dense slides — was wrong in detail: the K-14 slides'
+own median after the stretch is 0.21, close to the camera's 0.25. The gap
+was in the highlights.
+
+**Decided:** the source is normalised the same way — grey-world white
+balance, then the black/white-point stretch and the gamma to the exposure
+median — at training and on the Pi. All three steps are per-channel
+monotone in linear light, so they bake into the same three 256-entry tables
+and the float reference and the baked path agree within one 8-bit level
+(tested, and falsified by dropping the gamma from the tables only).
+Simulated before building: source quartiles move to 0.391 / 0.576 / 0.727,
+within 0.005–0.02 of the target. The exposure gain had been clamping on 29%
+of source images; levels clamps on none.
+
+**What changes on a photo:** bright scenes keep their whites at white
+instead of being dimmed; flat scenes get a clamped auto-contrast. The
+street shot's 5th percentile goes from 0.396 (shipped) to 0.224 and its
+range from 0.567 to 0.772, against 0.354 and 0.646 ungraded.
+
+**Strength:** with both sides aligned the residual camera→Kodachrome
+difference is small, and extrapolating it by 1.4 overshot: the ×1.4 fit was
+worse than identity on held-out data and failed the grey-axis gate. The
+shipped strength is set by what passes the gates, recorded below.
+
+## 2026-09-04: Grey-axis projection, evaluator precision, strength back to 1.0
+
+Three consequences of the symmetric normaliser, each measured before acting.
+
+**Grey axis.** The first symmetric fit failed `grey_axis_monotone` by one
+ramp step: −0.00108 at input 0.937, against a 0.001 tolerance. Per-channel
+monotonicity does not imply it — along the diagonal all three inputs rise
+together and cross terms can dip. Adjusting the diagonal nodes alone does
+not fix it (the ramp between nodes blends all eight corners of the cell),
+nor does a per-lightness scaling (a dip caused by corners at the same
+lightness as the diagonal node survives it). `lutfit.enforce_grey_axis`
+solves a small least-squares problem over the affected cells for the corner
+luminance changes that put every ramp sample on its isotonic target,
+repeated until the 256-point ramp is clean; on the real fit it moved 0.04%
+of nodes. Runs between two per-channel passes.
+
+**Evaluator precision.** The same fit failed `improvement_exceeds_noise` by
+0.0003. Re-measured over five seeds, the improvement was 0.00237 ± 0.00033
+— a seven-sigma effect — while the gate compared it to three times the
+spread of a 64-projection distance that was itself noisier (0.0007 on a
+0.0136 baseline) than the effect under judgement. The evaluator now uses
+256 projections; the spread halves and the rule is unchanged. This is
+instrument precision, documented here because it looks like a threshold
+change from a distance.
+
+**Strength.** With both sides normalised the same way the residual
+camera→Kodachrome difference is small, and extrapolating it by 1.4 overshot:
+the ×1.4 symmetric fit was *worse than identity* on held-out data. Shipped
+strength is 1.0. The earlier choice of 1.4 amplified a tone artefact of the
+asymmetric normaliser, which is why it looked like more Kodachrome.
+
+**Shipped:** K-14, strength 1.0, symmetric levels. Held-out 0.01313 →
+0.01134 (bar 0.00156), all five gates. On the seven captures that exposed
+the problem: outdoor 5th-percentile lightness 0.19–0.30 (was 0.39–0.41,
+ungraded 0.35–0.38), range +17–47% (was −6 to −10%), colours −8% to +3%.
+On the earlier eight: mean change 0.065, contrast +25%, colours +10%.

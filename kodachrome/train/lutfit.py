@@ -155,6 +155,78 @@ def cap_neutral_axis(
     return lut
 
 
+def _grey_axis_luminance(table: np.ndarray) -> np.ndarray:
+    """Linear luminance of the LUT's 256-point grey ramp, as the gate measures it."""
+    from ..color import luminance, srgb_to_linear
+
+    ramp = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    grey = np.stack([ramp, ramp, ramp], axis=1)
+    return luminance(srgb_to_linear(LUT3D(table).apply_numpy(grey)))
+
+
+def enforce_grey_axis(lut: LUT3D, passes: int = 8, tol: float = 2e-4) -> LUT3D:
+    """Make luminance non-decreasing along the 256-point grey ramp.
+
+    Per-channel monotonicity along each channel's own axis does not imply it:
+    along the diagonal all three inputs rise together and the cross terms can
+    dip. The first symmetric-levels fit dipped by 0.00108 at input 0.937 --
+    one step, just past the gate's 0.001 tolerance.
+
+    Each ramp sample is a trilinear blend of the eight corners of one cell.
+    Where the ramp departs from its isotonic regression, a small least
+    squares problem over the affected cells finds the corner luminance
+    changes that put every sample in those cells on target at once; the
+    blend is done in sRGB while the change is applied in linear light, so
+    the pass repeats until the ramp is clean. A scaling indexed by lightness
+    alone cannot do this: a dip caused by corners at the same lightness as
+    the diagonal node survives any per-lightness factor.
+    """
+    from scipy.optimize import isotonic_regression
+
+    from ..color import linear_to_srgb, luminance, srgb_to_linear
+
+    n = lut.size
+    table = np.array(lut.table, dtype=np.float32)
+    grey = np.linspace(0.0, 1.0, 256)
+    pos = grey * (n - 1)
+    cell = np.minimum(np.floor(pos).astype(int), n - 2)
+    frac = pos - cell
+    offsets = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+
+    for _ in range(passes):
+        lum_ramp = _grey_axis_luminance(table).astype(np.float64)
+        if np.diff(lum_ramp).min() >= -tol:
+            break
+        target = isotonic_regression(lum_ramp).x
+        bad_cells = set(cell[np.abs(target - lum_ramp) > tol / 4].tolist())
+        samples = [k for k in range(256) if cell[k] in bad_cells]
+        corners = sorted(
+            {(cell[k] + a, cell[k] + b, cell[k] + c) for k in samples for a, b, c in offsets}
+        )
+        col = {c: j for j, c in enumerate(corners)}
+        # One row per ramp sample in an affected cell: its trilinear weights on
+        # the corners' luminance changes must add up to its shortfall. Samples
+        # that are already on target constrain their corners to stay put, which
+        # is what a per-sample update could not do -- consecutive samples share
+        # corners and were undoing each other.
+        A = np.zeros((len(samples), len(corners)))
+        b = np.zeros(len(samples))
+        for r, k in enumerate(samples):
+            f = frac[k]
+            for a, g, c in offsets:
+                w = (f if a else 1 - f) * (f if g else 1 - f) * (f if c else 1 - f)
+                A[r, col[(cell[k] + a, cell[k] + g, cell[k] + c)]] = w
+            b[r] = target[k] - lum_ramp[k]
+        delta = np.linalg.solve(A.T @ A + 1e-4 * np.eye(len(corners)), A.T @ b)
+        lin = srgb_to_linear(table).astype(np.float64)
+        for c, d in zip(corners, delta, strict=True):
+            lum_c = float(luminance(lin[c][None])[0])
+            factor = float(np.clip((lum_c + d) / max(lum_c, 1e-6), 0.5, 2.0))
+            lin[c] = np.clip(lin[c] * factor, 0.0, 1.0)
+        table = linear_to_srgb(lin.astype(np.float32))
+    return LUT3D(table)
+
+
 def enforce_monotone(lut: LUT3D) -> LUT3D:
     """Project each output channel onto the monotone cone along its own axis.
 
@@ -222,4 +294,6 @@ def fit_lut(
     lut = LUT3D(np.clip(table, 0.0, 1.0).reshape(n, n, n, 3).astype(np.float32))
     if neutral_axis_cap is not None:
         lut = cap_neutral_axis(lut, neutral_axis_cap)
-    return enforce_monotone(lut) if monotone else lut
+    if monotone:
+        lut = enforce_monotone(enforce_grey_axis(enforce_monotone(lut)))
+    return lut
