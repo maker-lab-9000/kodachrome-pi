@@ -8080,3 +8080,14 @@ exist.
 
 A per-channel black point in levels was tried and reverted (worse than
 identity). See `docs/decisions.md`.
+
+### Addendum 3 (2026-09-04, evening): reference and fetcher
+
+7. `kodachrome-fetch --licences pd|cc-by|cc-by-sa` (default `pd`) and
+   `--attribution PATH`. Licence policy and counts recorded in the manifest
+   and in `params.json` `training.{target,source}.licences`.
+8. `FitConfig.strength` accepts up to 2 (extrapolation).
+9. Fetcher: files reached through two categories are listed once; non-LCCN
+   filenames carry the Commons page id; a guard refuses colliding names.
+10. Shipped default retrained on `Category:Photographs taken on Kodachrome
+    film` at strength 1.4. See `docs/decisions.md` for the four-way comparison.

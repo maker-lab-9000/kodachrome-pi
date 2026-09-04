@@ -23,24 +23,29 @@ naming both remedies.
 
 ## Training (Mac)
 
-### 1. Fetch the Kodachrome scans
+### 1. Fetch a reference corpus
+
+Two routes. The public-domain one, which is the tool's default:
 
 ```bash
-.venv/bin/kodachrome-fetch          # about 1,000 files, ~200 MB, into data/kodachrome/
+.venv/bin/kodachrome-fetch --out data/kodachrome
 ```
 
-The scans are the Library of Congress FSA/OWI colour transparencies
-(1939-1944), mirrored on Wikimedia Commons because loc.gov blocks scripted
-downloads. Every file is checked individually rather than trusted for being
-in the category: the licence must be on an allowlist, the bytes must decode,
-and the image must be a colour photograph of at least 800 px. Downloads are
-atomic, and a resumed run re-hashes what is on disk and refetches anything
-that does not match.
+That is the Library of Congress FSA/OWI collection, 1939–1944, about 1,100
+scans. It is the honest baseline and needs no licence thought at all.
 
-`data/kodachrome/manifest.json` lists every accepted file with its catalogue
-number, Commons page and revision ID, licence and SHA-1, plus every
-rejection and why. To use your own scans instead, point `kodachrome-train
---target` at any folder.
+The route the **shipped default** uses — K-14 era slides, 1970s–1990s, the
+Kodachrome most people picture:
+
+```bash
+.venv/bin/kodachrome-fetch --category "Category:Photographs taken on Kodachrome film" \
+  --out data/kodachrome-k14 --licences pd,cc-by,cc-by-sa \
+  --attribution docs/reference-attribution.md
+```
+
+These are mostly CC BY and CC BY-SA, so the licence families must be named
+explicitly, and `--attribution` writes the list of every file, author and
+licence that the repository commits. See "Choosing a different reference".
 
 ### 2. Collect camera samples
 
@@ -91,6 +96,13 @@ package:
 
 ```bash
 cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
+```
+
+The shipped default was produced by:
+
+```bash
+.venv/bin/kodachrome-train --source data/proxy-source --target data/kodachrome-k14 \
+  --out artifacts --proxy-source --strength 1.4
 ```
 
 ## Pi setup
@@ -184,7 +196,8 @@ is refused. `--all` overrides the originals-only default.
 By default it accepts public-domain files only. The Kodachrome slides most
 people picture — K-14 era, 1970s to 2000s — are almost all CC BY or CC BY-SA
 on Commons (of 852 candidates in `Category:Photographs taken on Kodachrome
-film`, 107 were public domain), so those families can be enabled explicitly:
+film`, 106 of the 761 usable files are public domain), so those families can
+be enabled explicitly:
 
 ```bash
 .venv/bin/kodachrome-fetch --category "Category:Photographs taken on Kodachrome film" \
@@ -199,8 +212,10 @@ NC and ND variants are never accepted.
 
 ## What this is, and is not
 
-The look is an **aesthetic colour match** to Library of Congress scans of
-1939-1944 Kodachrome. It is not an estimate of the film's response to a
+The look is an **aesthetic colour match** to scans of Kodachrome slides —
+by default the shipped artifact uses K-14 era slides from Wikimedia Commons
+(see `docs/reference-attribution.md`); the tool's own default corpus is the
+Library of Congress FSA/OWI collection of 1939-1944. It is not an estimate of the film's response to a
 scene, and it cannot be: the camera and the film photographed different
 subjects in different decades, so matching their colour distributions cannot
 separate "how the film rendered colour" from "what the 1940s looked like".
@@ -212,9 +227,11 @@ What the numbers do show is that graded images sit measurably closer to the
 Kodachrome colour distribution than the originals, on images held out of
 training, by a margin larger than an identity transform and larger than the
 measurement's own noise. `artifacts/report/summary.txt` states it per fit.
-The shipped default was fit on 64 proxy-source photographs and 1,140 scans,
-and moves the held-out distance from 0.02331 to 0.01374 where the gate asks
-for 0.00158.
+The shipped default was fit on 64 proxy-source photographs and 761 K-14 era
+Kodachrome slides at strength 1.4, and moves the held-out distance from
+0.03172 to 0.02029 where the gate asks for 0.00231. On the author's own
+Pi captures that is a mean Oklab change of 0.042: whites at 0.978, blacks
+at 0.000, contrast +8%, skin chroma +6%, colours overall −2%.
 
 Other limits:
 

@@ -358,9 +358,9 @@ the density of a slide on a light table, which no scan carries.
 ## 2026-09-04: Reference changed to K-14 era slides, strength 1.4
 
 **Decided:** the shipped default is trained on
-`Category:Photographs taken on Kodachrome film` (835 files: 107 public
-domain, 202 CC BY, 532 CC BY-SA; mostly 1970s–1990s slides, the K-14
-process) at `--strength 1.4`. The LoC FSA corpus remains the tool's
+`Category:Photographs taken on Kodachrome film` (761 files after
+de-duplication: 106 public-domain family, 195 CC BY, 460 CC BY-SA; mostly
+1970s–1990s slides, the K-14 process) at `--strength 1.4`. The LoC FSA corpus remains the tool's
 default and the public-domain route.
 **Rejected:** staying on LoC; LoC at 1.4; K-14 at 1.0.
 **Why:** four candidates were measured identically on the user's own eight
@@ -378,6 +378,10 @@ policy and per-licence counts are in the artifact's provenance, and
 `docs/reference-attribution.md` lists every file with author and licence.
 A LUT reuses no pixels; attribution is provided anyway because it costs a
 file and settles the question.
+
+**Shipped:** held-out 0.03172 → 0.02029 (gate bar 0.00231), all five gates,
+neutral max 0.0101. On the eight Pi captures: mean Oklab change 0.042,
+contrast +8%, skin chroma +6%, colours −2%, whites 0.978, blacks 0.000.
 
 ## 2026-09-04: Fetcher double-listed files reachable through two categories
 
