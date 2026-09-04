@@ -337,3 +337,16 @@ def test_licence_policy_admits_exactly_what_it_names():
     assert parse_licences("pd, cc-by") == by
     with pytest.raises(ValueError, match="unknown licence policy"):
         parse_licences("pd,cc-by-nc")
+
+
+def test_filenames_are_unique_even_when_title_stems_collide():
+    """Two Commons titles that normalise to the same stem must not share a file."""
+    def info(title, pageid, lccn=None):
+        return FileInfo(title, pageid, 1, "u", 2000, 1500, "CC BY-SA 4.0", lccn)
+
+    a = info("File:Ahaggar Mountains 1981 01.jpg", 111)
+    b = info("File:Ahaggar Mountains 1981-01.jpg", 222)
+    assert a.filename != b.filename
+    assert a.filename.endswith("_111.jpg") and b.filename.endswith("_222.jpg")
+    lccn = info("File:Whatever LCCN2017877392.tif", 333, "2017877392")
+    assert lccn.filename == "2017877392.jpg"

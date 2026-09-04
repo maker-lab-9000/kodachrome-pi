@@ -86,10 +86,18 @@ class FileInfo:
 
     @property
     def filename(self) -> str:
+        """LCCN when there is one; otherwise the title stem plus the Commons page id.
+
+        The page id is what makes the name unique. Without it, "Ahaggar
+        Mountains 1981 01" and "Ahaggar Mountains 1981-01" normalise to the
+        same stem, the second download overwrites the first, and the manifest
+        lists both: 79 of 835 K-14 files were lost that way before anyone
+        counted the JPEGs on disk against the manifest.
+        """
         if self.lccn:
             return f"{self.lccn}.jpg"
         stem = self.title.removeprefix("File:").rsplit(".", 1)[0]
-        return f"{re.sub(r'[^A-Za-z0-9]+', '_', stem).strip('_')[:120]}.jpg"
+        return f"{re.sub(r'[^A-Za-z0-9]+', '_', stem).strip('_')[:100]}_{self.pageid}.jpg"
 
 
 @dataclass
@@ -361,6 +369,11 @@ def fetch_category(
     infos, info_rejected = fetch_imageinfo(session, titles, width, licences)
     rejected.extend(info_rejected)
     say(f"{len(infos)} files pass licence and size checks; downloading at {width}px")
+
+    names = [info.filename for info in infos]
+    if len(set(names)) != len(names):
+        dup = sorted({n for n in names if names.count(n) > 1})[:3]
+        raise FetchError(f"filename collision among selected files, e.g. {dup}")
 
     report = FetchReport(rejected=rejected)
     for i, info in enumerate(infos, start=1):
