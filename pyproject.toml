@@ -33,6 +33,7 @@ kodachrome = ["data/*.cube", "data/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["slow: builds a wheel and installs it into a temporary venv"]
 
 [tool.ruff]
 line-length = 100
