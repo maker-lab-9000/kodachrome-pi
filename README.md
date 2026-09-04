@@ -76,6 +76,14 @@ shows held-out images normalised, graded, and beside real scans.
 `ramps.png` shows the tone curve and hue movement. `diagnostics.png` shows
 how often normalisation clamped. `metrics.json` has everything.
 
+A corpus with fewer than `1 / --val-fraction` images — under five at the
+default — cannot hold anything back, so the numbers are measured on the
+pixels the fit was trained on. That is memorisation, not generalisation.
+The trainer says so on the console, `summary.txt` opens with a WARNING, the
+contact sheet labels its rows TRAINING rather than held-out, and
+`params.json` records `metrics.held_out_eval: false`. Nothing silently
+claims a held-out result it did not measure.
+
 Promote a fit you like to the shipped default by copying it into the
 package:
 
