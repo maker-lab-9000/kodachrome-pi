@@ -5767,16 +5767,34 @@ def test_fit_recovers_per_channel_curve():
     assert err < 0.01
 
 
-def test_fit_stays_near_identity_where_there_is_no_data():
+def test_the_identity_term_anchors_nodes_no_data_reaches():
+    """Untouched nodes must stay put — and this test must notice if they do not.
+
+    The obvious fixture cannot. Fitting a near-identity transform (y = 1.1x)
+    over the dark half passes with the identity term *deleted*, because the
+    smoothness term extrapolates the fitted curve into the bright region and
+    lands close to identity anyway: measured 0.07 drift against a 0.25 bound.
+    A test that green-lights the absence of the thing it is named for is
+    worse than no test.
+
+    A strong transform separates them. Fitting y = 0.25x over the dark half
+    leaves the bright region 0.71 away from identity when nothing anchors it,
+    against 0.003 when the identity term is present.
+    """
     rng = np.random.default_rng(2)
-    # data only in the dark half of the cube
     x = (rng.random((20000, 3), dtype=np.float32) * 0.5).astype(np.float32)
-    y = np.clip(x * 1.1, 0, 1).astype(np.float32)
+    y = np.clip(x * 0.25, 0, 1).astype(np.float32)
     lut = fit_lut(x, y, n=9)
+
     bright = np.array([[0.95, 0.95, 0.95], [0.9, 0.2, 0.9]], dtype=np.float32)
     out = lut.apply_numpy(bright)
     assert np.all(np.isfinite(out))
-    assert np.abs(out - bright).max() < 0.25  # extrapolated, but not wild
+    assert np.abs(out - bright).max() < 0.05, "untouched nodes drifted"
+
+    # And the fitted region must still follow its data, or a LUT that simply
+    # ignored every sample would satisfy the assertion above.
+    dark = np.array([[0.3, 0.3, 0.3], [0.4, 0.15, 0.35]], dtype=np.float32)
+    assert np.abs(lut.apply_numpy(dark) - dark * 0.25).max() < 0.05
 
 
 def test_fit_rejects_mismatched_inputs():
