@@ -5084,6 +5084,14 @@ def test_no_validation_pixel_appears_in_training(tmp_path):
     expected_val = build_pool(split.val_paths, NormalizeParams(), cfg)
     assert np.array_equal(split.val_pool.srgb, expected_val.srgb)
 
+    # And the mirror, which matters more. A validation pool contaminated by
+    # training images inflates the score; a TRAINING pool contaminated by
+    # held-out images corrupts the fit itself and then reports on data it was
+    # fitted to. Verified that the assertion above stays green through exactly
+    # that leak, so it cannot stand in for this one.
+    expected_train = build_pool(split.train_paths, NormalizeParams(), cfg)
+    assert np.array_equal(split.train_pool.srgb, expected_train.srgb)
+
 
 def test_corpus_too_small_names_the_escape_hatch(tmp_path):
     paths = _write_images(tmp_path / "src", 4)
