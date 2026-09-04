@@ -154,3 +154,14 @@ the same order as the improvement a real grade would be expected to show, so
 the metric could not have distinguished a working fit from a broken one. The
 paired evaluator returns a bit-identical value in the same test, and a test
 now asserts exactly that.
+
+## 2026-09-03: Conjugate gradients on the normal equations for the LUT fit
+
+**Decided:** `fit_lut` forms the normal equations of the regularised least
+squares problem and solves them per channel with `scipy.sparse.linalg.cg`
+and a Jacobi preconditioner.
+**Rejected:** `lsqr` on the stacked system (slower for this shape); direct
+`spsolve` (3D grid fill-in is memory-hungry at 33^3).
+**Why:** the identity term makes the system positive definite, so CG is
+safe, and each iteration is a sparse product over about a million
+non-zeros. Fits finish in seconds on the Mac.

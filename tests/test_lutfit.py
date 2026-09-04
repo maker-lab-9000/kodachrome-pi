@@ -1,0 +1,68 @@
+import numpy as np
+import pytest
+
+from kodachrome.lut import LUT3D
+from kodachrome.train.lutfit import (
+    fit_lut,
+    node_index,
+    second_difference_operator,
+    trilinear_design_matrix,
+)
+
+
+def test_node_index_matches_table_flattening():
+    n = 5
+    table = LUT3D.identity(n).table.reshape(-1, 3)
+    for r, g, b in [(0, 0, 0), (4, 0, 0), (0, 4, 0), (0, 0, 4), (2, 3, 1)]:
+        idx = node_index(np.array([r]), np.array([g]), np.array([b]), n)[0]
+        assert np.allclose(table[idx], [r / 4, g / 4, b / 4])
+
+
+def test_design_matrix_rows_sum_to_one_and_reproduce_identity():
+    n = 9
+    x = np.random.default_rng(0).random((500, 3), dtype=np.float32)
+    a = trilinear_design_matrix(x, n)
+    assert a.shape == (500, n**3)
+    assert np.allclose(np.asarray(a.sum(axis=1)).ravel(), 1.0)
+    assert a.nnz <= 500 * 8
+    ident = LUT3D.identity(n).table.reshape(-1, 3)
+    assert np.allclose(a @ ident, x, atol=1e-6)
+
+
+def test_second_difference_operator_kills_linear_luts():
+    n = 7
+    d = second_difference_operator(n)
+    assert d.shape == (3 * n * n * (n - 2), n**3)
+    ident = LUT3D.identity(n).table.reshape(-1, 3)
+    assert np.allclose(d @ ident, 0.0, atol=1e-6)
+    bumpy = ident.copy()
+    bumpy[n**3 // 2] += 0.1
+    assert np.abs(d @ bumpy).max() > 0.1
+
+
+def test_fit_recovers_per_channel_curve():
+    rng = np.random.default_rng(1)
+    x = rng.random((30000, 3), dtype=np.float32)
+    y = np.clip(x**1.3, 0, 1).astype(np.float32)
+    lut = fit_lut(x, y, n=17, lambda_smooth=1e-3, lambda_identity=1e-4)
+    assert lut.size == 17
+    held = rng.random((3000, 3), dtype=np.float32)
+    err = np.abs(lut.apply_numpy(held) - np.clip(held**1.3, 0, 1)).mean()
+    assert err < 0.01
+
+
+def test_fit_stays_near_identity_where_there_is_no_data():
+    rng = np.random.default_rng(2)
+    # data only in the dark half of the cube
+    x = (rng.random((20000, 3), dtype=np.float32) * 0.5).astype(np.float32)
+    y = np.clip(x * 1.1, 0, 1).astype(np.float32)
+    lut = fit_lut(x, y, n=9)
+    bright = np.array([[0.95, 0.95, 0.95], [0.9, 0.2, 0.9]], dtype=np.float32)
+    out = lut.apply_numpy(bright)
+    assert np.all(np.isfinite(out))
+    assert np.abs(out - bright).max() < 0.25  # extrapolated, but not wild
+
+
+def test_fit_rejects_mismatched_inputs():
+    with pytest.raises(ValueError):
+        fit_lut(np.zeros((10, 3)), np.zeros((9, 3)), n=5)
