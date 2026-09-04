@@ -71,6 +71,52 @@ def test_contact_sheet_shows_three_rows(tmp_path):
         assert im.height > 3 * 64  # three labelled rows stacked
 
 
+def test_a_corpus_with_no_held_out_split_says_so_instead_of_claiming_held_out(tmp_path):
+    """A sheet captioned "held-out" while showing training images would lie.
+
+    `split_paths` yields an empty validation list for any corpus under five
+    images at the default fraction, and `--allow-small` supports exactly that.
+    """
+    paths = _images(tmp_path / "tiny", 3, 0)
+    metrics = {
+        "swd_before": 0.1, "swd_after": 0.05, "swd_identity": 0.1, "swd_seed_spread": 0.001,
+        "train_swd_before": 0.1, "train_swd_after": 0.04,
+        "transport_gamut_clip_deltaE": 0.001, "lut_fit_rms_deltaE": 0.01,
+        "grey_axis_monotone": True, "channel_monotone": True,
+        "neutral_axis_max_chroma": 0.004, "clipped_volume_fraction": 0.01,
+        "hue_bins": [],
+    }
+    cfg = SampleConfig(crop_frac=0.0, max_side=80)
+
+    no_val = CorpusSplit(paths, [], _pool(0), _pool(1, 1), "abc123")
+    out_dir = tmp_path / "report"
+    write_report(out_dir, _darkening_lut(), metrics, check_gates(metrics), no_val,
+                 _split(tmp_path, "tgt", 5), NormalizeParams(),
+                 NormalizeParams(white_balance=False), cfg)
+    summary = (out_dir / "summary.txt").read_text()
+    assert "WARNING" in summary
+    assert "trained on" in summary
+
+    ordinary = tmp_path / "ordinary"
+    write_report(ordinary, _darkening_lut(), metrics, check_gates(metrics),
+                 _split(tmp_path, "src", 0), _split(tmp_path, "tgt2", 6),
+                 NormalizeParams(), NormalizeParams(white_balance=False), cfg)
+    assert "WARNING" not in (ordinary / "summary.txt").read_text()
+
+    # The sheet's own labels must track the flag, not be hard-coded: same images
+    # and same seed, so any pixel difference is the caption changing.
+    sheets = [
+        np.asarray(Image.open(render_contact_sheet(
+            paths, paths, _darkening_lut(), NormalizeParams(),
+            NormalizeParams(white_balance=False), cfg,
+            tmp_path / f"sheet_{flag}.png", rng=np.random.default_rng(0),
+            held_out=flag,
+        )))
+        for flag in (True, False)
+    ]
+    assert not np.array_equal(sheets[0], sheets[1])
+
+
 def test_write_report_produces_every_artifact(tmp_path):
     metrics = {
         "swd_before": 0.1, "swd_after": 0.05, "swd_identity": 0.1, "swd_seed_spread": 0.001,

@@ -19,7 +19,10 @@ compared against the noise floor instead of being asserted.
 
 Metrics are computed on **held-out images**. Values on the training pool are
 reported too, prefixed ``train_``, and are only useful for spotting
-overfitting.
+overfitting. A corpus too small to hold any images back (fewer than
+``1 / val_fraction``) falls back to training pixels; ``fit`` records that as
+``held_out_eval: false`` and every artifact that reports the number then
+labels it TRAINING rather than held-out.
 
 **Safety gates.** A LUT can reduce the distribution distance and still be
 unusable. Checking only that neutral grey keeps rising in luminance, as the
@@ -231,7 +234,7 @@ def check_gates(metrics: dict) -> list[Gate]:
             round(improvement, 6),
             round(margin, 6),
             improvement > margin,
-            f"held-out distance fell by {improvement:.5f}; needs to beat "
+            f"evaluation distance fell by {improvement:.5f}; needs to beat "
             f"{NOISE_MARGIN}x the seed spread ({margin:.5f})",
         ),
         Gate(
@@ -279,7 +282,11 @@ def evaluate(
     chroma_floor: float = 0.03,
     seed: int = 0,
 ) -> dict:
-    """The metrics block of params.json. Primary numbers are held-out."""
+    """The metrics block of params.json.
+
+    Primary numbers are held-out whenever a validation split exists; ``fit``
+    sets ``held_out_eval`` to say whether it did.
+    """
     identity = LUT3D.identity(lut.size)
 
     val_ev = Evaluator.build(val_src, val_tgt, val_weights, seed=seed)

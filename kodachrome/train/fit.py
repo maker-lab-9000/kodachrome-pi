@@ -13,6 +13,8 @@ The sequence (spec section 6):
 4. ``lutfit.fit_lut`` fits a smooth LUT to those pairs.
 5. ``evaluate.evaluate`` measures the result on the held-out images with a
    paired evaluator, and ``check_gates`` turns the numbers into pass or fail.
+   If either corpus was too small to hold images back, this falls back to
+   training pixels, warns, and records ``held_out_eval: false``.
 6. Everything is written into a staging directory and published atomically,
    so an interrupted run can never leave a new LUT beside old parameters.
 
@@ -167,14 +169,27 @@ def train(
     result = fit(source.train_pool, target.train_pool, cfg, say)
     fit_seconds = time.perf_counter() - t0
 
-    say("evaluating on held-out images")
+    # The evaluation is only held out if BOTH sides kept images back. A corpus
+    # under 1/val_fraction images yields an empty validation split, and falling
+    # back to training pixels while still calling the result "held-out" would
+    # report memorisation as generalisation.
+    source_held_out = len(source.val_pool.srgb) > 0
+    target_held_out = len(target.val_pool.srgb) > 0
+    held_out_eval = source_held_out and target_held_out
+    if held_out_eval:
+        say("evaluating on held-out images")
+    else:
+        pairs = (("source", source_held_out), ("target", target_held_out))
+        short = [name for name, ok in pairs if not ok]
+        say(f"WARNING: no held-out images for the {' and '.join(short)} corpus; "
+            "evaluating on training pixels, which measures memorisation, not generalisation")
     val_weights = hue_weights(
         source.val_pool.lab, target.val_pool.lab, cfg.hue_bins, cfg.chroma_floor
-    ) if len(target.val_pool.srgb) else None
+    ) if target_held_out else None
     metrics = evaluate(
         lut=result.lut,
-        val_src=source.val_pool if len(source.val_pool.srgb) else source.train_pool,
-        val_tgt=target.val_pool if len(target.val_pool.srgb) else target.train_pool,
+        val_src=source.val_pool if source_held_out else source.train_pool,
+        val_tgt=target.val_pool if target_held_out else target.train_pool,
         val_weights=val_weights,
         train_src=source.train_pool,
         train_tgt=target.train_pool,
@@ -184,6 +199,7 @@ def train(
         chroma_floor=cfg.chroma_floor,
         seed=cfg.seed,
     )
+    metrics["held_out_eval"] = held_out_eval
     gates = check_gates(metrics)
 
     training = {
@@ -290,8 +306,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    label = "held-out" if metrics.get("held_out_eval", True) else "TRAINING (not held out)"
     print(
-        f"held-out distance to Kodachrome: {metrics['swd_before']:.5f} -> "
+        f"{label} distance to Kodachrome: {metrics['swd_before']:.5f} -> "
         f"{metrics['swd_after']:.5f} (seed spread {metrics['swd_seed_spread']:.5f})"
     )
     failed = [g for g in gates if not g.passed]

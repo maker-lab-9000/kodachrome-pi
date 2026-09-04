@@ -165,3 +165,27 @@ and a Jacobi preconditioner.
 **Why:** the identity term makes the system positive definite, so CG is
 safe, and each iteration is a sparse product over about a million
 non-zeros. Fits finish in seconds on the Mac.
+
+## 2026-09-04: A report may not claim "held-out" when it is not
+
+**Decided:** one flag, `held_out_eval`, is computed where the fallback
+happens and recorded in `params.json`. Every surface that reports the
+number reads it: the contact sheet row labels, the `summary.txt` metric
+line, the console line, and a warning in both the console and the summary.
+The gate detail was reworded to "evaluation distance", which is true either
+way.
+**Rejected:** leaving the fallback silent; removing the fallback and
+refusing to report at all on a small corpus.
+**Why:** `split_paths` returns an empty validation list for any corpus under
+`1 / val_fraction` images — under five at the default — and `--allow-small`
+exists to permit exactly that. Both `report.write_report` and `fit` then
+quietly substituted training pixels while four separate strings still said
+"held-out". The contact sheet is the artifact a person uses to judge the
+fit, and showing training images under a held-out caption is the single most
+flattering thing the tool could do. Refusing to run would be worse: a small
+corpus is a legitimate way to try the pipeline out. Saying plainly which
+pixels were measured costs nothing and keeps the numbers interpretable.
+
+Found by generating a report for a three-image corpus and reading it as a
+user would. The external review caught the contact-sheet instance; the other
+three turned up only by running it.

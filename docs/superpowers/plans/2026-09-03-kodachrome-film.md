@@ -6488,7 +6488,7 @@ def check_gates(metrics: dict) -> list[Gate]:
             round(improvement, 6),
             round(margin, 6),
             improvement > margin,
-            f"held-out distance fell by {improvement:.5f}; needs to beat "
+            f"evaluation distance fell by {improvement:.5f}; needs to beat "
             f"{NOISE_MARGIN}x the seed spread ({margin:.5f})",
         ),
         Gate(
@@ -6982,7 +6982,9 @@ def write_report(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    held_out = bool(source_split.val_paths)
+    # fit() records what it actually measured; fall back to the paths for
+    # direct callers that assemble metrics themselves.
+    held_out = bool(metrics.get("held_out_eval", bool(source_split.val_paths)))
     render_contact_sheet(
         source_split.val_paths or source_split.train_paths,
         target_split.val_paths or target_split.train_paths,
@@ -7004,7 +7006,8 @@ def write_report(
     lines = [
         "Kodachrome fit summary",
         "",
-        f"held-out distance to Kodachrome: {metrics['swd_before']:.5f} before "
+        f"{'held-out' if held_out else 'TRAINING'} distance to Kodachrome: "
+        f"{metrics['swd_before']:.5f} before "
         f"-> {metrics['swd_after']:.5f} after "
         f"(seed spread {metrics['swd_seed_spread']:.5f})",
         f"training-pool distance:          {metrics['train_swd_before']:.5f} -> "
@@ -7017,8 +7020,8 @@ def write_report(
     if not held_out:
         lines.insert(
             2,
-            "WARNING: the source corpus was too small to hold any images back, so the "
-            "contact sheet shows images the fit was trained on and the numbers above "
+            "WARNING: a corpus was too small to hold any images back, so the contact "
+            "sheet shows images the fit was trained on and the distances below "
             "measure memorisation rather than generalisation.",
         )
     for g in gates:
@@ -7427,14 +7430,27 @@ def train(
     result = fit(source.train_pool, target.train_pool, cfg, say)
     fit_seconds = time.perf_counter() - t0
 
-    say("evaluating on held-out images")
+    # The evaluation is only held out if BOTH sides kept images back. A corpus
+    # under 1/val_fraction images yields an empty validation split, and falling
+    # back to training pixels while still calling the result "held-out" would
+    # report memorisation as generalisation.
+    source_held_out = len(source.val_pool.srgb) > 0
+    target_held_out = len(target.val_pool.srgb) > 0
+    held_out_eval = source_held_out and target_held_out
+    if held_out_eval:
+        say("evaluating on held-out images")
+    else:
+        pairs = (("source", source_held_out), ("target", target_held_out))
+        short = [name for name, ok in pairs if not ok]
+        say(f"WARNING: no held-out images for the {' and '.join(short)} corpus; "
+            "evaluating on training pixels, which measures memorisation, not generalisation")
     val_weights = hue_weights(
         source.val_pool.lab, target.val_pool.lab, cfg.hue_bins, cfg.chroma_floor
-    ) if len(target.val_pool.srgb) else None
+    ) if target_held_out else None
     metrics = evaluate(
         lut=result.lut,
-        val_src=source.val_pool if len(source.val_pool.srgb) else source.train_pool,
-        val_tgt=target.val_pool if len(target.val_pool.srgb) else target.train_pool,
+        val_src=source.val_pool if source_held_out else source.train_pool,
+        val_tgt=target.val_pool if target_held_out else target.train_pool,
         val_weights=val_weights,
         train_src=source.train_pool,
         train_tgt=target.train_pool,
@@ -7444,6 +7460,7 @@ def train(
         chroma_floor=cfg.chroma_floor,
         seed=cfg.seed,
     )
+    metrics["held_out_eval"] = held_out_eval
     gates = check_gates(metrics)
 
     training = {
@@ -7550,8 +7567,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    label = "held-out" if metrics.get("held_out_eval", True) else "TRAINING (not held out)"
     print(
-        f"held-out distance to Kodachrome: {metrics['swd_before']:.5f} -> "
+        f"{label} distance to Kodachrome: {metrics['swd_before']:.5f} -> "
         f"{metrics['swd_after']:.5f} (seed spread {metrics['swd_seed_spread']:.5f})"
     )
     failed = [g for g in gates if not g.passed]
