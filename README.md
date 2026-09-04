@@ -21,6 +21,27 @@ from an extra. `pip install -e ".[train,dev]"` includes it. Installing the
 bare package and then importing a module that needs OpenCV raises an error
 naming both remedies.
 
+## Training (Mac)
+
+### 1. Fetch the Kodachrome scans
+
+```bash
+.venv/bin/kodachrome-fetch          # about 1,000 files, ~200 MB, into data/kodachrome/
+```
+
+The scans are the Library of Congress FSA/OWI colour transparencies
+(1939-1944), mirrored on Wikimedia Commons because loc.gov blocks scripted
+downloads. Every file is checked individually rather than trusted for being
+in the category: the licence must be on an allowlist, the bytes must decode,
+and the image must be a colour photograph of at least 800 px. Downloads are
+atomic, and a resumed run re-hashes what is on disk and refetches anything
+that does not match.
+
+`data/kodachrome/manifest.json` lists every accepted file with its catalogue
+number, Commons page and revision ID, licence and SHA-1, plus every
+rejection and why. To use your own scans instead, point `kodachrome-train
+--target` at any folder.
+
 ## Pi setup
 
 Written in a later step.
