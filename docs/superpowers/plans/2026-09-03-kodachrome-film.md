@@ -8100,3 +8100,8 @@ identity). See `docs/decisions.md`.
 12. `lutfit.enforce_grey_axis` (joint least squares over affected cells),
     applied between two `enforce_monotone` passes in `fit_lut`.
     `Evaluator.build` default `n_proj` 64 → 256. Shipped strength 1.0.
+13. `NormalizeParams.levels_tone` ("luma" default | "channel"): the tone
+    curve on Y of YCrCb; `tone_lut` and the Y step in `normalize_u8`.
+    `FitConfig.neutral_axis_cap` 0.01 → 0.005. `api_get` backs off on 429.
+    (A 1.5 gamma ceiling and `stats_lum_max` 0.60 were tried and reverted;
+    see `docs/decisions.md`.)

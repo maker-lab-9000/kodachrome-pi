@@ -141,18 +141,29 @@ def make_session() -> Any:
     return requests.Session()
 
 
-def api_get(session: Any, params: dict, retries: int = 3) -> dict:
+def api_get(session: Any, params: dict, retries: int = 6, sleep: Any = time.sleep) -> dict:
+    """GET with backoff. 429 honours Retry-After and waits much longer.
+
+    Enumerating a 4,000-file category is dozens of paginated calls in quick
+    succession, and Commons answers a burst of those with 429. The old
+    1-2-4 second retry gave up in seven seconds; two fetches died that way.
+    """
     params = {**params, "format": "json"}
     last = "no response"
     for attempt in range(retries):
+        wait = 2**attempt
         try:
             r = session.get(API_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=60)
             if r.status_code == 200:
                 return r.json()
             last = f"HTTP {r.status_code}"
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
+                wait = max(15 * 2**attempt, int(retry_after) if str(retry_after).isdigit() else 0)
         except Exception as exc:  # noqa: BLE001 - network errors are all retried alike
             last = repr(exc)
-        time.sleep(2**attempt)
+        if attempt < retries - 1:
+            sleep(min(wait, 300))
     raise FetchError(f"Commons API request failed after {retries} attempts: {last}")
 
 

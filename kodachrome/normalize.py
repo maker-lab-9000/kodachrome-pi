@@ -8,13 +8,17 @@ trainer applies this exact code to the corpora (``normalize_float``); the Pi
 applies the same maths through three 256-entry lookup tables
 (``normalize_u8``).
 
-Why three 1D tables suffice
----------------------------
-White balance is a per-channel gain in linear light; exposure is either a
-scalar gain (``levels=False``) or a black/white-point stretch followed by a
-gamma (``levels=True``). Every one of those is a monotone function of one
-channel, so the composite sRGB-to-sRGB map is three independent monotone
-functions of one byte. ``cv2.LUT`` applies that in milliseconds on a Pi 400.
+Why lookup tables suffice
+-------------------------
+White balance is a per-channel gain in linear light, baked into three
+256-entry tables. The tone step -- a scalar gain (``levels=False``) or a
+black/white-point stretch followed by a gamma (``levels=True``) -- is one
+monotone curve. Applied per channel it would fit the same three tables, but
+per-channel gamma widens the gaps between R, G and B, which is saturation:
+skin came out +50% chroma in bright rooms. So by default the curve is
+applied to Y of YCrCb through a fourth table and chroma is left alone
+(``levels_tone="luma"``). Two ``cvtColor`` calls and three ``cv2.LUT``
+calls: about 100 ms for 1080p on a Pi 400.
 
 Levels, and why both sides get it
 ---------------------------------
@@ -33,24 +37,17 @@ Targets versus sources
 Kodachrome scans are normalised with ``white_balance=False``: the film's
 daylight balance and warm cast are part of the look being learned.
 
-Idempotence, approximately
---------------------------
-Normalising an already-normalised image is close to, but not exactly, a
-no-op. The statistics mask is recomputed on the transformed pixels, so the
-second pass averages a slightly different subset and applies a small
-correction. Repeated passes converge rather than drift. Nothing here
-normalises twice, so this is documented rather than engineered away:
-iterating to a fixed point would cost time on every frame to remove an
-error of about two 8-bit levels that no caller ever sees.
-
-Reporting clamps
-----------------
-Both gains are clamped to sane ranges so a night shot is not amplified into
-daylight. When a clamp bites, the resulting image is *not* fully normalised,
-and the LUT then sees input it was not fitted on. ``Gains.clamped`` records
-that so the trainer can publish a clamp rate per corpus and the capture log
-can explain a shot that came out wrong, instead of the limit acting
-silently.
+Normalising twice is not supported
+----------------------------------
+The statistics ignore highlights (``stats_lum_max``), so a pass that
+brightens an image pushes pixels past the cutoff and the next pass measures
+a different set. On the levels path the second pass is mild (gamma 0.94 on
+a photo-like ramp) because black and white are pinned; on the legacy gain
+path it is not (a second gain of 1.3), because a gain can push the whole
+top of the range out of the statistic. Nothing in the project normalises
+an image twice: the trainer normalises corpora once and the Pi normalises
+a capture once, with the same code. This is documented rather than
+engineered away, and tested as a bounded second pass on the levels path.
 """
 
 from __future__ import annotations
@@ -82,6 +79,12 @@ class NormalizeParams:
     exposure_gain_min: float = 0.5
     exposure_gain_max: float = 3.0
     stats_lum_min: float = 0.02
+    # 0.90, and not lower: excluding highlights from the statistic (0.60 was
+    # tried) helped a face against a white wall but is content-dependent --
+    # the K-14 corpus is 44% sky, so ignoring bright pixels re-exposed slides
+    # for their ground and pushed skies toward white, while sky-light source
+    # photos barely moved. The pools drifted apart and the held-out distance
+    # went from 0.0122 to 0.0211, worse than identity.
     stats_lum_max: float = 0.90
     # Levels: black/white-point stretch plus a gamma to the median. Added for
     # scanned targets -- across 150 LoC Kodachromes the white point sat at a
@@ -96,6 +99,11 @@ class NormalizeParams:
     levels_max_stretch: float = 4.0
     levels_gamma_min: float = 0.5
     levels_gamma_max: float = 2.0
+    # How the stretch+gamma is applied. "luma": to the Y channel of YCrCb with
+    # chroma untouched. "channel": to each channel in linear light, which
+    # widens the gaps between R, G and B -- that is saturation, and it made
+    # skin +50% chroma in bright rooms while the LUT contributed 1%.
+    levels_tone: str = "luma"
     # Where the levels gamma puts the median. None means the exposure target,
     # i.e. the same median as the source -- which assumes a well-exposed slide
     # has the same median as a well-exposed digital frame. It does not: slides
@@ -106,13 +114,17 @@ class NormalizeParams:
 
     def __post_init__(self) -> None:
         for f in fields(self):
-            if f.name not in ("white_balance", "levels") and getattr(self, f.name) is not None:
+            if f.name in ("white_balance", "levels", "levels_tone"):
+                continue
+            if getattr(self, f.name) is not None:
                 _check_finite(f.name, getattr(self, f.name))
         if not 0.0 <= self.levels_low_pct < self.levels_high_pct <= 100.0:
             raise ValueError(
                 f"levels_low_pct ({self.levels_low_pct}) must be below "
                 f"levels_high_pct ({self.levels_high_pct}), both within [0, 100]"
             )
+        if self.levels_tone not in ("luma", "channel"):
+            raise ValueError(f"levels_tone must be 'luma' or 'channel', got {self.levels_tone!r}")
         if self.levels_max_stretch < 1.0:
             raise ValueError(
                 f"levels_max_stretch must be at least 1, got {self.levels_max_stretch}"
@@ -272,7 +284,7 @@ def compute_gains(rgb: np.ndarray, params: NormalizeParams) -> Gains:
         exposure=1.0,
         clamped={"wb": wb_clamped, "exposure": False, "levels": bool(clamped)},
         levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma,
-                "black_rgb_spread": float(lo_c.max() - lo_c.min())},
+                "black_rgb_spread": float(lo_c.max() - lo_c.min()), "tone": params.levels_tone},
     )
 
 
@@ -282,12 +294,35 @@ def _apply_levels_linear(lin: np.ndarray, levels: dict) -> np.ndarray:
     return np.power(out, np.float32(levels["gamma"]))
 
 
+def _tone_curve(y_srgb: np.ndarray, levels: dict) -> np.ndarray:
+    """The stretch+gamma as a curve on sRGB-encoded luma, for the luma path."""
+    return linear_to_srgb(_apply_levels_linear(srgb_to_linear(y_srgb), levels)).astype(np.float32)
+
+
+def _luma_tone(rgb_srgb: np.ndarray, levels: dict) -> np.ndarray:
+    """Apply the tone curve to Y of YCrCb, leaving Cr and Cb as they are."""
+    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_srgb, dtype=np.float32), cv2.COLOR_RGB2YCrCb)
+    ycc[..., 0] = _tone_curve(ycc[..., 0], levels)
+    return np.clip(cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
+
+
+def tone_lut(gains: Gains) -> np.ndarray | None:
+    """The 256-entry Y table for the luma path, or None when there is no such step."""
+    if gains.levels is None or gains.levels.get("tone", "channel") != "luma":
+        return None
+    y = _tone_curve(np.arange(256, dtype=np.float32) / 255.0, gains.levels)
+    return np.clip(np.round(y * 255.0), 0, 255).astype(np.uint8)
+
+
 def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
     rgb = _require_float_image(rgb, "apply_gains_float")
     lin = srgb_to_linear(rgb) * gains.combined
-    if gains.levels is not None:
-        return linear_to_srgb(_apply_levels_linear(lin, gains.levels)).astype(np.float32)
-    return linear_to_srgb(np.clip(lin, 0.0, 1.0))
+    if gains.levels is None:
+        return linear_to_srgb(np.clip(lin, 0.0, 1.0))
+    if gains.levels.get("tone", "channel") == "luma":
+        balanced = linear_to_srgb(np.clip(lin, 0.0, 1.0)).astype(np.float32)
+        return _luma_tone(balanced, gains.levels)
+    return linear_to_srgb(_apply_levels_linear(lin, gains.levels)).astype(np.float32)
 
 
 def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
@@ -297,12 +332,17 @@ def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarra
 
 
 def gains_to_luts(gains: Gains) -> np.ndarray:
-    """Bake the gains into three 256-entry uint8 tables, one per channel."""
+    """Bake the per-channel part into three 256-entry uint8 tables.
+
+    On the luma path that is white balance only; the tone curve lives in
+    ``tone_lut`` and is applied to Y afterwards.
+    """
     lin = srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
     luts = np.empty((3, 256), dtype=np.uint8)
+    per_channel_tone = gains.levels is not None and gains.levels.get("tone", "channel") != "luma"
     for c in range(3):
         x = lin * gains.combined[c]
-        if gains.levels is not None:
+        if per_channel_tone:
             x = _apply_levels_linear(x, gains.levels)
         else:
             x = np.clip(x, 0.0, 1.0)
@@ -318,4 +358,10 @@ def normalize_u8(
     step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
     gains = compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)
     table = np.ascontiguousarray(gains_to_luts(gains).T).reshape(256, 1, 3)
-    return cv2.LUT(np.ascontiguousarray(rgb_u8), table), gains
+    out = cv2.LUT(np.ascontiguousarray(rgb_u8), table)
+    ylut = tone_lut(gains)
+    if ylut is not None:
+        ycc = cv2.cvtColor(out, cv2.COLOR_RGB2YCrCb)
+        ycc[..., 0] = cv2.LUT(ycc[..., 0], ylut)
+        out = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
+    return out, gains

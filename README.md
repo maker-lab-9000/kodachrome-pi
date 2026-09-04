@@ -101,7 +101,7 @@ cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
 The shipped default was produced by:
 
 ```bash
-.venv/bin/kodachrome-train --source data/proxy-source --target data/kodachrome-k14 \
+.venv/bin/kodachrome-train --source data/proxy-large --target data/kodachrome-k14 \
   --out artifacts --proxy-source
 ```
 
@@ -136,10 +136,12 @@ works from any directory and a built wheel carries it. `--artifacts DIR`
 points at a directory instead, which is how you use a LUT you trained
 yourself. Every capture is normalised before the LUT: grey-world white balance, then
 a black/white-point stretch (0.5th percentile to black, 99.5th to white,
-clamped) and a gamma that puts the median on the exposure target. Camera
-frames and reference scans get the same treatment, which is what lets a
-LUT fitted on one apply to the other. All of it is three 256-entry tables
-on the Pi. `params.json` records the normalisation, the grain settings, the
+clamped) and a gamma that puts the median on the exposure target. The
+stretch and gamma act on luma only, so they change tone without changing
+saturation — applied per channel they made skin +50% chroma in bright
+rooms. Camera frames and reference scans get the same treatment, which is
+what lets a LUT fitted on one apply to the other. On the Pi it is four
+256-entry tables and two colour-space conversions. `params.json` records the normalisation, the grain settings, the
 LUT's SHA-1 and full training provenance; a LUT whose hash disagrees with
 its `params.json` is refused rather than silently graded with the wrong
 parameters.
@@ -232,13 +234,15 @@ What the numbers do show is that graded images sit measurably closer to the
 Kodachrome colour distribution than the originals, on images held out of
 training, by a margin larger than an identity transform and larger than the
 measurement's own noise. `artifacts/report/summary.txt` states it per fit.
-The shipped default was fit on 64 proxy-source photographs and 761 K-14 era
+The shipped default was fit on 399 proxy-source photographs and 761 K-14 era
 Kodachrome slides, both normalised the same way, and moves the held-out
-distance from 0.01313 to 0.01134 where the gate asks for 0.00156. On the
-author's own Pi captures that is a mean Oklab change of 0.065: whites at
-0.984, blacks at 0.000, contrast +25%, colours +10%, skin chroma +1%. On
-outdoor scenes the 5th-percentile lightness drops from 0.35 to 0.19–0.30
-where an earlier version lifted it to 0.40.
+distance from 0.02009 to 0.01536 where the gate asks for 0.00363, on about
+80 held-out source images. On the author's own Pi captures: outdoor
+5th-percentile lightness drops 0.09–0.26 and range grows 16–60%; skin
+chroma changes by −10% to +1% (an earlier per-channel normaliser had made
+it +50%); indoor whites carry half the blue they did. Colours overall move
+−8% to +5%, mostly slightly down: this camera's ISP renders reds more
+saturated than K-14 slides do, and the match is honest about it.
 
 Other limits:
 

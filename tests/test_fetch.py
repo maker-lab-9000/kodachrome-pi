@@ -7,7 +7,9 @@ from PIL import Image
 
 from kodachrome.train.fetch import (
     API_URL,
+    FetchError,
     FileInfo,
+    api_get,
     download,
     fetch_category,
     fetch_imageinfo,
@@ -384,3 +386,21 @@ def test_a_file_reachable_through_two_categories_is_listed_once(monkeypatch):
     )
     titles = [m["title"] for m in iter_category_members(None, "Category:P")]
     assert titles == ["File:A.jpg", "File:B.jpg"]
+
+
+def test_api_get_backs_off_much_longer_on_429_and_honours_retry_after():
+    class R:
+        def __init__(self, code, headers=None):
+            self.status_code, self.headers = code, headers or {}
+        def json(self):
+            return {"ok": True}
+    answers = [R(429, {"Retry-After": "40"}), R(429), R(200)]
+    class S:
+        def get(self, *a, **k):
+            return answers.pop(0)
+    waits = []
+    assert api_get(S(), {"action": "query"}, sleep=waits.append) == {"ok": True}
+    assert waits == [40, 30], waits          # Retry-After wins, then 15 * 2**attempt
+    with pytest.raises(FetchError, match="HTTP 429"):
+        always_429 = type("S2", (), {"get": lambda self, *a, **k: R(429)})()
+        api_get(always_429, {}, retries=2, sleep=lambda s: None)

@@ -41,7 +41,9 @@ class Pipeline:
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),
             "levels": (
-                {k: round(float(v), 4) for k, v in gains.levels.items()} if gains.levels else None
+                {k: (v if isinstance(v, str) else round(float(v), 4))
+                 for k, v in gains.levels.items()}
+                if gains.levels else None
             ),
             "clamped": dict(gains.clamped),
             "lut_sha1": self.artifacts.lut_sha1,

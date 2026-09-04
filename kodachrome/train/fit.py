@@ -71,7 +71,7 @@ class FitConfig:
     lambda_identity: float = 1.0
     strength: float = 1.0
     seed: int = 0
-    neutral_axis_cap: float = 0.01
+    neutral_axis_cap: float = 0.005   # halved from 0.01: 0.01 left indoor whites visibly cool
 
     def __post_init__(self) -> None:
         if not 2 <= self.lut_size <= 65:

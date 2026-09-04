@@ -474,3 +474,62 @@ asymmetric normaliser, which is why it looked like more Kodachrome.
 the problem: outdoor 5th-percentile lightness 0.19–0.30 (was 0.39–0.41,
 ungraded 0.35–0.38), range +17–47% (was −6 to −10%), colours −8% to +3%.
 On the earlier eight: mean change 0.065, contrast +25%, colours +10%.
+
+## 2026-09-04: Tone curve on luma only; gamma ceiling 1.5; neutral cap 0.005
+
+**Evidence:** thirteen more captures. Outdoor was right. Three selfies
+against white walls came out ruddy: skin chroma +49%, +52%, +21%, faces
+down a tenth of L. Decomposed, the LUT contributed about 1%; the rest was
+the normaliser. A white-walled room has a high scene median, so the gamma
+that puts the median on 0.25 hit its 2.0 ceiling, and a gamma applied per
+channel in linear light widens the gaps between R, G and B — which is
+saturation. Outdoors the same mechanism at gamma 1.1–1.2 read as pleasant
+density; on a face it read as sunburn. The same face would render
+differently depending on the wall behind it, which is the definition of a
+normaliser artefact.
+
+**Decided:** the stretch and gamma are applied to Y of YCrCb, chroma
+untouched (`levels_tone="luma"`, the default). White balance stays a
+per-channel gain in linear light. The Pi path is three `cv2.LUT` tables
+for white balance, then a fourth on Y between two `cvtColor` calls; the
+float reference does the same through the same conversions, and the two
+agree within three 8-bit levels (Y is quantised before the curve, and the
+conversions round twice). Falsified by dropping the Y table from the Pi
+path. Simulated on the same shots before building: skin +6%, +2%, −5%;
+outdoor 5th percentile and range unchanged to three decimals. Cost about
++55 ms on the Mac, so roughly +150 ms on the Pi.
+
+Also `neutral_axis_cap` 0.01 → 0.005, because indoor whites at 0.01 leaned
+visibly cyan-blue (wall b −0.010 → −0.020). K-14 whites genuinely are cool;
+half of that is kept.
+
+**Two things tried for the face-against-a-white-wall case, both
+rejected.** A gamma ceiling of 1.5 worked on the faces and broke the fit:
+18% of K-14 slides need *darkening* past 1.5, so the target pool came out
+lighter than the source and the LUT learned to lift again. Excluding
+highlights from the exposure statistic (`stats_lum_max` 0.60) also worked
+on the faces — gammas 1.55 / 1.56 / 0.94, faces within 0.05 L of the
+camera — and broke the fit worse: the statistic is content-dependent. The
+K-14 corpus is 44% sky, so ignoring bright pixels re-exposed slides for
+their ground and pushed skies toward white, while sky-light source photos
+barely moved; held-out went from 0.0122 to 0.0211. Both reverted. What
+remains for that case is the luma-only tone, which removes the ruddiness;
+the face is still darkened by the scene median, as any global exposure
+statistic will do to a portrait against white.
+
+**Held-out noise at 64 source images.** Changing the split seed moved the
+held-out identity distance from 0.0112 to 0.0180 — a 60% swing from which
+12 images are held out. The fit improved on both splits but could not
+clear a noise bar that is mostly split variance. A 500-image proxy corpus
+is the remedy; the first two fetches of it died on Commons' 429 during
+category enumeration, so `api_get` now backs off properly.
+
+**Shipped:** 399 source images (public domain, USDA), 761 K-14 slides,
+luma-only tone, cap 0.005, strength 1.0. Held-out 0.02009 → 0.01536
+against a 0.00363 bar, all five gates, on ~80 held-out source images. On
+the thirteen captures: skin chroma +1% / −2% / −10% (was +49 / +52 / +21),
+walls b −0.020 and −0.011 (were −0.026 and −0.015), outdoor range +16% to
++60%. The remaining known limit: a face against a white wall is darkened
+by the scene-median exposure (L 0.53 → 0.41). Every global exposure
+statistic does this to a portrait against white; the two attempts to
+special-case it broke the fit and are recorded above.
