@@ -258,3 +258,21 @@ targets are scans of 70-year-old film, digitised flat; matching their
 distribution reproduces the look of the scan, not of a slide on a light box.
 That is consistent with the aesthetic claim this project already makes, but
 it is a real limit on how "Kodachrome" the output can feel.
+
+## 2026-09-04: The 150 ms Pi estimate is optimistic — measured 220 ms on a Mac
+
+**Measured:** a 1920x1080 frame through `Pipeline.process` takes a median
+220 ms on an Intel Core i5-1038NG7. The breakdown is grain 105 ms (47%),
+the 3D LUT 56 ms (25%), normalisation 45 ms (20%).
+
+**Why it matters:** the entry above estimates "about 150 ms on a Pi 400".
+A Pi 400's Cortex-A72 at 1.8 GHz is several times slower than this laptop
+for this kind of array work, so the realistic figure is closer to one
+second per photo. The estimate was never measured and should not be quoted
+until step 5 of Task 22 runs on the hardware.
+
+**Not treated as a blocker:** capture is keypress-driven, one photo at a
+time, not video. A second per shot is acceptable for that flow. But grain
+is the dominant cost at nearly half the budget and is the obvious place to
+look if it turns out to be too slow — it is currently the least optimised
+stage of the three.
