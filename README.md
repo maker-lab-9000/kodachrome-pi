@@ -93,7 +93,27 @@ cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
 
 ## Pi setup
 
-Written in a later step.
+On Raspberry Pi OS (Bookworm or newer, 64-bit):
+
+```bash
+sudo apt update
+sudo apt install -y git python3-venv python3-opencv python3-numpy python3-pil
+git clone <this repo> ~/kodachrome-film && cd ~/kodachrome-film
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install -e .
+.venv/bin/kodachrome-capture --fake     # smoke test without the camera
+.venv/bin/kodachrome-capture            # real camera
+```
+
+`--system-site-packages` is what lets the venv see apt's OpenCV, which is
+built with GTK so the preview window works. Do not `pip install
+opencv-python` on the Pi: the wheel most likely to be selected is the
+headless one, which silently disables the preview.
+
+Plug the U20CAM directly into the Pi rather than an unpowered hub; the
+vendor FAQ attributes dropped frames to hub power. `ls /dev/v4l/by-id/`
+gives a stable path you can pass to `--device`, which is worth using if
+another camera is ever attached.
 
 ## How it works
 
@@ -155,3 +175,48 @@ skips the `*_kodachrome.jpg` siblings, so running it twice cannot
 double-grade. Pointed at any other folder it grades everything. Existing
 outputs are kept unless `--overwrite`; an output directory inside the input
 is refused. `--all` overrides the originals-only default.
+
+## What this is, and is not
+
+The look is an **aesthetic colour match** to Library of Congress scans of
+1939-1944 Kodachrome. It is not an estimate of the film's response to a
+scene, and it cannot be: the camera and the film photographed different
+subjects in different decades, so matching their colour distributions cannot
+separate "how the film rendered colour" from "what the 1940s looked like".
+The honest fix would be to photograph one colour chart on both, which is
+impossible now that Kodachrome has been discontinued since 2009 and
+unprocessable since 2010.
+
+What the numbers do show is that graded images sit measurably closer to the
+Kodachrome colour distribution than the originals, on images held out of
+training, by a margin larger than an identity transform and larger than the
+measurement's own noise. `artifacts/report/summary.txt` states it per fit.
+The shipped default was fit on 64 proxy-source photographs and 1,140 scans,
+and moves the held-out distance from 0.02330 to 0.01375 where the gate asks
+for 0.00161.
+
+Other limits:
+
+- The scans carry LoC's scanner and colour management, and 1940s Kodachrome
+  differs from later K-14 stock. Point `--target` at your own scans to
+  change the reference.
+- **Shadows lift rather than deepen.** The targets are scans of 70-year-old
+  film, digitised flat, so matching their distribution reproduces the look
+  of the scan and not of a slide on a light box. If you want Kodachrome's
+  deep blacks, that is a contrast curve applied after this, not something
+  the reference can teach.
+- A large hue rotation is only partly recovered — roughly 5 degrees of a
+  90-degree target. The damping comes from the transport and the LUT-fit
+  smoothness, not from hue reweighting, which was measured and found to make
+  almost no difference here. Saturation, lightness and tone curve are
+  learned fully.
+- 71% of the colour cube contains no source pixel at this corpus size, so
+  those regions are held at identity by `--lambda-identity` rather than
+  learned. More varied source photographs is the most direct improvement.
+- White balance is grey-world with clamped gains, so a scene legitimately
+  dominated by one colour is partially neutralised. The capture log records
+  when a gain clamped.
+- The camera's own auto exposure and white balance are recorded but not
+  locked; see `docs/decisions.md`. Locking is the first item of future work.
+- No lens, halation or vignette modelling; the 121-degree lens distortion is
+  left alone.
