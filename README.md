@@ -60,7 +60,7 @@ written but a gate failed; read the report before using it.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--strength` | 1.0 | 0 = no change, 1 = full; 0.7 for a lighter touch |
+| `--strength` | 1.0 | 0 = no change, 1 = the learned look, 0.7 lighter, up to 2 exaggerates it |
 | `--val-fraction` | 0.2 | share of images held out of training for the metrics |
 | `--lambda-smooth` | 0.01 | raise if the ramps band or the fit looks noisy |
 | `--lambda-identity` | 1.0 | raise if colours the camera never produced go strange |
@@ -177,6 +177,25 @@ skips the `*_kodachrome.jpg` siblings, so running it twice cannot
 double-grade. Pointed at any other folder it grades everything. Existing
 outputs are kept unless `--overwrite`; an output directory inside the input
 is refused. `--all` overrides the originals-only default.
+
+## Choosing a different reference
+
+`kodachrome-fetch --category` points the trainer at any Commons category.
+By default it accepts public-domain files only. The Kodachrome slides most
+people picture — K-14 era, 1970s to 2000s — are almost all CC BY or CC BY-SA
+on Commons (of 852 candidates in `Category:Photographs taken on Kodachrome
+film`, 107 were public domain), so those families can be enabled explicitly:
+
+```bash
+.venv/bin/kodachrome-fetch --category "Category:Photographs taken on Kodachrome film" \
+  --out data/kodachrome-k14 --licences pd,cc-by,cc-by-sa
+```
+
+A fitted LUT carries no image content, which is why this is offered at all,
+but it is a choice: the policy and per-licence counts are written into the
+manifest and into the artifact's `training.target.licences`, and every
+accepted file's author and licence are recorded so attribution is possible.
+NC and ND variants are never accepted.
 
 ## What this is, and is not
 

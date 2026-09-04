@@ -36,6 +36,7 @@ import random
 import re
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -53,6 +54,16 @@ DEFAULT_CATEGORY = "Category:Color photographs from the Farm Security Administra
 SKIP_WORDS = ("cropped", "restored", "retouched", "colorized", "colourized", "edit")
 MIN_LONG_SIDE = 800
 LICENCE_ALLOWLIST = {"public domain", "cc0", "pdm", "no restrictions"}
+# Which licence families a fetch may accept. The default is public domain
+# only. "cc-by" and "cc-by-sa" exist because the Kodachrome slides people
+# actually remember -- K-14 era, 1970s to 2000s -- are almost all CC BY or
+# CC BY-SA on Commons (of 852 candidates, 107 were PD). A fitted LUT carries
+# no image content, so training on them is defensible, but it is a choice:
+# it must be asked for, it is written into the manifest and the artifact's
+# provenance, and every accepted file's author and licence are recorded so
+# attribution is possible. NC and ND variants are never accepted.
+LICENCE_POLICIES = ("pd", "cc-by", "cc-by-sa")
+DEFAULT_LICENCES = frozenset({"pd"})
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/tiff"}
 _LCCN_RE = re.compile(r"LCCN(\d{6,})", re.IGNORECASE)
 
@@ -71,6 +82,7 @@ class FileInfo:
     height: int
     license: str
     lccn: str | None
+    artist: str = ""
 
     @property
     def filename(self) -> str:
@@ -88,12 +100,31 @@ class FetchReport:
     repaired: int = 0
 
 
-def licence_allowed(text: str | None) -> bool:
-    """Explicit allowlist: exact free-licence names, plus the PD-* family."""
+def parse_licences(text: str) -> frozenset[str]:
+    """``"pd,cc-by"`` -> ``{"pd", "cc-by"}``, refusing anything not in LICENCE_POLICIES."""
+    names = frozenset(n.strip().lower() for n in text.split(",") if n.strip())
+    unknown = names - set(LICENCE_POLICIES)
+    if unknown or not names:
+        raise ValueError(
+            f"unknown licence policy {sorted(unknown)}; choose from {', '.join(LICENCE_POLICIES)}"
+        )
+    return names
+
+
+def licence_allowed(text: str | None, licences: frozenset[str] = DEFAULT_LICENCES) -> bool:
+    """Explicit allowlist per policy. NC and ND are refused under every policy."""
     if not text:
         return False
-    normalised = text.strip().lower()
-    return normalised in LICENCE_ALLOWLIST or normalised.startswith("pd-")
+    n = text.strip().lower()
+    if "pd" in licences and (n in LICENCE_ALLOWLIST or n.startswith("pd-")):
+        return True
+    if "-nc" in n or "-nd" in n:
+        return False
+    if "cc-by-sa" in licences and n.startswith("cc by-sa"):
+        return True
+    if "cc-by" in licences and (n.startswith("cc by ") or n == "attribution"):
+        return True
+    return False
 
 
 def make_session() -> Any:
@@ -168,7 +199,7 @@ def select_titles(entries: list[dict]) -> tuple[list[str], list[dict]]:
 
 
 def fetch_imageinfo(
-    session: Any, titles: list[str], width: int
+    session: Any, titles: list[str], width: int, licences: frozenset[str] = DEFAULT_LICENCES
 ) -> tuple[list[FileInfo], list[dict]]:
     infos: list[FileInfo] = []
     rejected: list[dict] = []
@@ -195,7 +226,7 @@ def fetch_imageinfo(
                 rejected.append({"title": title, "reason": f"mime:{ii.get('mime')}"})
                 continue
             licence = ii.get("extmetadata", {}).get("LicenseShortName", {}).get("value", "")
-            if not licence_allowed(licence):
+            if not licence_allowed(licence, licences):
                 rejected.append({"title": title, "reason": "licence", "license": licence})
                 continue
             if max(int(ii["width"]), int(ii["height"])) < MIN_LONG_SIDE:
@@ -213,6 +244,9 @@ def fetch_imageinfo(
                     height=int(ii["height"]),
                     license=licence,
                     lccn=m.group(1) if m else None,
+                    artist=re.sub(
+                        r"<[^>]+>", "", ii.get("extmetadata", {}).get("Artist", {}).get("value", "")
+                    ).strip()[:200],
                 )
             )
     return infos, rejected
@@ -300,6 +334,7 @@ def fetch_category(
     sample: int | None = None,
     seed: int = 0,
     progress: Callable[[str], None] | None = None,
+    licences: frozenset[str] = DEFAULT_LICENCES,
 ) -> FetchReport:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -323,7 +358,7 @@ def fetch_category(
     if limit is not None:
         titles = titles[:limit]
 
-    infos, info_rejected = fetch_imageinfo(session, titles, width)
+    infos, info_rejected = fetch_imageinfo(session, titles, width, licences)
     rejected.extend(info_rejected)
     say(f"{len(infos)} files pass licence and size checks; downloading at {width}px")
 
@@ -356,6 +391,8 @@ def fetch_category(
         "n_files": len(report.files),
         "n_failed": report.failed,
         "n_repaired": report.repaired,
+        "licence_policy": sorted(licences),
+        "licences": dict(sorted(Counter(e["license"] for e in report.files).items())),
         "corpus_sha1": corpus_sha1([out_dir / e["filename"] for e in report.files]),
         "files": report.files,
         "rejected": rejected,
@@ -380,7 +417,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample", type=int, default=None, help="seeded random subset of N files")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-files", type=int, default=200)
+    parser.add_argument("--licences", default="pd",
+                        help="comma-separated: pd (default), cc-by, cc-by-sa; NC/ND never")
     args = parser.parse_args(argv)
+    try:
+        licences = parse_licences(args.licences)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     try:
         report = fetch_category(
@@ -392,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             sample=args.sample,
             seed=args.seed,
             progress=print,
+            licences=licences,
         )
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)

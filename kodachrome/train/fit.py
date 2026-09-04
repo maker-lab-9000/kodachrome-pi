@@ -30,6 +30,7 @@ the shipped artifact know to retrain.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import subprocess
@@ -87,8 +88,13 @@ class FitConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative, got {value}")
-        if not 0.0 <= self.strength <= 1.0:
-            raise ValueError(f"strength must be in [0, 1], got {self.strength}")
+        # partner = src + strength * (moved - src): 1 is the learned look, below
+        # blends toward identity, above EXTRAPOLATES the learned difference. The
+        # first real fit had the right shape at about a third of the amplitude
+        # people expect, so >1 is a legitimate knob. Capped at 2 because beyond
+        # that the transport's out-of-gamut clipping dominates the result.
+        if not 0.0 <= self.strength <= 2.0:
+            raise ValueError(f"strength must be in [0, 2], got {self.strength}")
 
 
 @dataclass
@@ -125,6 +131,18 @@ def fit(
         neutral_axis_cap=cfg.neutral_axis_cap,
     )
     return FitResult(lut, partner_lab.astype(np.float32), weights)
+
+
+def _corpus_licences(corpus_dir: Path) -> dict | None:
+    """What kodachrome-fetch recorded about the licences of this corpus, if anything."""
+    manifest = Path(corpus_dir) / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        m = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return None
+    return {"policy": m.get("licence_policy"), "counts": m.get("licences")}
 
 
 def _code_revision() -> str:
@@ -217,6 +235,7 @@ def train(
             "dir": str(target_dir),
             "n_images": len(target.train_paths) + len(target.val_paths),
             "corpus_sha1": target.corpus_sha1,
+            "licences": _corpus_licences(target_dir),
             "normalize": target_normalize.to_dict(),
             "n_pixels": int(len(target.train_pool.srgb)),
             "clamp_rate": target.train_pool.clamp_rate,
@@ -226,6 +245,7 @@ def train(
             "dir": str(source_dir),
             "n_images": len(source.train_paths) + len(source.val_paths),
             "corpus_sha1": source.corpus_sha1,
+            "licences": _corpus_licences(source_dir),
             "n_pixels": int(len(source.train_pool.srgb)),
             "proxy": proxy_source,
             "clamp_rate": source.train_pool.clamp_rate,
@@ -268,7 +288,8 @@ def build_parser() -> argparse.ArgumentParser:
     # duplicated here, which silently pinned the CLI to the old values when the
     # dataclass defaults changed -- every trained artifact used them.
     fd = FitConfig()
-    parser.add_argument("--strength", type=float, default=fd.strength)
+    parser.add_argument("--strength", type=float, default=fd.strength,
+                        help="0 = no change, 1 = the learned look, up to 2 exaggerates it")
     parser.add_argument("--lut-size", type=int, default=fd.lut_size)
     parser.add_argument("--iterations", type=int, default=fd.iterations)
     parser.add_argument("--hue-bins", type=int, default=fd.hue_bins)

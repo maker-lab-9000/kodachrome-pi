@@ -14,6 +14,7 @@ from kodachrome.train.fetch import (
     iter_category_members,
     licence_allowed,
     main,
+    parse_licences,
     select_titles,
     validate_image,
 )
@@ -320,3 +321,19 @@ def test_main_enforces_min_files(tmp_path, monkeypatch, capsys):
     assert main(["--out", str(tmp_path), "--category", CAT, "--min-files", "5"]) == 1
     assert "fewer than 5" in capsys.readouterr().err
     assert main(["--out", str(tmp_path), "--category", CAT, "--min-files", "2"]) == 0
+
+
+def test_licence_policy_admits_exactly_what_it_names():
+    """PD only by default; CC BY and CC BY-SA must be asked for; NC/ND never."""
+    pd = frozenset({"pd"})
+    by = frozenset({"pd", "cc-by"})
+    bysa = frozenset({"pd", "cc-by", "cc-by-sa"})
+    assert licence_allowed("Public domain") and licence_allowed("PD-USGov", pd)
+    assert not licence_allowed("CC BY 3.0") and licence_allowed("CC BY 3.0", by)
+    assert licence_allowed("Attribution", by)
+    assert not licence_allowed("CC BY-SA 4.0", by) and licence_allowed("CC BY-SA 4.0", bysa)
+    for bad in ("CC BY-NC-SA 2.0", "CC BY-ND 4.0", "GFDL 1.2", "", None):
+        assert not licence_allowed(bad, bysa), bad
+    assert parse_licences("pd, cc-by") == by
+    with pytest.raises(ValueError, match="unknown licence policy"):
+        parse_licences("pd,cc-by-nc")

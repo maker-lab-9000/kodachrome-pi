@@ -7,6 +7,7 @@ from kodachrome.artifacts import Artifacts
 from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
 from kodachrome.grain import GrainParams
 from kodachrome.imageio import save_jpeg
+from kodachrome.lut import LUT3D
 from kodachrome.train.dataset import PixelPool, SampleConfig
 from kodachrome.train.fit import FitConfig, build_parser, fit, main, train
 
@@ -86,7 +87,7 @@ def test_strength_zero_gives_an_identity_lut():
         ({"lut_size": 1}, "lut_size"),
         ({"iterations": 0}, "iterations"),
         ({"hue_bins": 0}, "hue_bins"),
-        ({"strength": 1.5}, "strength"),
+        ({"strength": 2.5}, "strength"),
         ({"lambda_smooth": -1.0}, "lambda_smooth"),
     ],
 )
@@ -225,3 +226,20 @@ def test_cli_defaults_track_fitconfig():
     for name in ("lambda_identity", "lambda_smooth", "lut_size", "iterations",
                  "hue_bins", "strength", "seed", "neutral_axis_cap"):
         assert defaults[name] == getattr(cfg, name), name
+
+
+def test_strength_above_one_extrapolates_the_learned_look():
+    """1 is the learned look; 1.4 pushes further along the same direction."""
+    with pytest.raises(ValueError, match=r"\[0, 2\]"):
+        FitConfig(strength=2.5)
+    rng = np.random.default_rng(3)
+    src = _pool(rng)
+    tgt = np.clip(oklab_to_srgb(_curve_and_rotation(srgb_to_oklab(_pool(rng)))), 0, 1)
+    tgt = tgt.astype(np.float32)
+    ident = LUT3D.identity(9).table
+    dev = {}
+    for s in (1.0, 1.4):
+        cfg = FitConfig(lut_size=9, iterations=8, strength=s)
+        lut = fit(PixelPool(src, 1), PixelPool(tgt, 1), cfg).lut
+        dev[s] = np.abs(lut.table - ident).mean()
+    assert dev[1.4] > dev[1.0] * 1.15, dev
