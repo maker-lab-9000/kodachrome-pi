@@ -70,6 +70,7 @@ class FitConfig:
     lambda_identity: float = 1.0
     strength: float = 1.0
     seed: int = 0
+    neutral_axis_cap: float = 0.01
 
     def __post_init__(self) -> None:
         if not 2 <= self.lut_size <= 65:
@@ -80,6 +81,8 @@ class FitConfig:
             raise ValueError(f"hue_bins must be positive, got {self.hue_bins}")
         if not 0.0 <= self.chroma_floor < 0.5:
             raise ValueError(f"chroma_floor must be in [0, 0.5), got {self.chroma_floor}")
+        if self.neutral_axis_cap < 0:
+            raise ValueError(f"neutral_axis_cap must be non-negative, got {self.neutral_axis_cap}")
         for name in ("lambda_smooth", "lambda_identity"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
@@ -119,6 +122,7 @@ def fit(
         n=cfg.lut_size,
         lambda_smooth=cfg.lambda_smooth,
         lambda_identity=cfg.lambda_identity,
+        neutral_axis_cap=cfg.neutral_axis_cap,
     )
     return FitResult(lut, partner_lab.astype(np.float32), weights)
 
@@ -270,6 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hue-bins", type=int, default=fd.hue_bins)
     parser.add_argument("--lambda-smooth", type=float, default=fd.lambda_smooth)
     parser.add_argument("--lambda-identity", type=float, default=fd.lambda_identity)
+    parser.add_argument("--neutral-axis-cap", type=float, default=fd.neutral_axis_cap,
+                        help="max Oklab chroma the LUT may give a neutral input; 0 = fully neutral")
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grain-strength", type=float, default=GrainParams().strength)
@@ -300,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = FitConfig(
             lut_size=args.lut_size, iterations=args.iterations, hue_bins=args.hue_bins,
             lambda_smooth=args.lambda_smooth, lambda_identity=args.lambda_identity,
+            neutral_axis_cap=args.neutral_axis_cap,
             strength=args.strength, seed=args.seed,
         )
         sample_cfg = SampleConfig(

@@ -276,3 +276,66 @@ time, not video. A second per shot is acceptable for that flow. But grain
 is the dominant cost at nearly half the budget and is the obvious place to
 look if it turns out to be too slow — it is currently the least optimised
 stage of the three.
+
+## 2026-09-04: Real captures showed the look was the scan, not the film
+
+**Evidence:** six frames from the Pi 400 and a test chart. Whites went
+0.987 → 0.847 in Oklab lightness, blacks lifted, mid grey darkened 16%,
+every colour patch lost chroma (red −19%, skin patch −33%), neutrals carried
+a blue-grey tint. Measured on 150 of the target scans as the trainer saw
+them: **the white point sat at a median 0.72 linear luminance** (p10 0.43).
+Archival scans are flat by design. The transport matched that flatness
+faithfully and the LUT learned to compress tone into the middle.
+
+**Decided, three changes, all on the training side except the exposure target:**
+
+1. **Levels normalisation for target scans** (`NormalizeParams.levels`).
+   Stretch p0.5–p99.5 of luminance to 0–1 in linear light, then a clamped
+   gamma puts the median on the exposure target without moving either end.
+   A gain cannot do that: it drags the white point again. One black point
+   and one exponent for all channels, so neutrals stay neutral. The capture
+   path refuses the flag.
+2. **Exposure target 0.18 → 0.25.** Five of six Pi shots were dimmed 10–45%
+   at 0.18; the camera's auto-exposure aims brighter than that.
+3. **Grain 0.025 → 0.010.** 0.027 RMS on a flat grey patch, about 7 levels,
+   and graded JPEGs 3–5× the originals because grain defeats compression.
+
+**Result on the same chart:** whites 0.987 → 0.973, blacks 0.101 → 0.058,
+mid grey unchanged, red −7%, green −2%, blue +3%. On the user's actual face
+(not the chart's pale patch) skin chroma rose 5% where it had fallen 11%.
+Held-out distance 0.02331 → 0.01326 before the neutral cap below.
+
+**Rejected: a per-channel black point.** Tried because dark greys came out
+olive; it made the fit *worse than identity* (0.01366 → 0.01750).
+Subtracting a different offset per channel and clipping leaves 0.5% of
+pixels at zero in one channel but not the others — saturated dark colours
+the film never produced, fed straight into the target distribution. The
+per-channel spread is still measured and reported, not corrected.
+
+## 2026-09-04: Cap the neutral-axis tint at half the gate
+
+**Decided:** `lutfit.cap_neutral_axis`, default cap 0.01 Oklab chroma,
+applied after the fit and before the monotone projection. The grey ramp's
+own tint is measured as a function of lightness, the excess over the cap is
+subtracted from every node, and the subtraction tapers to zero above chroma
+0.06 — just under skin, measured at 0.07 on a real face — so colour
+rendering is untouched.
+**Rejected:** relaxing `MAX_NEUTRAL_CHROMA` (the thresholds were agreed so
+they cannot be quietly relaxed to fit what the fit produced); zeroing the
+cast entirely.
+**Why:** the levels-normalised fit left dark greys olive at 0.036 against
+the 0.02 gate, and that cast is genuinely part of what the transport
+matched, so removing it has a price. Measured on the held-out evaluator:
+
+| cap | neutral max | held-out SWD | vs uncapped |
+|---|---|---|---|
+| none | 0.0363 | 0.01326 | — (fails gate) |
+| 0.015 | 0.0151 | 0.01350 | +1.8% |
+| **0.01** | **0.0101** | **0.01374** | **+3.6%** |
+| 0.005 | 0.0051 | 0.01412 | +6.4% |
+| 0 | 0.0007 | 0.01456 | +9.8% |
+
+At 0.01 the match is within 0.00001 of the previously shipped artifact's
+0.01375, with the tone problems gone and neutrals held below visibility.
+`--neutral-axis-cap 0` gives fully neutral greys; a larger value keeps more
+of the cast, up to the gate.

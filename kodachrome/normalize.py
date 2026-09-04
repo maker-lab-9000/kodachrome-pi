@@ -238,8 +238,17 @@ def levels_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, 
     rgb = _require_float_image(rgb, "levels_float")
     lin = srgb_to_linear(rgb)
     lum = lin @ LUMA_709
+    # ONE black point and ONE stretch for all channels, both from luminance.
+    # A per-channel black point was tried (2026-09-04) because dark greys came
+    # out olive: it made the fit worse than identity. Subtracting a different
+    # offset per channel and clipping leaves 0.5% of pixels at zero in one
+    # channel but not the others -- saturated dark colours the film never
+    # produced, seeded straight into the target distribution. The spread of
+    # the per-channel black points is still measured and recorded, so a
+    # scan with a strongly coloured base is visible in the corpus report.
     pct = np.percentile(lum, [params.levels_low_pct, params.levels_high_pct])
     lo, hi = float(pct[0]), float(pct[1])
+    lo_c = np.percentile(lin.reshape(-1, 3), params.levels_low_pct, axis=0)
     raw_stretch = 1.0 / max(hi - lo, _EPS)
     stretch = min(raw_stretch, params.levels_max_stretch)
     lin = np.clip((lin - lo) * stretch, 0.0, 1.0)
@@ -260,7 +269,8 @@ def levels_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, 
         wb=np.ones(3, dtype=np.float32),
         exposure=1.0,
         clamped={"wb": False, "exposure": False, "levels": bool(clamped)},
-        levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma},
+        levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma,
+                "black_rgb_spread": float(lo_c.max() - lo_c.min())},
     )
     return out.astype(np.float32), gains
 

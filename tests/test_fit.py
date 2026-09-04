@@ -223,5 +223,5 @@ def test_cli_defaults_track_fitconfig():
     defaults = vars(build_parser().parse_args(["--source", "x"]))
     cfg = FitConfig()
     for name in ("lambda_identity", "lambda_smooth", "lut_size", "iterations",
-                 "hue_bins", "strength", "seed"):
+                 "hue_bins", "strength", "seed", "neutral_axis_cap"):
         assert defaults[name] == getattr(cfg, name), name

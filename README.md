@@ -62,11 +62,13 @@ written but a gate failed; read the report before using it.
 |---|---|---|
 | `--strength` | 1.0 | 0 = no change, 1 = full; 0.7 for a lighter touch |
 | `--val-fraction` | 0.2 | share of images held out of training for the metrics |
-| `--lambda-smooth` | 1e-3 | raise if the ramps band or the fit looks noisy |
-| `--lambda-identity` | 1e-4 | raise if colours the camera never produced go strange |
-| `--grain-strength` | 0.025 | grain, in luminance units at mid-grey |
+| `--lambda-smooth` | 0.01 | raise if the ramps band or the fit looks noisy |
+| `--lambda-identity` | 1.0 | raise if colours the camera never produced go strange |
+| `--grain-strength` | 0.010 | grain, in luminance units at mid-grey |
 | `--proxy-source` | off | mark the source as stand-in photos |
 | `--allow-small` | off | proceed with a corpus below the recommended minimum |
+| `--no-target-levels` | off | skip the black/white-point stretch on target scans (A/B only) |
+| `--neutral-axis-cap` | 0.01 | most Oklab chroma a neutral input may gain; 0 = fully neutral greys |
 
 ### 4. Read the report
 
@@ -192,19 +194,22 @@ Kodachrome colour distribution than the originals, on images held out of
 training, by a margin larger than an identity transform and larger than the
 measurement's own noise. `artifacts/report/summary.txt` states it per fit.
 The shipped default was fit on 64 proxy-source photographs and 1,140 scans,
-and moves the held-out distance from 0.02330 to 0.01375 where the gate asks
-for 0.00161.
+and moves the held-out distance from 0.02331 to 0.01374 where the gate asks
+for 0.00158.
 
 Other limits:
 
 - The scans carry LoC's scanner and colour management, and 1940s Kodachrome
   differs from later K-14 stock. Point `--target` at your own scans to
   change the reference.
-- **Shadows lift rather than deepen.** The targets are scans of 70-year-old
-  film, digitised flat, so matching their distribution reproduces the look
-  of the scan and not of a slide on a light box. If you want Kodachrome's
-  deep blacks, that is a contrast curve applied after this, not something
-  the reference can teach.
+- **The scans are flat, and the trainer corrects for it.** The Library of
+  Congress scans put white at about 0.72 linear luminance; an early fit
+  learned that and pushed whites to 0.85. Target scans now get a
+  black/white-point stretch before training (`--no-target-levels` turns it
+  off). What remains is the film's colour, not the scanner's tone curve.
+- **Neutral greys are held near neutral.** The learned cast on greys is
+  capped at 0.01 Oklab chroma (`--neutral-axis-cap`); the film's warm
+  shadows are real but stronger than looks good on a white wall.
 - A large hue rotation is only partly recovered — roughly 5 degrees of a
   90-degree target. The damping comes from the transport and the LUT-fit
   smoothness, not from hue reweighting, which was measured and found to make

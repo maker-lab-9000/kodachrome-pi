@@ -42,6 +42,7 @@ import scipy.sparse as sp
 from scipy.optimize import isotonic_regression
 from scipy.sparse.linalg import cg
 
+from ..color import oklab_to_srgb, srgb_to_oklab
 from ..lut import LUT3D
 
 
@@ -99,6 +100,61 @@ def second_difference_operator(n: int) -> sp.csr_matrix:
     return sp.vstack(blocks).tocsr()
 
 
+# Inputs with Oklab chroma below the first value are treated as neutral and
+# fully corrected; above the second they are colour and left alone; between,
+# a smoothstep. 0.06 sits just under skin (measured 0.07 on a real face).
+NEUTRAL_TAPER = (0.03, 0.06)
+
+
+def cap_neutral_axis(
+    lut: LUT3D, cap: float, taper: tuple[float, float] = NEUTRAL_TAPER, passes: int = 4
+) -> LUT3D:
+    """Limit the tint the LUT gives a neutral input to ``cap`` Oklab chroma.
+
+    Distribution transport learns the target's cast on greys along with
+    everything else, and on the first levels-normalised fit it left dark
+    greys olive at chroma 0.036 against a 0.02 gate. Zeroing the cast
+    entirely costs about 10% of the held-out match, because that cast is
+    part of what the transport was matching. Capping it keeps a residual
+    below visibility and removes only the excess.
+
+    The grey ramp's own output tint is measured as a function of input
+    lightness, the excess over ``cap`` is subtracted from every node, and the
+    subtraction is tapered to zero for colourful input so hue rendering is
+    untouched. ``cap=0`` neutralises greys fully. Runs before
+    ``enforce_monotone`` so the ordering constraint is re-imposed last.
+
+    The correction is applied at the nodes but the ramp is read back through
+    trilinear interpolation, and Oklab-to-sRGB is not linear between nodes,
+    so one pass leaves a residual (0.006 of a 0.03 shift at 17 nodes). A few
+    passes converge; the loop stops early once the ramp is within the cap.
+    """
+    if cap < 0:
+        raise ValueError(f"cap must be non-negative, got {cap}")
+    n = lut.size
+    lab_in = srgb_to_oklab(LUT3D.identity(n).table.reshape(-1, 3)).astype(np.float64)
+    c_in = np.hypot(lab_in[:, 1], lab_in[:, 2])
+    x = np.clip((c_in - taper[0]) / (taper[1] - taper[0]), 0.0, 1.0)
+    w = 1.0 - x * x * (3.0 - 2.0 * x)
+    ramp = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    grey = np.stack([ramp, ramp, ramp], axis=1)
+    l_grey = srgb_to_oklab(grey)[:, 0].astype(np.float64)
+
+    for _ in range(passes):
+        tint = srgb_to_oklab(lut.apply_numpy(grey)).astype(np.float64)[:, 1:]
+        mag = np.hypot(tint[:, 0], tint[:, 1])
+        if mag.max() <= cap + 1e-4:
+            break
+        keep = np.where(mag > cap, cap / np.maximum(mag, 1e-12), 1.0)
+        excess = tint * (1.0 - keep)[:, None]                 # what to remove, per ramp L
+        lab_out = srgb_to_oklab(lut.table.reshape(-1, 3)).astype(np.float64)
+        lab_out[:, 1] -= w * np.interp(lab_in[:, 0], l_grey, excess[:, 0])
+        lab_out[:, 2] -= w * np.interp(lab_in[:, 0], l_grey, excess[:, 1])
+        out = np.clip(oklab_to_srgb(lab_out.astype(np.float32)), 0.0, 1.0)
+        lut = LUT3D(out.reshape(n, n, n, 3).astype(np.float32))
+    return lut
+
+
 def enforce_monotone(lut: LUT3D) -> LUT3D:
     """Project each output channel onto the monotone cone along its own axis.
 
@@ -136,6 +192,7 @@ def fit_lut(
     rtol: float = 1e-8,
     maxiter: int = 5000,
     monotone: bool = True,
+    neutral_axis_cap: float | None = 0.01,
 ) -> LUT3D:
     x = np.asarray(x_srgb, dtype=np.float64)
     y = np.clip(np.asarray(y_srgb, dtype=np.float64), 0.0, 1.0)
@@ -163,4 +220,6 @@ def fit_lut(
             )
         table[:, c] = sol
     lut = LUT3D(np.clip(table, 0.0, 1.0).reshape(n, n, n, 3).astype(np.float32))
+    if neutral_axis_cap is not None:
+        lut = cap_neutral_axis(lut, neutral_axis_cap)
     return enforce_monotone(lut) if monotone else lut

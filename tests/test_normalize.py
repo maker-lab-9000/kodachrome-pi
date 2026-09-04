@@ -266,3 +266,17 @@ def test_capture_path_refuses_levels():
     img = (_gradient_image() * 255).round().astype(np.uint8)
     with pytest.raises(ValueError, match="levels"):
         normalize_u8(img, NormalizeParams(white_balance=False, levels=True))
+
+
+def test_levels_reports_how_coloured_the_scan_black_is_without_correcting_it():
+    """A per-channel black point was tried and made the fit worse than identity
+    (see normalize.py). The spread is still reported so a coloured base shows
+    up in the corpus report; the darkest tones keep their colour."""
+    p = NormalizeParams(white_balance=False, levels=True)
+    ramp = np.linspace(0.0, 0.6, 64 * 64, dtype=np.float32).reshape(64, 64)
+    lin = np.stack([ramp + 0.010, ramp + 0.012, ramp + 0.030], axis=-1)   # blue-black base
+    out, gains = normalize_float(color.linear_to_srgb(lin).astype(np.float32), p)
+    assert gains.levels["black_rgb_spread"] == pytest.approx(0.020, abs=0.003)
+    o = color.srgb_to_linear(out).reshape(-1, 3)
+    dark = o[np.argsort(o @ np.array([0.2126, 0.7152, 0.0722]))[200:260]]
+    assert dark[:, 2].mean() > dark[:, 0].mean(), "the shared black point must keep the base colour"

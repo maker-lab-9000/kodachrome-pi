@@ -8064,3 +8064,19 @@ Task 21's step 2 candidate list was also corrected: the usable proxy
 category is `Category:Photographs by the U.S. Department of Agriculture`
 (4,092 files), not the spelled-out "United States" form, which does not
 exist.
+
+### Addendum 2 (2026-09-04, after the first captures from the Pi)
+
+4. **`NormalizeParams.levels`** — target scans get a black/white-point
+   stretch plus a clamped gamma to the exposure median. Training only;
+   `normalize_u8` refuses it. Default on via `fit.train(target_levels=True)`,
+   `--no-target-levels` to disable.
+5. **`lutfit.cap_neutral_axis`** — the LUT's tint on neutral input is capped
+   (default 0.01 Oklab chroma, `FitConfig.neutral_axis_cap`,
+   `--neutral-axis-cap`), applied before `enforce_monotone`.
+6. **Defaults:** `exposure_target_median` 0.18 → 0.25;
+   `GrainParams.strength` 0.025 → 0.010; the CLI's `--grain-strength`
+   default now derives from `GrainParams`.
+
+A per-channel black point in levels was tried and reverted (worse than
+identity). See `docs/decisions.md`.

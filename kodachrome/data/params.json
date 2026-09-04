@@ -1,16 +1,22 @@
 {
   "version": 2,
   "lut_file": "kodachrome.cube",
-  "lut_sha1": "3dfa46cafffeae21a7918a8673798116c6aa538c",
+  "lut_sha1": "1e1d6855a0a5e2acfc528bb706895a8e2b88287d",
   "normalize": {
     "white_balance": true,
     "wb_gain_min": 0.6,
     "wb_gain_max": 1.6,
-    "exposure_target_median": 0.18,
+    "exposure_target_median": 0.25,
     "exposure_gain_min": 0.5,
     "exposure_gain_max": 3.0,
     "stats_lum_min": 0.02,
-    "stats_lum_max": 0.9
+    "stats_lum_max": 0.9,
+    "levels": false,
+    "levels_low_pct": 0.5,
+    "levels_high_pct": 99.5,
+    "levels_max_stretch": 4.0,
+    "levels_gamma_min": 0.5,
+    "levels_gamma_max": 2.0
   },
   "grain": {
     "strength": 0.01,
@@ -18,8 +24,8 @@
     "enabled": true
   },
   "training": {
-    "date": "2026-09-04T03:28:58Z",
-    "code_revision": "5e2d44b",
+    "date": "2026-09-04T10:31:10Z",
+    "code_revision": "d4345d9",
     "package_version": "0.1.0",
     "dependency_versions": {
       "numpy": "2.5.2",
@@ -32,8 +38,24 @@
       "dir": "data/kodachrome",
       "n_images": 1193,
       "corpus_sha1": "933dbe386ae4058c775421f980add55ab42cf957",
+      "normalize": {
+        "white_balance": false,
+        "wb_gain_min": 0.6,
+        "wb_gain_max": 1.6,
+        "exposure_target_median": 0.25,
+        "exposure_gain_min": 0.5,
+        "exposure_gain_max": 3.0,
+        "stats_lum_min": 0.02,
+        "stats_lum_max": 0.9,
+        "levels": true,
+        "levels_low_pct": 0.5,
+        "levels_high_pct": 99.5,
+        "levels_max_stretch": 4.0,
+        "levels_gamma_min": 0.5,
+        "levels_gamma_max": 2.0
+      },
       "n_pixels": 400000,
-      "clamp_rate": 0.1539,
+      "clamp_rate": 0.0984,
       "profiles": {
         "sRGB (assumed)": 912,
         "Display P3": 1,
@@ -51,7 +73,7 @@
       "corpus_sha1": "b328b37e0af528b4a50ae37b78d30791429612ed",
       "n_pixels": 156000,
       "proxy": true,
-      "clamp_rate": 0.2308,
+      "clamp_rate": 0.2885,
       "profiles": {
         "Adobe RGB (1998)": 19,
         "c2": 19,
@@ -74,7 +96,8 @@
       "lambda_identity": 1.0,
       "strength": 1.0,
       "seed": 0,
-      "fit_seconds": 14.6
+      "neutral_axis_cap": 0.01,
+      "fit_seconds": 19.9
     },
     "sample": {
       "crop_frac": 0.06,
@@ -87,18 +110,18 @@
       "seed": 0
     },
     "metrics": {
-      "swd_before": 0.023298,
-      "swd_after": 0.013749,
-      "swd_identity": 0.023298,
-      "swd_seed_spread": 0.000535,
-      "train_swd_before": 0.015748,
-      "train_swd_after": 0.003258,
-      "transport_gamut_clip_deltaE": 0.000398,
-      "lut_fit_rms_deltaE": 0.011165,
+      "swd_before": 0.023311,
+      "swd_after": 0.013738,
+      "swd_identity": 0.023311,
+      "swd_seed_spread": 0.000441,
+      "train_swd_before": 0.018931,
+      "train_swd_after": 0.006293,
+      "transport_gamut_clip_deltaE": 0.001501,
+      "lut_fit_rms_deltaE": 0.016765,
       "grey_axis_monotone": true,
       "channel_monotone": true,
-      "neutral_axis_max_chroma": 0.01862,
-      "clipped_volume_fraction": 0.0,
+      "neutral_axis_max_chroma": 0.010081,
+      "clipped_volume_fraction": 0.000537,
       "n_val_source_pixels": 36000,
       "n_val_target_pixels": 400000,
       "held_out_eval": true

@@ -2,8 +2,9 @@ import numpy as np
 import pytest
 
 from kodachrome.lut import LUT3D
-from kodachrome.train.evaluate import channels_are_monotone
+from kodachrome.train.evaluate import channels_are_monotone, neutral_axis_max_chroma
 from kodachrome.train.lutfit import (
+    cap_neutral_axis,
     enforce_monotone,
     fit_lut,
     node_index,
@@ -155,3 +156,52 @@ def test_fit_lut_returns_a_monotone_lut_by_default():
     y[:, 0] = 1.0 - y[:, 0]
     assert not channels_are_monotone(fit_lut(x, y, n=9, monotone=False))
     assert channels_are_monotone(fit_lut(x, y, n=9))
+
+
+def _tinted_lut(n=17, a=0.0, b=0.03):
+    """Identity with a uniform Oklab shift: every input, grey or not, gains (a, b)."""
+    from kodachrome.color import oklab_to_srgb, srgb_to_oklab
+    lab = srgb_to_oklab(LUT3D.identity(n).table.reshape(-1, 3))
+    lab[:, 1] += a
+    lab[:, 2] += b
+    return LUT3D(np.clip(oklab_to_srgb(lab), 0, 1).reshape(n, n, n, 3).astype(np.float32))
+
+
+def test_cap_neutral_axis_limits_grey_tint_and_leaves_colour_alone():
+    """Dark greys came out olive at 0.036 on the first levels fit; the gate is 0.02.
+
+    A uniform +0.03 b-shift is well over a 0.01 cap on the grey ramp. After
+    capping, greys carry at most the cap and a saturated red node is
+    unchanged, because the correction tapers to zero for colourful input.
+    """
+    from kodachrome.color import srgb_to_oklab
+    lut = _tinted_lut()
+    assert neutral_axis_max_chroma(lut) > 0.025
+    capped = cap_neutral_axis(lut, 0.01)
+    assert neutral_axis_max_chroma(capped) <= 0.0105
+    red = np.array([[0.9, 0.1, 0.1]], dtype=np.float32)
+    assert np.allclose(capped.apply_numpy(red), lut.apply_numpy(red), atol=1e-6)
+    # And a mid grey now carries no more than the cap, in the same hue direction.
+    grey_lab = srgb_to_oklab(capped.apply_numpy(np.array([[0.5, 0.5, 0.5]], dtype=np.float32)))
+    assert np.hypot(grey_lab[0, 1], grey_lab[0, 2]) <= 0.0105
+
+
+def test_cap_neutral_axis_zero_neutralises_and_none_is_a_no_op():
+    """cap=0 drives the grey ramp toward neutral; the floor is the grid.
+
+    The correction lands on nodes and the ramp is read back by trilinear
+    interpolation, so a coarse grid keeps a residual (measured 0.0041 at 17
+    nodes, 0.0007 at 33, for a uniform 0.03 shift). Production is 33.
+    """
+    assert neutral_axis_max_chroma(cap_neutral_axis(_tinted_lut(n=17), 0.0)) < 0.006
+    assert neutral_axis_max_chroma(cap_neutral_axis(_tinted_lut(n=33), 0.0)) < 0.0025
+    lut = _tinted_lut()
+    with pytest.raises(ValueError, match="non-negative"):
+        cap_neutral_axis(lut, -0.1)
+    rng = np.random.default_rng(0)
+    x = rng.random((3000, 3)).astype(np.float32)
+    y = np.clip(x * np.array([1.05, 1.0, 0.9], dtype=np.float32), 0, 1)   # a warm cast
+    uncapped = fit_lut(x, y, n=9, neutral_axis_cap=None)
+    default = fit_lut(x, y, n=9)
+    assert neutral_axis_max_chroma(uncapped) > 0.012
+    assert neutral_axis_max_chroma(default) <= 0.0105 + 1e-3     # monotone runs after the cap
