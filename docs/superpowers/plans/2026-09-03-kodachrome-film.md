@@ -6210,6 +6210,28 @@ def test_evaluate_returns_the_documented_metric_block():
     assert metrics["swd_identity"] == pytest.approx(metrics["swd_before"], abs=1e-6)
 
 
+def test_a_missing_seed_spread_is_an_error_not_a_free_pass():
+    """Omitting the noise floor must not quietly switch the gate off.
+
+    With `.get(..., 0.0)` the margin becomes 0, so an improvement of 0.0001 —
+    pure sampling noise — passes. Measured before this was tightened.
+    """
+    metrics = {
+        "swd_before": 0.10,
+        "swd_after": 0.0999,
+        "grey_axis_monotone": True,
+        "channel_monotone": True,
+        "neutral_axis_max_chroma": 0.005,
+        "clipped_volume_fraction": 0.01,
+    }
+    with pytest.raises(KeyError, match="swd_seed_spread"):
+        check_gates(metrics)
+
+    # Present and honest: the same marginal improvement is refused.
+    failed = [g.name for g in check_gates({**metrics, "swd_seed_spread": 0.001}) if not g.passed]
+    assert failed == ["improvement_exceeds_noise"]
+
+
 def test_gates_pass_and_fail_explicitly():
     good = {
         "swd_before": 0.10, "swd_after": 0.04, "swd_seed_spread": 0.001,
@@ -6454,7 +6476,11 @@ class Gate:
 
 def check_gates(metrics: dict) -> list[Gate]:
     """The numeric bar an artifact must clear, fixed before tuning."""
-    margin = NOISE_MARGIN * float(metrics.get("swd_seed_spread", 0.0))
+    # Strict indexing, like every other key here. Defaulting a missing spread to
+    # 0.0 would set the margin to 0 and turn this gate into "any improvement
+    # above zero passes" — silently disabling the one check that distinguishes
+    # a real grade from sampling noise, which is the reason the gate exists.
+    margin = NOISE_MARGIN * float(metrics["swd_seed_spread"])
     improvement = float(metrics["swd_before"]) - float(metrics["swd_after"])
     gates = [
         Gate(
