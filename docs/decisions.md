@@ -339,3 +339,57 @@ At 0.01 the match is within 0.00001 of the previously shipped artifact's
 0.01375, with the tone problems gone and neutrals held below visibility.
 `--neutral-axis-cap 0` gives fully neutral greys; a larger value keeps more
 of the cast, up to the gate.
+
+## 2026-09-04: The camera already out-saturates Kodachrome scans
+
+**Measured** (colours with Oklab chroma above 0.06, all corpora through the
+trainer's own normalisation): the U20CAM proxy source renders reds at 0.120
+and greens at 0.103; the LoC 1940s scans 0.101 and 0.077; the K-14 era
+scans 0.106 and 0.101. Overall colour chroma: source 0.090, LoC 0.083,
+K-14 0.098. Modern ISPs push reds and greens hard; slide scans do not.
+
+**Consequence:** an honest distribution match from this camera to any
+Kodachrome scan lands near neutral or slightly desaturating on colours.
+The first real fit's "subtlety" (colours −3%, deep reds +11%, greens −6 to
+−10%) was the method working, not failing. The "Kodachrome look" in
+popular memory is a palette — blue skies, muted greens, warm skin — plus
+the density of a slide on a light table, which no scan carries.
+
+## 2026-09-04: Reference changed to K-14 era slides, strength 1.4
+
+**Decided:** the shipped default is trained on
+`Category:Photographs taken on Kodachrome film` (835 files: 107 public
+domain, 202 CC BY, 532 CC BY-SA; mostly 1970s–1990s slides, the K-14
+process) at `--strength 1.4`. The LoC FSA corpus remains the tool's
+default and the public-domain route.
+**Rejected:** staying on LoC; LoC at 1.4; K-14 at 1.0.
+**Why:** four candidates were measured identically on the user's own eight
+Pi captures. All pass every gate. Against ungraded, effect sizes were LoC
+0.031, LoC×1.4 0.035, K-14 0.034, K-14×1.4 0.041 Oklab; between any two
+candidates the difference is 0.009–0.023, so the choice is close and was
+made on character and era rather than on a decisive number. K-14 holds
+skies and cyans (+2%) where LoC cut them (−7%), mutes greens half as much,
+drives blacks to zero, and adds 5–7% contrast. Strength 1.4 extrapolates
+the learned direction by 40% at no gate cost; above 1 the transport's
+clipping starts to dominate, so the cap is 2.
+
+**Licence.** CC BY and CC BY-SA must be asked for (`--licences`), the
+policy and per-licence counts are in the artifact's provenance, and
+`docs/reference-attribution.md` lists every file with author and licence.
+A LUT reuses no pixels; attribution is provided anyway because it costs a
+file and settles the question.
+
+## 2026-09-04: Fetcher double-listed files reachable through two categories
+
+**Found:** the K-14 manifest claimed 835 files while 756 JPEGs were on
+disk; the LoC manifest 1,140 against 1,133. First diagnosed as filename
+collisions overwriting each other. That was wrong, and the correction came
+from the guard written for it: the "colliding" names carried the same
+Commons page id, so they were the *same file*, reached once through the
+category and again through a subcategory. Nothing was lost; files were
+listed, counted, and hashed into `corpus_sha1` twice.
+**Fixed:** category traversal now skips a file title it has already seen;
+a guard refuses to proceed if selected filenames still collide; non-LCCN
+filenames carry the page id so genuinely different files with the same
+stem cannot share one either. The earlier commit message that said
+"79 files were lost" is superseded by this entry.

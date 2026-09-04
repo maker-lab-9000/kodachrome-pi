@@ -174,6 +174,13 @@ def iter_category_members(
         data = api_get(session, params)
         for member in data.get("query", {}).get("categorymembers", []):
             if member["ns"] == 6:
+                # A file in both a category and one of its subcategories is
+                # reached twice. Before this check it was listed twice, hashed
+                # twice into corpus_sha1, and counted twice: 79 of "835" K-14
+                # files and 7 of "1,140" LoC files were the same file again.
+                if member["title"] in seen:
+                    continue
+                seen.add(member["title"])
                 yield member
             elif member["ns"] == 14 and recurse:
                 yield from iter_category_members(session, member["title"], recurse, seen)
@@ -418,6 +425,35 @@ def fetch_category(
     return report
 
 
+def write_attribution(manifest_path: str | Path, out_path: str | Path) -> int:
+    """Write a Markdown attribution list from a fetch manifest; returns the file count.
+
+    CC BY and CC BY-SA ask for attribution when a work is reused. A fitted
+    LUT reuses no pixels, but the honest position is to make attribution
+    trivial rather than argue it is unnecessary, and the manifest lives in a
+    git-ignored data directory. This file is meant to be committed.
+    """
+    m = json.loads(Path(manifest_path).read_text())
+    files = sorted(m["files"], key=lambda e: e["title"].lower())
+    lines = [
+        f"# Reference corpus attribution: {m['category']}",
+        "",
+        f"Fetched {m['fetched_at']} from Wikimedia Commons, licence policy "
+        f"`{', '.join(m.get('licence_policy', ['pd']))}`. {len(files)} files. "
+        "Each line is title, author as recorded by Commons, licence, and the file page.",
+        "",
+        "| # | title | author | licence |",
+        "|---|---|---|---|",
+    ]
+    for i, e in enumerate(files, 1):
+        title = e["title"].removeprefix("File:")
+        page = "https://commons.wikimedia.org/wiki/" + e["title"].replace(" ", "_")
+        author = (e.get("artist") or "unknown").replace("|", "/")
+        lines.append(f"| {i} | [{title.replace('|', '/')}]({page}) | {author} | {e['license']} |")
+    Path(out_path).write_text("\n".join(lines) + "\n")
+    return len(files)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kodachrome-fetch",
@@ -430,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample", type=int, default=None, help="seeded random subset of N files")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-files", type=int, default=200)
+    parser.add_argument("--attribution", type=Path, default=None,
+                        help="also write a Markdown attribution list of every accepted file")
     parser.add_argument("--licences", default="pd",
                         help="comma-separated: pd (default), cc-by, cc-by-sa; NC/ND never")
     args = parser.parse_args(argv)
@@ -454,6 +492,9 @@ def main(argv: list[str] | None = None) -> int:
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.attribution is not None:
+        n = write_attribution(args.out / "manifest.json", args.attribution)
+        print(f"attribution for {n} files written to {args.attribution}")
     if len(report.files) < args.min_files:
         print(
             f"error: accepted {len(report.files)} files, fewer than {args.min_files}. "

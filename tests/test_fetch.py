@@ -17,6 +17,7 @@ from kodachrome.train.fetch import (
     parse_licences,
     select_titles,
     validate_image,
+    write_attribution,
 )
 
 CAT = "Category:Test"
@@ -350,3 +351,36 @@ def test_filenames_are_unique_even_when_title_stems_collide():
     assert a.filename.endswith("_111.jpg") and b.filename.endswith("_222.jpg")
     lccn = info("File:Whatever LCCN2017877392.tif", 333, "2017877392")
     assert lccn.filename == "2017877392.jpg"
+
+
+def test_write_attribution_lists_every_file_with_author_and_licence(tmp_path):
+    manifest = {
+        "category": "Category:Test", "fetched_at": "2026-09-04T00:00:00Z",
+        "licence_policy": ["cc-by", "pd"],
+        "files": [
+            {"title": "File:Zebra 1981.jpg", "artist": "A. Person", "license": "CC BY-SA 4.0"},
+            {"title": "File:Alpha | pipe.jpg", "artist": "", "license": "Public domain"},
+        ],
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    n = write_attribution(tmp_path / "manifest.json", tmp_path / "ATTRIBUTION.md")
+    text = (tmp_path / "ATTRIBUTION.md").read_text()
+    assert n == 2
+    assert "A. Person" in text and "CC BY-SA 4.0" in text and "unknown" in text
+    assert text.index("Alpha") < text.index("Zebra"), "sorted by title"
+    assert "commons.wikimedia.org/wiki/File:Zebra_1981.jpg" in text
+    assert "Alpha / pipe" in text, "a pipe in a title must not break the table"
+
+
+def test_a_file_reachable_through_two_categories_is_listed_once(monkeypatch):
+    """Parent lists A and subcat S; S lists A and B. A must appear once."""
+    tree = {
+        "Category:P": [{"ns": 6, "title": "File:A.jpg"}, {"ns": 14, "title": "Category:S"}],
+        "Category:S": [{"ns": 6, "title": "File:A.jpg"}, {"ns": 6, "title": "File:B.jpg"}],
+    }
+    monkeypatch.setattr(
+        "kodachrome.train.fetch.api_get",
+        lambda session, params: {"query": {"categorymembers": tree[params["cmtitle"]]}},
+    )
+    titles = [m["title"] for m in iter_category_members(None, "Category:P")]
+    assert titles == ["File:A.jpg", "File:B.jpg"]
