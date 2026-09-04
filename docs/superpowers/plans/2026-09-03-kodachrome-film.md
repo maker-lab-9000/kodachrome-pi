@@ -2893,7 +2893,7 @@ class FakeCapture:
         set_convert_fails=False,
         set_raises=False,
         mutate_then_raise=False,
-        raise_on_restore=False,
+        restore_behaviour="ok",
         buffer_ndim=1,
         grab_consumes=False,
         props=None,
@@ -2903,7 +2903,7 @@ class FakeCapture:
         self.set_convert_fails = set_convert_fails
         self.set_raises = set_raises
         self.mutate_then_raise = mutate_then_raise
-        self.raise_on_restore = raise_on_restore
+        self.restore_behaviour = restore_behaviour
         self.buffer_ndim = buffer_ndim
         self.grab_consumes = grab_consumes
         self.props = props or {
@@ -2932,8 +2932,11 @@ class FakeCapture:
         """
         self.requested.append((prop, val))
         if prop == cv2.CAP_PROP_CONVERT_RGB:
-            if self.raise_on_restore and val == 1 and self.convert_rgb == 0:
-                raise cv2.error("driver refused to leave raw mode")
+            if val == 1 and self.convert_rgb == 0:
+                if self.restore_behaviour == "raise":
+                    raise cv2.error("driver refused to leave raw mode")
+                if self.restore_behaviour == "false":
+                    return False
             if self.mutate_then_raise:
                 self.convert_rgb = val
                 raise cv2.error("device rejected the mode after applying it")
@@ -3086,21 +3089,46 @@ def test_a_two_dimensional_raw_buffer_is_accepted(fake_capture):
     assert cap is not None
 
 
-def test_a_raising_restore_during_fallback_does_not_kill_the_session(fake_capture):
-    """The fallback exists to keep the session alive; it must not end it."""
+@pytest.mark.parametrize("restore", ["raise", "false"], ids=["raises", "returns-false"])
+def test_a_device_that_will_not_leave_raw_mode_fails_honestly(fake_capture, restore, capsys):
+    """Refusing the restore must not produce frames the session cannot trust.
+
+    If the device keeps sending compressed buffers, claiming decoded mode
+    would send them through ``cvtColor`` as BGR and yield silent garbage. The
+    session must stay in raw mode and fail loudly instead.
+    """
     good = _jpeg_bytes(synthetic_frame(48, 64))
+    bad = good[:-2]
     cap = fake_capture(
-        buffers=[good, good, good[:-2]],
+        buffers=[good, good, bad, bad, bad, bad],
         decoded=np.zeros((48, 64, 3), np.uint8),
-        raise_on_restore=True,
+        restore_behaviour=restore,
     )
     cam = V4L2Camera(device=0, warmup_frames=0)
     assert cam.read().source == "raw-mjpeg"
 
-    frame = cam.read()  # truncated buffer triggers the fallback, whose restore raises
+    with pytest.raises(CameraError, match="3 attempts"):
+        cam.read()
+
+    assert cam.stream_info.raw_mjpeg is True, "the mode must not change if the device refused"
+    assert cap.convert_rgb == 0
+    assert "refused to leave raw mode" in capsys.readouterr().out
+
+
+def test_a_successful_restore_does_fall_back_to_decoded(fake_capture):
+    """The ordinary case: the device complies, so the session degrades cleanly."""
+    good = _jpeg_bytes(synthetic_frame(48, 64))
+    fake_capture(
+        buffers=[good, good, good[:-2], good],
+        decoded=np.zeros((48, 64, 3), np.uint8),
+    )
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.read().source == "raw-mjpeg"
+
+    frame = cam.read()
     assert frame.source == "decoded"
+    assert frame.jpeg is None
     assert cam.stream_info.raw_mjpeg is False
-    assert cap.convert_rgb == 0, "the fake refused the restore, as the scenario intends"
 
 
 def test_read_raises_after_three_failed_attempts(fake_capture):
@@ -3367,6 +3395,7 @@ class V4L2Camera:
         self._raw = self._enable_raw_mode() if prefer_raw else False
         self.stream_info = self._negotiated(width, height, fps)
         self._warned_fallback = False
+        self._warned_stuck = False
         for _ in range(warmup_frames):
             self.cap.read()
 
@@ -3426,24 +3455,48 @@ class V4L2Camera:
             if not self.cap.grab():
                 break
 
-    def _fallback_to_decoded(self, reason: str) -> None:
-        """Degrade to decoded frames. Must not itself be able to end the session.
+    def _fallback_to_decoded(self, reason: str) -> bool:
+        """Try to leave raw mode. Only claim success if the device complied.
 
-        The restore is guarded for the same reason ``_enable_raw_mode``'s is: a
-        driver that raises here would propagate the error out of ``read`` and
-        kill the capture session, which is precisely what this fallback exists
-        to prevent. Verified by simulation before the guard was added — a
-        ``cv2.error`` from this line escaped ``read`` uncaught.
+        Two failures are guarded here, and the second is subtler than it
+        looks. Raising must not escape, or the error would propagate out of
+        ``read`` and end the session this fallback exists to preserve.
+
+        But swallowing the error is not enough either. If the device refuses
+        to leave raw mode, it keeps sending compressed buffers — so declaring
+        decoded mode anyway would send the next frame down the decoded branch,
+        where ``cvtColor`` reads a JPEG buffer as though it were a BGR image.
+        Measured: that returns a plausible ``(1, 504, 3)`` array rather than
+        raising, so the session would serve silent garbage. That is the same
+        belief-versus-reality split this class already guards against in
+        ``_enable_raw_mode``.
+
+        So the mode only changes when the device actually changed. If it did
+        not, the session stays in raw mode and keeps validating buffers; a
+        genuinely broken stream then exhausts ``read``'s retry budget and
+        fails loudly, which is the honest outcome. A single bad buffer does
+        not permanently downgrade a camera that cannot be downgraded.
         """
+        try:
+            left_raw_mode = bool(self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1))
+        except cv2.error:
+            left_raw_mode = False
+
+        if not left_raw_mode:
+            if not self._warned_stuck:
+                print(
+                    f"warning: {reason}, and the device refused to leave raw mode; "
+                    "continuing to validate raw buffers"
+                )
+                self._warned_stuck = True
+            return False
+
         if not self._warned_fallback:
             print(f"warning: {reason}; falling back to decoded frames (_ungraded.jpg)")
             self._warned_fallback = True
         self._raw = False
         self.stream_info.raw_mjpeg = False
-        try:
-            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-        except cv2.error:
-            pass
+        return True
 
     def read(self) -> Frame:
         for _ in range(3):
