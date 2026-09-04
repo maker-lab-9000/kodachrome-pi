@@ -18,6 +18,13 @@ from kodachrome.capture.camera import (
 )
 
 
+def _tagged_frame(index):
+    """A synthetic frame with a unique first pixel, so frames are distinguishable."""
+    frame = synthetic_frame(48, 64).copy()
+    frame[0, 0] = (index, index, index)
+    return frame
+
+
 def _jpeg_bytes(rgb):
     buf = io.BytesIO()
     Image.fromarray(rgb).save(buf, "JPEG", quality=95)
@@ -96,11 +103,13 @@ class FakeCapture:
     executed by any test: a build where raw mode silently never engaged would
     pass the whole suite, and that logic is the project's headline promise.
 
-    Two things to know when writing tests against it. Constructing a
+    Three things to know when writing tests against it. Constructing a
     ``V4L2Camera`` consumes one buffer, because ``_enable_raw_mode`` reads a
     frame to verify the mode really works — so a queue must include that
     verification frame before the ones a test intends ``read()`` to return.
-    And format properties are reported, not stored (see ``set``).
+    Format properties are reported, not stored (see ``set``). And ``grab``
+    consumes only when a test passes ``grab_consumes=True``, so that buffer
+    counts stay independent of ``_drain``'s internal grab limit.
     """
 
     def __init__(
@@ -111,6 +120,9 @@ class FakeCapture:
         set_convert_fails=False,
         set_raises=False,
         mutate_then_raise=False,
+        restore_behaviour="ok",
+        buffer_ndim=1,
+        grab_consumes=False,
         props=None,
     ):
         self.buffers = list(buffers or [])
@@ -118,6 +130,9 @@ class FakeCapture:
         self.set_convert_fails = set_convert_fails
         self.set_raises = set_raises
         self.mutate_then_raise = mutate_then_raise
+        self.restore_behaviour = restore_behaviour
+        self.buffer_ndim = buffer_ndim
+        self.grab_consumes = grab_consumes
         self.props = props or {
             cv2.CAP_PROP_FRAME_WIDTH: 1920,
             cv2.CAP_PROP_FRAME_HEIGHT: 1080,
@@ -127,6 +142,7 @@ class FakeCapture:
         self.convert_rgb = 1
         self.released = False
         self.requested = []
+        self.grabs = 0
 
     def isOpened(self):
         return True
@@ -143,6 +159,11 @@ class FakeCapture:
         """
         self.requested.append((prop, val))
         if prop == cv2.CAP_PROP_CONVERT_RGB:
+            if val == 1 and self.convert_rgb == 0:
+                if self.restore_behaviour == "raise":
+                    raise cv2.error("driver refused to leave raw mode")
+                if self.restore_behaviour == "false":
+                    return False
             if self.mutate_then_raise:
                 self.convert_rgb = val
                 raise cv2.error("device rejected the mode after applying it")
@@ -160,10 +181,27 @@ class FakeCapture:
         if self.convert_rgb == 0:
             if not self.buffers:
                 return False, None
-            return True, np.frombuffer(self.buffers.pop(0), np.uint8)
+            buf = np.frombuffer(self.buffers.pop(0), np.uint8)
+            return True, buf.reshape(1, -1) if self.buffer_ndim == 2 else buf
         return True, self.decoded
 
     def grab(self):
+        """Count every grab; consume a buffer only when a test asks it to.
+
+        An unconditional ``True`` that consumes nothing makes ``_drain``
+        untestable — a drain that grabbed the wrong number of frames, or was
+        deleted outright, would still pass. But consuming unconditionally
+        couples every fixture's buffer count to the literal ``4`` inside
+        ``_drain``: change that constant and unrelated tests fail for reasons
+        they do not assert on. So consumption is opt-in, and exactly one test
+        opts in to verify the drain.
+        """
+        self.grabs += 1
+        if not self.grab_consumes:
+            return True
+        if not self.buffers:
+            return False
+        self.buffers.pop(0)
         return True
 
     def release(self):
@@ -253,6 +291,71 @@ def test_negotiation_mismatch_warns_but_does_not_abort(fake_capture, capsys):
     assert cam.stream_info.width == 1280 and cam.stream_info.fps == 15.0
     assert cam.read().rgb.shape == (720, 1280, 3)
     assert cap is not None
+
+
+def test_read_returns_the_newest_frame_not_a_stale_queued_one(fake_capture):
+    """`_drain` must discard queued frames, or the preview lags behind reality."""
+    buffers = [_jpeg_bytes(_tagged_frame(i)) for i in range(6)]
+    cap = fake_capture(buffers=list(buffers), grab_consumes=True)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+
+    frame = cam.read()
+    assert cap.grabs == 4, "the drain loop should grab up to four queued frames"
+    # Index 0 is eaten by the constructor's verification read, 1-4 by the drain,
+    # so a correct drain leaves index 5. Without the drain this would be index 1.
+    assert frame.jpeg == buffers[5], "read returned a stale frame instead of the newest"
+
+
+def test_a_two_dimensional_raw_buffer_is_accepted(fake_capture):
+    """Real V4L2 backends can hand back a 2-D buffer; 1-D is not the only shape."""
+    data = _jpeg_bytes(synthetic_frame(48, 64))
+    cap = fake_capture(buffers=[data] * 4, buffer_ndim=2)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.stream_info.raw_mjpeg is True
+    assert cam.read().jpeg == data
+    assert cap is not None
+
+
+@pytest.mark.parametrize("restore", ["raise", "false"], ids=["raises", "returns-false"])
+def test_a_device_that_will_not_leave_raw_mode_fails_honestly(fake_capture, restore, capsys):
+    """Refusing the restore must not produce frames the session cannot trust.
+
+    If the device keeps sending compressed buffers, claiming decoded mode
+    would send them through ``cvtColor`` as BGR and yield silent garbage. The
+    session must stay in raw mode and fail loudly instead.
+    """
+    good = _jpeg_bytes(synthetic_frame(48, 64))
+    bad = good[:-2]
+    cap = fake_capture(
+        buffers=[good, good, bad, bad, bad, bad],
+        decoded=np.zeros((48, 64, 3), np.uint8),
+        restore_behaviour=restore,
+    )
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.read().source == "raw-mjpeg"
+
+    with pytest.raises(CameraError, match="3 attempts"):
+        cam.read()
+
+    assert cam.stream_info.raw_mjpeg is True, "the mode must not change if the device refused"
+    assert cap.convert_rgb == 0
+    assert "refused to leave raw mode" in capsys.readouterr().out
+
+
+def test_a_successful_restore_does_fall_back_to_decoded(fake_capture):
+    """The ordinary case: the device complies, so the session degrades cleanly."""
+    good = _jpeg_bytes(synthetic_frame(48, 64))
+    fake_capture(
+        buffers=[good, good, good[:-2], good],
+        decoded=np.zeros((48, 64, 3), np.uint8),
+    )
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert cam.read().source == "raw-mjpeg"
+
+    frame = cam.read()
+    assert frame.source == "decoded"
+    assert frame.jpeg is None
+    assert cam.stream_info.raw_mjpeg is False
 
 
 def test_read_raises_after_three_failed_attempts(fake_capture):

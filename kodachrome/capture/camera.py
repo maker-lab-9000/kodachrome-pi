@@ -223,6 +223,7 @@ class V4L2Camera:
         self._raw = self._enable_raw_mode() if prefer_raw else False
         self.stream_info = self._negotiated(width, height, fps)
         self._warned_fallback = False
+        self._warned_stuck = False
         for _ in range(warmup_frames):
             self.cap.read()
 
@@ -282,13 +283,48 @@ class V4L2Camera:
             if not self.cap.grab():
                 break
 
-    def _fallback_to_decoded(self, reason: str) -> None:
+    def _fallback_to_decoded(self, reason: str) -> bool:
+        """Try to leave raw mode. Only claim success if the device complied.
+
+        Two failures are guarded here, and the second is subtler than it
+        looks. Raising must not escape, or the error would propagate out of
+        ``read`` and end the session this fallback exists to preserve.
+
+        But swallowing the error is not enough either. If the device refuses
+        to leave raw mode, it keeps sending compressed buffers — so declaring
+        decoded mode anyway would send the next frame down the decoded branch,
+        where ``cvtColor`` reads a JPEG buffer as though it were a BGR image.
+        Measured: that returns a plausible ``(1, 504, 3)`` array rather than
+        raising, so the session would serve silent garbage. That is the same
+        belief-versus-reality split this class already guards against in
+        ``_enable_raw_mode``.
+
+        So the mode only changes when the device actually changed. If it did
+        not, the session stays in raw mode and keeps validating buffers; a
+        genuinely broken stream then exhausts ``read``'s retry budget and
+        fails loudly, which is the honest outcome. A single bad buffer does
+        not permanently downgrade a camera that cannot be downgraded.
+        """
+        try:
+            left_raw_mode = bool(self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1))
+        except cv2.error:
+            left_raw_mode = False
+
+        if not left_raw_mode:
+            if not self._warned_stuck:
+                print(
+                    f"warning: {reason}, and the device refused to leave raw mode; "
+                    "continuing to validate raw buffers"
+                )
+                self._warned_stuck = True
+            return False
+
         if not self._warned_fallback:
             print(f"warning: {reason}; falling back to decoded frames (_ungraded.jpg)")
             self._warned_fallback = True
         self._raw = False
         self.stream_info.raw_mjpeg = False
-        self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        return True
 
     def read(self) -> Frame:
         for _ in range(3):
