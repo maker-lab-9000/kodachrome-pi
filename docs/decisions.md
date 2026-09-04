@@ -189,3 +189,39 @@ pixels were measured costs nothing and keeps the numbers interpretable.
 Found by generating a report for a three-image corpus and reading it as a
 user would. The external review caught the contact-sheet instance; the other
 three turned up only by running it.
+
+## 2026-09-04: The first real fit fails `channel_monotone`, and the gate is right
+
+**Decided:** do not promote the trained artifact to the packaged default.
+Leave the gate thresholds exactly as they are.
+**Rejected:** relaxing `channel_monotone`; shipping the artifact with a
+failing gate; over-regularising until the gate passes.
+**Why:** trained on 64 proxy source images and 1,140 Kodachrome scans with a
+real held-out split, the fit reduces held-out distance from 0.02330 to
+0.01346 — 42%, at seventeen times the seed-noise floor. The colour match
+works. But the resulting LUT contains per-channel reversals of up to 0.366,
+which is 93 levels out of 255: a gradient crossing one of those bands
+posterises or inverts.
+
+Two hypotheses were tested and the first was wrong. Unconstrained
+extrapolation looked likely — 71% of the colour cube holds no source pixels,
+and 82% of the *severe* reversals sat in empty cells. Anchoring those cells
+with `--lambda-identity` fixed `grey_axis_monotone` and
+`neutral_axis_chroma` and cut violations from 3,421 to 724. But at that
+setting only 3% of the remaining violating nodes have zero support, against
+47% of the cube; at `--lut-size 17` it is 0%. The reversals that survive are
+in *well-supported* regions, so they are not extrapolation.
+
+The gate was then checked against six obviously legitimate grades —
+saturation, hue rotation at 5 and 10 degrees, warm channel gains, a contrast
+S-curve, and identity. All six pass. The gate is not rejecting a plausible
+film look; the fitted LUT is genuinely defective.
+
+The cause is structural: iterative distribution transfer matches
+distributions and makes no per-channel ordering promise, and the
+least-squares fit that follows is unconstrained. Nothing in the pipeline
+asks the learned map to be monotone. Adding that constraint is the real fix
+and is a design decision, not a threshold to be quietly loosened —
+`evaluate.py` says the thresholds were "agreed before tuning so the gates
+cannot be quietly relaxed to fit whatever the fit produced", and a failing
+gate on a correct gate means fix the fit.
