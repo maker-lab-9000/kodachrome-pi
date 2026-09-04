@@ -4366,10 +4366,10 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
         "2017000001",
     )
     session = FakeSession(_handler, files={"https://upload/1.jpg": _photo_bytes()})
-    path = download(session, info, tmp_path)
-    assert path is not None and path.name == "2017000001.jpg"
+    path, reason = download(session, info, tmp_path)
+    assert path is not None and path.name == "2017000001.jpg" and reason == ""
     calls = len(session.calls)
-    assert download(session, info, tmp_path) == path      # resumed, not re-fetched
+    assert download(session, info, tmp_path) == (path, "")  # resumed, not re-fetched
     assert len(session.calls) == calls
 
     bad = FileInfo(
@@ -4383,7 +4383,7 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
         "2017000002",
     )
     failing = FakeSession(_handler, fail_urls={"https://upload/bad.jpg"})
-    assert download(failing, bad, tmp_path, retries=1) is None
+    assert download(failing, bad, tmp_path, retries=1) == (None, "http-500")
     assert list(tmp_path.glob("*.part")) == [], "no partial files may remain"
     assert not (tmp_path / "2017000002.jpg").exists()
 
@@ -4400,8 +4400,59 @@ def test_download_rejects_undecodable_content(tmp_path):
         "2017000003",
     )
     session = FakeSession(_handler, files={"https://upload/x.jpg": b"garbage"})
-    assert download(session, info, tmp_path) is None
+    path, reason = download(session, info, tmp_path)
+    assert path is None
+    assert reason.startswith("undecodable"), f"the manifest would record {reason!r}"
     assert not (tmp_path / "2017000003.jpg").exists()
+    # Bad content is not retried: it will fail identically every time.
+    assert len(session.calls) == 1
+
+
+def test_a_rejected_photo_records_why_not_just_that_it_failed(tmp_path):
+    """The manifest must distinguish a scanned document from a network error."""
+    info = FileInfo(
+        "File:G LCCN2017000007.jpg",
+        1,
+        2,
+        "https://upload/g.jpg",
+        1200,
+        900,
+        "Public domain",
+        "2017000007",
+    )
+    session = FakeSession(_handler, files={"https://upload/g.jpg": _grey_bytes()})
+    path, reason = download(session, info, tmp_path)
+    assert path is None
+    assert reason == "greyscale", "a document that decodes must not read as 'download-failed'"
+
+
+@pytest.mark.parametrize(
+    "title, expected",
+    [("File:svg.jpg", "mime:image/svg+xml"), ("File:noinfo.jpg", "no-imageinfo")],
+)
+def test_metadata_level_rejections_are_named(title, expected):
+    """Both defensive branches in fetch_imageinfo, which no fixture reached before."""
+
+    def handler(params):
+        if params.get("prop", "").startswith("imageinfo"):
+            page = {"title": title, "pageid": 1, "revisions": [{"revid": 9}]}
+            if "noinfo" not in title:
+                page["imageinfo"] = [
+                    {
+                        "url": "https://upload/x.svg",
+                        "thumburl": "https://upload/x.svg",
+                        "width": 4000,
+                        "height": 3000,
+                        "mime": "image/svg+xml",
+                        "extmetadata": {"LicenseShortName": {"value": "Public domain"}},
+                    }
+                ]
+            return {"query": {"pages": {"0": page}}}
+        raise AssertionError("unexpected params")
+
+    infos, rejected = fetch_imageinfo(FakeSession(handler), [title], 1024)
+    assert infos == []
+    assert rejected == [{"title": title, "reason": expected}]
 
 
 def test_fetch_category_writes_a_manifest_with_hashes_and_rejections(tmp_path):
@@ -4686,29 +4737,48 @@ def validate_image(data: bytes) -> tuple[bool, str]:
     return True, ""
 
 
-def download(session: Any, info: FileInfo, out_dir: str | Path, retries: int = 3) -> Path | None:
-    """Download to a temporary file, validate, then rename. Never leaves a partial file."""
+def download(
+    session: Any, info: FileInfo, out_dir: str | Path, retries: int = 3
+) -> tuple[Path | None, str]:
+    """Download to a temporary file, validate, then rename. Never leaves a partial file.
+
+    Returns ``(path, "")`` on success and ``(None, reason)`` on failure. The
+    reason is carried rather than discarded because it lands in the manifest,
+    and "a corpus you cannot audit is a corpus you cannot defend" is this
+    module's whole premise. Collapsing every failure into one generic label
+    would hide the byte-level colour and size check — the very check that
+    catches a scanned document the API described as a photograph.
+
+    Content that decodes but fails validation returns immediately: a greyscale
+    scan will still be a greyscale scan on the third attempt, so retrying only
+    spends the backoff budget. Transport failures do get the retries.
+    """
     out_dir = Path(out_dir)
     final = out_dir / info.filename
     if final.is_file() and final.stat().st_size > 0:
-        return final
+        return final, ""
     tmp = final.with_suffix(final.suffix + ".part")
+    reason = "download-failed"
     for attempt in range(retries):
         try:
             r = session.get(info.url, headers={"User-Agent": USER_AGENT}, timeout=120)
-            if r.status_code == 200 and r.content:
-                ok, _reason = validate_image(r.content)
+            if r.status_code != 200:
+                reason = f"http-{r.status_code}"
+            elif not r.content:
+                reason = "empty-response"
+            else:
+                ok, why = validate_image(r.content)
                 if not ok:
-                    return None
+                    return None, why
                 tmp.write_bytes(r.content)
                 tmp.replace(final)
-                return final
-        except Exception:  # noqa: BLE001
-            pass
+                return final, ""
+        except Exception as exc:  # noqa: BLE001 - every transport failure retries alike
+            reason = f"error:{type(exc).__name__}"
         finally:
             tmp.unlink(missing_ok=True)
         time.sleep(2**attempt)
-    return None
+    return None, reason
 
 
 def corpus_sha1(paths: list[Path]) -> str:
@@ -4765,10 +4835,10 @@ def fetch_category(
                 say(f"  {info.filename} does not match its recorded hash; refetching")
                 final.unlink()
                 report.repaired += 1
-        path = download(session, info, out_dir)
+        path, reason = download(session, info, out_dir)
         if path is None:
             report.failed += 1
-            rejected.append({"title": info.title, "reason": "download-failed"})
+            rejected.append({"title": info.title, "reason": reason})
             continue
         entry = asdict(info)
         entry["filename"] = info.filename
