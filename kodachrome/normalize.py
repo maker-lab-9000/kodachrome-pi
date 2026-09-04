@@ -66,16 +66,48 @@ class NormalizeParams:
     white_balance: bool = True
     wb_gain_min: float = 0.6
     wb_gain_max: float = 1.6
-    exposure_target_median: float = 0.18
+    exposure_target_median: float = 0.25
     exposure_gain_min: float = 0.5
     exposure_gain_max: float = 3.0
     stats_lum_min: float = 0.02
     stats_lum_max: float = 0.90
+    # Levels: a training-side normaliser for scanned targets. Archival scans
+    # are deliberately flat -- across 150 LoC Kodachromes the white point sat
+    # at a median 0.72 linear luminance -- and learning from them unstretched
+    # taught the LUT to push white to 0.85. Levels puts p0.5 at black and
+    # p99.5 at white, then a gamma puts the median on the exposure target
+    # without moving either end (a gain would drag the white point again).
+    # Never used on the capture path; ``normalize_u8`` refuses it.
+    levels: bool = False
+    levels_low_pct: float = 0.5
+    levels_high_pct: float = 99.5
+    levels_max_stretch: float = 4.0
+    levels_gamma_min: float = 0.5
+    levels_gamma_max: float = 2.0
 
     def __post_init__(self) -> None:
         for f in fields(self):
-            if f.name != "white_balance":
+            if f.name not in ("white_balance", "levels"):
                 _check_finite(f.name, getattr(self, f.name))
+        if self.levels and self.white_balance:
+            raise ValueError(
+                "levels normalisation does not combine with white_balance; targets keep "
+                "their cast (see docs/decisions.md), so pass white_balance=False"
+            )
+        if not 0.0 <= self.levels_low_pct < self.levels_high_pct <= 100.0:
+            raise ValueError(
+                f"levels_low_pct ({self.levels_low_pct}) must be below "
+                f"levels_high_pct ({self.levels_high_pct}), both within [0, 100]"
+            )
+        if self.levels_max_stretch < 1.0:
+            raise ValueError(
+                f"levels_max_stretch must be at least 1, got {self.levels_max_stretch}"
+            )
+        if not 0.0 < self.levels_gamma_min < self.levels_gamma_max:
+            raise ValueError(
+                f"levels_gamma_min ({self.levels_gamma_min}) must be positive and below "
+                f"levels_gamma_max ({self.levels_gamma_max})"
+            )
         if self.wb_gain_min <= 0:
             raise ValueError(f"wb_gain_min must be positive, got {self.wb_gain_min}")
         if self.exposure_gain_min <= 0:
@@ -115,6 +147,9 @@ class Gains:
     wb: np.ndarray
     exposure: float
     clamped: dict = field(default_factory=lambda: {"wb": False, "exposure": False})
+    # Set only by the levels path: the black/white points found, the stretch
+    # and gamma applied. ``exposure`` stays 1.0 there, because no gain was.
+    levels: dict | None = None
 
     @property
     def combined(self) -> np.ndarray:
@@ -123,11 +158,14 @@ class Gains:
         )
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "wb": [round(float(g), 4) for g in self.wb],
             "exposure": round(float(self.exposure), 4),
             "clamped": dict(self.clamped),
         }
+        if self.levels is not None:
+            d["levels"] = {k: round(float(v), 4) for k, v in self.levels.items()}
+        return d
 
 
 def _require_float_image(rgb: np.ndarray, caller: str) -> np.ndarray:
@@ -189,8 +227,48 @@ def apply_gains_float(rgb: np.ndarray, gains: Gains) -> np.ndarray:
     return linear_to_srgb(np.clip(srgb_to_linear(rgb) * gains.combined, 0.0, 1.0))
 
 
+def levels_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
+    """Stretch p_low..p_high of luminance to 0..1, then gamma the median to target.
+
+    Everything happens in linear light with ONE black point and ONE stretch
+    shared by all three channels, so a neutral input stays neutral. The gamma
+    is likewise per channel with a shared exponent. Both the stretch and the
+    gamma are clamped and the clamp is recorded, never silent.
+    """
+    rgb = _require_float_image(rgb, "levels_float")
+    lin = srgb_to_linear(rgb)
+    lum = lin @ LUMA_709
+    pct = np.percentile(lum, [params.levels_low_pct, params.levels_high_pct])
+    lo, hi = float(pct[0]), float(pct[1])
+    raw_stretch = 1.0 / max(hi - lo, _EPS)
+    stretch = min(raw_stretch, params.levels_max_stretch)
+    lin = np.clip((lin - lo) * stretch, 0.0, 1.0)
+
+    lum = lin @ LUMA_709
+    mask = (lum >= params.stats_lum_min) & (lum <= params.stats_lum_max)
+    if mask.mean() < 0.01:
+        mask = np.ones_like(mask)
+    median = float(np.clip(np.median(lum[mask]), _EPS, 1.0 - _EPS))
+    raw_gamma = math.log(params.exposure_target_median) / math.log(median)
+    gamma = float(np.clip(raw_gamma, params.levels_gamma_min, params.levels_gamma_max))
+    out = linear_to_srgb(np.power(lin, np.float32(gamma)))
+
+    clamped = raw_stretch > params.levels_max_stretch or not (
+        params.levels_gamma_min <= raw_gamma <= params.levels_gamma_max
+    )
+    gains = Gains(
+        wb=np.ones(3, dtype=np.float32),
+        exposure=1.0,
+        clamped={"wb": False, "exposure": False, "levels": bool(clamped)},
+        levels={"low": lo, "high": hi, "stretch": stretch, "gamma": gamma},
+    )
+    return out.astype(np.float32), gains
+
+
 def normalize_float(rgb: np.ndarray, params: NormalizeParams) -> tuple[np.ndarray, Gains]:
     """Reference path used by the trainer. ``rgb`` is float32 sRGB in [0, 1]."""
+    if params.levels:
+        return levels_float(rgb, params)
     gains = compute_gains(rgb, params)
     return apply_gains_float(rgb, gains), gains
 
@@ -209,6 +287,11 @@ def normalize_u8(
     rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
 ) -> tuple[np.ndarray, Gains]:
     """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
+    if params.levels:
+        raise ValueError(
+            "levels normalisation is a training-side step for scanned targets; "
+            "the capture path does not support it"
+        )
     h, w = rgb_u8.shape[:2]
     step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
     gains = compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)

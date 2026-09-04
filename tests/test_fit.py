@@ -5,6 +5,7 @@ import pytest
 
 from kodachrome.artifacts import Artifacts
 from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
+from kodachrome.grain import GrainParams
 from kodachrome.imageio import save_jpeg
 from kodachrome.train.dataset import PixelPool, SampleConfig
 from kodachrome.train.fit import FitConfig, build_parser, fit, main, train
@@ -189,7 +190,7 @@ def test_main_refuses_a_small_corpus_then_accepts_the_flag(tmp_path, capsys):
     assert main([*args, "--allow-small"]) in (0, 3)
     data = json.loads((tmp_path / "o" / "params.json").read_text())
     assert data["training"]["fit"]["strength"] == 1.0
-    assert data["grain"]["strength"] == pytest.approx(0.025)
+    assert data["grain"]["strength"] == pytest.approx(GrainParams().strength)
 
 
 def test_main_reports_a_failed_gate_with_exit_code_3(tmp_path, monkeypatch, capsys):

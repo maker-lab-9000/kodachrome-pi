@@ -6,9 +6,12 @@ Both corpora go through the same steps:
    shadow or scanner bed; camera frames can have vignetted corners.
 2. Downscale so the long side is ``max_side``. Colour statistics do not need
    full resolution.
-3. Normalise with the same code the Pi runs. Sources get white balance;
-   targets are given ``NormalizeParams(white_balance=False)`` by the caller,
-   because the film's cast is part of the look being learned.
+3. Normalise with the same code the Pi runs. Sources get white balance and
+   a median-to-target exposure gain; targets are given
+   ``NormalizeParams(white_balance=False, levels=True)`` by the caller: no
+   white balance, because the film's cast is part of the look being learned,
+   and a black/white-point stretch because archival scans are flat and that
+   flatness is not.
 4. Sample pixels whose Oklab lightness is inside ``(l_min, l_max)``.
    Near-black pixels are borders and crushed shadows, near-white are blown
    highlights and scanner glare; neither says anything about how the film

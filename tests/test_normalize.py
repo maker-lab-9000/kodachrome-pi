@@ -61,7 +61,8 @@ def test_grey_world_neutralises_a_mild_cast():
     out, gains = normalize_float(img, NormalizeParams())
     assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)
     assert np.allclose(out[..., 1], out[..., 2], atol=1 / 255)
-    assert np.median(color.luminance(color.srgb_to_linear(out))) == pytest.approx(0.18, abs=0.005)
+    target = NormalizeParams().exposure_target_median
+    assert np.median(color.luminance(color.srgb_to_linear(out))) == pytest.approx(target, abs=0.005)
     assert gains.wb[0] < 1.0 < gains.wb[2]
     assert gains.clamped == {"wb": False, "exposure": False}
 
@@ -92,10 +93,12 @@ def test_normalising_twice_is_nearly_a_no_op_and_converges():
     """Normalisation is close to idempotent, but not exactly, and that is fine.
 
     The statistics mask is recomputed on the transformed image, so a second
-    pass measures a slightly different set of pixels (2784 of 3072 becomes
-    2752 for this fixture) whose median is 0.1835 rather than the 0.18
-    target. The residual correction is real, not floating-point noise. What
-    matters is that it is small and that repeated passes settle instead of
+    pass measures a slightly different set of pixels (2774 of 3072 becomes
+    2746 for this fixture) whose median is 0.228 rather than the 0.25
+    target. The residual correction is real, not floating-point noise, and it
+    grew when the target moved from 0.18 to 0.25: a brighter target pushes
+    more of this ramp past ``stats_lum_max`` (3.1% -> 5.0% of pixels). What
+    matters is that it is bounded and that repeated passes settle instead of
     drifting; nothing in the project normalises an image twice.
     """
     img = _gradient_image()
@@ -103,12 +106,13 @@ def test_normalising_twice_is_nearly_a_no_op_and_converges():
     twice, gains2 = normalize_float(once, NormalizeParams())
     thrice, _ = normalize_float(twice, NormalizeParams())
 
-    # Measured for this fixture: gains within 0.019 of 1, pixels within 2.05/255.
+    # Measured for this fixture at target 0.25: wb within 0.001 of 1, exposure
+    # 1.097, pixels within 10.2/255.
     assert np.allclose(gains2.wb, 1.0, atol=0.05)
-    assert gains2.exposure == pytest.approx(1.0, abs=0.05)
-    assert np.abs(twice - once).max() < 6 / 255
+    assert gains2.exposure == pytest.approx(1.0, abs=0.15)
+    assert np.abs(twice - once).max() < 12 / 255
 
-    # Measured: 2.05/255 then 0.53/255. Each pass corrects less than the last.
+    # Measured: 10.2/255 then 5.4/255. Each pass corrects less than the last.
     assert np.abs(thrice - twice).max() < np.abs(twice - once).max()
 
 
@@ -169,3 +173,96 @@ def test_luts_are_monotone():
     )
     assert luts.shape == (3, 256) and luts.dtype == np.uint8
     assert np.all(np.diff(luts.astype(int), axis=1) >= 0)
+
+
+# --- levels normalisation: the training-side step for scanned targets -------
+
+
+def _low_contrast_grey(lo=0.05, hi=0.60, n=64):
+    """A neutral ramp that never reaches black or white, like an archival scan."""
+    lin = np.linspace(lo, hi, n * n, dtype=np.float32).reshape(n, n)
+    rgb = color.linear_to_srgb(np.stack([lin, lin, lin], axis=-1))
+    return rgb.astype(np.float32)
+
+
+def test_levels_pins_black_white_and_median_and_keeps_neutrals_neutral():
+    """The scans' whites sit at 0.72 linear luminance (measured, 150 scans).
+
+    Learning from them unstretched taught the LUT to push white to 0.85.
+    Levels puts p0.5 at black, p99.5 at white, then a gamma puts the median
+    on the exposure target without moving either end.
+    """
+    p = NormalizeParams(white_balance=False, levels=True)
+    out, gains = normalize_float(_low_contrast_grey(), p)
+    lum = color.luminance(color.srgb_to_linear(out))
+    lo, hi = np.percentile(lum, [p.levels_low_pct, p.levels_high_pct])
+    assert lo == pytest.approx(0.0, abs=0.01)
+    assert hi == pytest.approx(1.0, abs=0.01)
+    # The gamma targets the median on the statistics mask, exactly as the
+    # source-side exposure gain does, so source and target agree on what
+    # "median" means. Recompute it from the recorded black point and stretch
+    # and check the exponent lands it on target. The whole-image median sits
+    # a little above (0.29 here) because the mask drops the ramp's ends.
+    lv = gains.levels
+    stretched = np.clip((color.luminance(color.srgb_to_linear(_low_contrast_grey())) - lv["low"])
+                        * lv["stretch"], 0.0, 1.0)
+    m = (stretched >= p.stats_lum_min) & (stretched <= p.stats_lum_max)
+    landed = np.median(stretched[m]) ** lv["gamma"]
+    assert landed == pytest.approx(p.exposure_target_median, abs=0.005)
+    assert np.median(lum) == pytest.approx(p.exposure_target_median, abs=0.05)
+    assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)
+    assert np.allclose(out[..., 1], out[..., 2], atol=1 / 255)
+    assert gains.levels is not None
+    assert gains.exposure == 1.0 and np.allclose(gains.wb, 1.0)
+    assert gains.clamped == {"wb": False, "exposure": False, "levels": False}
+
+
+def test_levels_clamps_are_recorded_not_silent():
+    p = NormalizeParams(white_balance=False, levels=True)
+    # Nearly flat: the raw stretch would be ~20x, far past the 4x ceiling.
+    flat = _low_contrast_grey(0.40, 0.45)
+    _, g = normalize_float(flat, p)
+    assert g.levels["stretch"] == pytest.approx(p.levels_max_stretch)
+    assert g.clamped["levels"] is True
+    # Mostly black with a small bright patch: median after stretch ~0.02, so
+    # the gamma that would reach 0.25 is ~0.35, below the 0.5 floor.
+    dark = _low_contrast_grey(0.0, 0.02)
+    dark[:4, :4] = 1.0
+    _, g = normalize_float(dark, p)
+    assert g.levels["gamma"] == pytest.approx(p.levels_gamma_min)
+    assert g.clamped["levels"] is True
+
+
+def test_levels_off_is_exactly_the_old_path():
+    img = _gradient_image()
+    out, gains = normalize_float(img, NormalizeParams())
+    ref = apply_gains_float(img, compute_gains(img, NormalizeParams()))
+    assert np.array_equal(out, ref)
+    assert gains.levels is None
+    assert "levels" not in gains.clamped
+
+
+def test_levels_does_not_combine_with_white_balance():
+    with pytest.raises(ValueError, match="levels"):
+        NormalizeParams(white_balance=True, levels=True)
+
+
+def test_levels_params_validate_and_round_trip():
+    with pytest.raises(ValueError, match="levels_gamma"):
+        NormalizeParams(
+            white_balance=False, levels=True, levels_gamma_min=2.0, levels_gamma_max=1.0
+        )
+    with pytest.raises(ValueError, match="levels_low_pct"):
+        NormalizeParams(
+            white_balance=False, levels=True, levels_low_pct=99.0, levels_high_pct=1.0
+        )
+    p = NormalizeParams(white_balance=False, levels=True, levels_max_stretch=3.0)
+    assert NormalizeParams.from_dict(p.to_dict()) == p
+    assert "levels" in Gains(wb=np.ones(3), exposure=1.0, levels={"gamma": 0.7}).to_dict()
+
+
+def test_capture_path_refuses_levels():
+    """Levels is for scanned targets in training. The Pi must never run it."""
+    img = (_gradient_image() * 255).round().astype(np.uint8)
+    with pytest.raises(ValueError, match="levels"):
+        normalize_u8(img, NormalizeParams(white_balance=False, levels=True))

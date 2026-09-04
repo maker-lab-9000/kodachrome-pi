@@ -101,10 +101,11 @@ def render_contact_sheet(
     )
     draw = ImageDraw.Draw(sheet)
     origin = "Held-out" if held_out else "TRAINING (corpus too small to hold any back)"
+    target_step = "levels" if target_normalize.levels else "exposure"
     rows = [
         (f"{origin} source, normalised", normalised),
         (f"{origin} source, graded with the fitted LUT", graded),
-        ("Real Kodachrome scans (exposure-normalised)", kodachrome),
+        (f"Real Kodachrome scans ({target_step}-normalised)", kodachrome),
     ]
     for r, (label, images) in enumerate(rows):
         y = pad + r * (label_h + thumb + pad)

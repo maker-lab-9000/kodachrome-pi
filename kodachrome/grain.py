@@ -34,7 +34,7 @@ cv2 = require_cv2()
 
 @dataclass
 class GrainParams:
-    strength: float = 0.025
+    strength: float = 0.010
     blur_sigma: float = 0.7
     enabled: bool = True
 

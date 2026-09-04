@@ -152,6 +152,7 @@ def train(
     grain: GrainParams | None,
     proxy_source: bool = False,
     allow_small: bool = False,
+    target_levels: bool = True,
     command: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict, list]:
@@ -159,7 +160,7 @@ def train(
     source_dir, target_dir, out_dir = Path(source_dir), Path(target_dir), Path(out_dir)
 
     source_normalize = NormalizeParams()
-    target_normalize = NormalizeParams(white_balance=False)
+    target_normalize = NormalizeParams(white_balance=False, levels=target_levels)
     source = build_corpus(source_dir, source_normalize, sample_cfg, MIN_SOURCE_IMAGES,
                           "source", allow_small, say)
     target = build_corpus(target_dir, target_normalize, sample_cfg, MIN_TARGET_IMAGES,
@@ -212,6 +213,7 @@ def train(
             "dir": str(target_dir),
             "n_images": len(target.train_paths) + len(target.val_paths),
             "corpus_sha1": target.corpus_sha1,
+            "normalize": target_normalize.to_dict(),
             "n_pixels": int(len(target.train_pool.srgb)),
             "clamp_rate": target.train_pool.clamp_rate,
             "profiles": target.train_pool.profiles,
@@ -270,10 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-identity", type=float, default=fd.lambda_identity)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--grain-strength", type=float, default=0.025)
+    parser.add_argument("--grain-strength", type=float, default=GrainParams().strength)
     parser.add_argument("--max-side", type=int, default=512)
     parser.add_argument("--pixels-per-image", type=int, default=3000)
     parser.add_argument("--max-pixels", type=int, default=400_000)
+    parser.add_argument("--no-target-levels", dest="target_levels", action="store_false",
+                        help="skip the black/white-point stretch on target scans (A/B only)")
     parser.add_argument("--proxy-source", action="store_true",
                         help="mark the source as stand-in photos, not U20CAM shots")
     parser.add_argument("--allow-small", action="store_true",
@@ -311,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         metrics, gates = train(
             args.source, args.target, args.out, cfg, sample_cfg, grain,
             proxy_source=args.proxy_source, allow_small=args.allow_small,
+            target_levels=args.target_levels,
             command=" ".join(["kodachrome-train", *(argv or sys.argv[1:])]), progress=print,
         )
     except CorpusTooSmall as exc:
