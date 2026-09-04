@@ -5020,7 +5020,11 @@ def test_crop_removes_border():
 
 
 def test_prepare_image_normalises_and_returns_gains():
-    img = np.full((100, 100, 3), (190, 170, 150), dtype=np.uint8)
+    # A mild cast, dark enough that neither gain clamps: median linear
+    # luminance lands near the 0.18 target, so the exposure gain is 0.99.
+    # (190, 170, 150) looks similar but sits at luminance 0.42, which drives
+    # the raw exposure gain to 0.43 and clamps it against the 0.5 floor.
+    img = np.full((100, 100, 3), (130, 116, 102), dtype=np.uint8)
     out, gains = prepare_image(img, NormalizeParams(), SampleConfig(crop_frac=0.0, max_side=50))
     assert out.dtype == np.float32 and out.shape == (50, 50, 3)
     assert np.allclose(out[..., 0], out[..., 1], atol=1 / 255)
