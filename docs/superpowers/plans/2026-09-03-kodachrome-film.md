@@ -6122,8 +6122,28 @@ def test_hue_hist_residual_is_zero_when_reweighting_is_exact():
             [rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, 2 * np.pi, 8000)], 1
         )
     )
+    # Uneven around the whole circle, not confined to half of it. Reweighting
+    # can only scale samples that exist, so a hue with no samples at all leaves
+    # a residual pinned at 1/n_bins — measured 0.0459 against a 1/24 = 0.0417
+    # floor. That would make the test assert something unachievable rather than
+    # something false.
     tgt_lab = lch_to_oklab(
-        np.stack([rng.uniform(0.3, 0.8, 8000), np.full(8000, 0.12), rng.uniform(0, np.pi, 8000)], 1)
+        np.concatenate(
+            [
+                np.stack(
+                    [rng.uniform(0.3, 0.8, 5600), np.full(5600, 0.12), rng.uniform(0, np.pi, 5600)],
+                    1,
+                ),
+                np.stack(
+                    [
+                        rng.uniform(0.3, 0.8, 2400),
+                        np.full(2400, 0.12),
+                        rng.uniform(np.pi, 2 * np.pi, 2400),
+                    ],
+                    1,
+                ),
+            ]
+        )
     )
     w = hue_weights(src_lab, tgt_lab, 24)
     assert hue_hist_residual(src_lab, tgt_lab, w, 24, 0.03) < 0.02
