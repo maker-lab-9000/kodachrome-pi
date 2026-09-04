@@ -47,6 +47,33 @@ Until training has run, the bundled LUT is an identity placeholder and its
 | `kodachrome-capture` | Pi | live preview, SPACE to capture |
 | `kodachrome-process` | either | regrade a folder of originals |
 
+### Capture on the Pi
+
+```bash
+kodachrome-capture                 # probes for the camera, opens a preview if a display is attached
+kodachrome-capture --device /dev/v4l/by-id/usb-…   # pick a camera by stable path
+kodachrome-capture --no-preview    # headless: SPACE and Q from the terminal
+kodachrome-capture --fake          # no hardware, synthetic frames
+```
+
+Keys: `SPACE` capture, `P` toggle graded/original preview, `Q` quit. SPACE
+takes a fresh frame; it does not save the frame currently displayed.
+
+Each capture writes to `~/Pictures/kodachrome/YYYY-MM-DD/`:
+
+| File | Contents |
+|---|---|
+| `HHMMSS_original.jpg` | the camera's own JPEG bytes, unmodified |
+| `HHMMSS_ungraded.jpg` | a re-encode, written **instead** when the camera cannot supply its compressed frame |
+| `HHMMSS_kodachrome.jpg` | the graded version |
+| `captures.jsonl` | one audit line per capture |
+
+The audit line records the white balance and exposure gains, whether either
+hit its clamp, the grain seed, the LUT's SHA-1, the negotiated stream format,
+and both the pipeline time and the full shutter-to-saved time. The seed and
+hash together mean a graded file can be regenerated exactly from its
+original.
+
 ### Regrade a folder
 
 ```bash
