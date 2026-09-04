@@ -4256,7 +4256,11 @@ def _handler(params):
                     {"ns": 14, "title": CAT, "pageid": 15},
                 ]
             )
-    if params.get("prop") == "imageinfo":
+    # Substring, not equality: the real call asks for "imageinfo|revisions",
+    # because the revision id is part of the provenance record. Matching on
+    # equality here silently sent every imageinfo call down the AssertionError
+    # path, where api_get retried it three times with backoff before failing.
+    if "imageinfo" in params.get("prop", ""):
         pages = {}
         for i, title in enumerate(params["titles"].split("|")):
             small = "small" in title
