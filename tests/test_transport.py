@@ -87,6 +87,34 @@ def test_idt_moves_source_onto_target_distribution():
     assert np.allclose(moved.std(axis=0), tgt.std(axis=0), rtol=0.1)
 
 
+def test_transport_preserves_pixel_identity():
+    """Row i of the output must be where source pixel i went, not merely a
+    point drawn from the right distribution.
+
+    Everything else in this file is permutation-invariant: shuffling the
+    output rows leaves the sliced Wasserstein distance, the means and the
+    standard deviations bit-identical, because a permutation does not change
+    a distribution at all. Measured, to be sure of it. So a regression that
+    reordered rows would sail through every other assertion here while
+    handing the LUT fitter pairs that no longer correspond — a film look
+    fitted to noise, with nothing to say so.
+
+    The property is tested as equivariance: permuting the input must permute
+    the output the same way. That holds exactly for a rank-based mapping and
+    fails for any reordering.
+    """
+    rng = np.random.default_rng(0)
+    src = rng.normal([0.5, 0.0, 0.0], [0.1, 0.05, 0.05], (3000, 3))
+    tgt = rng.normal([0.6, 0.05, -0.05], [0.15, 0.08, 0.04], (3000, 3))
+    perm = np.random.default_rng(7).permutation(len(src))
+
+    straight = iterative_distribution_transfer(src, tgt, iterations=8, rng=np.random.default_rng(1))
+    permuted = iterative_distribution_transfer(
+        src[perm], tgt, iterations=8, rng=np.random.default_rng(1)
+    )
+    assert np.array_equal(permuted, straight[perm]), "row correspondence was not preserved"
+
+
 def test_sliced_wasserstein_zero_for_identical_and_positive_for_shift():
     rng = np.random.default_rng(6)
     a = rng.normal(size=(5000, 3))
