@@ -260,7 +260,7 @@ def check_gates(metrics: dict) -> list[Gate]:
             round(float(metrics["clipped_volume_fraction"]), 5),
             MAX_CLIPPED_VOLUME,
             float(metrics["clipped_volume_fraction"]) < MAX_CLIPPED_VOLUME,
-            "too much of the colour cube is pinned to the gamut boundary",
+            "the interior of the colour cube must stay off the gamut boundary",
         ),
     ]
     return gates
