@@ -88,6 +88,35 @@ def test_fit_rejects_mismatched_inputs():
         fit_lut(np.zeros((10, 3)), np.zeros((9, 3)), n=5)
 
 
+@pytest.mark.parametrize("channel", [0, 1, 2])
+def test_enforce_monotone_repairs_each_channel_along_its_own_axis(channel):
+    """Channel c must be repaired along axis c, and no other channel touched.
+
+    Exercising only the red channel leaves `moveaxis(.., c, 0)` free to be
+    `moveaxis(.., 0, 0)`: green and blue would then be projected along the
+    RED axis, which still satisfies the gate while silently corrupting them.
+    Only the tone-curve acceptance test caught that, and only by 0.0017.
+    """
+    n = 9
+    table = LUT3D.identity(n).table.astype(np.float64).copy()
+    idx = [3, 4, 5]
+    idx[channel] = 6
+    table[tuple(idx) + (channel,)] = 0.0          # a hard reversal along axis `channel`
+    broken = LUT3D(table.astype(np.float32))
+    assert not channels_are_monotone(broken)
+
+    fixed = enforce_monotone(broken)
+    assert channels_are_monotone(fixed)
+
+    # Repaired along its OWN axis...
+    steps = np.diff(fixed.table[..., channel].astype(np.float64), axis=channel)
+    assert steps.min() >= -1e-9
+    # ...and the other two channels are untouched.
+    moved = [c for c in range(3)
+             if np.abs(fixed.table[..., c].astype(np.float64) - table[..., c]).max() > 1e-9]
+    assert moved == [channel], f"projection altered channels {moved}, expected only [{channel}]"
+
+
 def test_enforce_monotone_makes_a_reversed_lut_monotone_without_moving_the_rest():
     """A least squares fit gives no ordering guarantee; this projection does.
 
