@@ -219,7 +219,11 @@ class Gate:
 
 def check_gates(metrics: dict) -> list[Gate]:
     """The numeric bar an artifact must clear, fixed before tuning."""
-    margin = NOISE_MARGIN * float(metrics.get("swd_seed_spread", 0.0))
+    # Strict indexing, like every other key here. Defaulting a missing spread to
+    # 0.0 would set the margin to 0 and turn this gate into "any improvement
+    # above zero passes" — silently disabling the one check that distinguishes
+    # a real grade from sampling noise, which is the reason the gate exists.
+    margin = NOISE_MARGIN * float(metrics["swd_seed_spread"])
     improvement = float(metrics["swd_before"]) - float(metrics["swd_after"])
     gates = [
         Gate(
