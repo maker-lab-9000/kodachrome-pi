@@ -11,7 +11,7 @@ dist/
 
 # Data and generated output
 /data/
-artifacts/report/
+/artifacts/
 
 # Agent scratch space (plans' ledgers, briefs, review packages)
 .superpowers/
