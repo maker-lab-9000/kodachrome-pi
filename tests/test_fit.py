@@ -39,7 +39,14 @@ def test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation():
 
 
 def test_a_large_hue_rotation_is_only_partly_recovered():
-    """Pins the documented limit: reweighting damps rotations beyond about one bin."""
+    """Pins the documented limit: a large hue rotation is only partly recovered.
+
+    The damping comes from the transport and the LUT-fit smoothing, NOT from
+    hue reweighting: this fixture is uniform over the cube, so a 90-degree
+    rotation leaves the hue histogram unchanged and `hue_weights` has nothing
+    to correct. Disabling reweighting entirely moves the result from about
+    5 degrees to about 7, both far under the bound below.
+    """
     rng = np.random.default_rng(1)
     src = _pool(rng)
     tgt = np.clip(
@@ -143,6 +150,23 @@ def test_train_leaves_the_previous_artifact_intact_if_publication_fails(tmp_path
     with pytest.raises(OSError):
         train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True)
     assert (out / "params.json").read_text() == good
+    # The `finally` must remove staging on the failure path too. Without this
+    # assertion the whole try/finally can be deleted and the test stays green:
+    # the mocked publish raises before touching out_dir, so the params check
+    # above passes either way.
+    leftover = list(out.parent.glob(".kodachrome-staging-*"))
+    assert leftover == [], f"staging directory left behind: {leftover}"
+
+
+def test_train_creates_a_nested_output_parent_instead_of_crashing(tmp_path):
+    """`mkdtemp` needs out_dir's parent; publish() creating it later is too late."""
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    out = tmp_path / "does" / "not" / "exist" / "artifacts"
+    cfg = FitConfig(lut_size=9, iterations=5)
+    sample = SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25)
+    train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True)
+    assert (out / "params.json").exists()
 
 
 def test_main_rejects_identical_and_missing_dirs(tmp_path, capsys):

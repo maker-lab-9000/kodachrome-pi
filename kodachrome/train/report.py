@@ -212,9 +212,12 @@ def write_report(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # fit() records what it actually measured; fall back to the paths for
-    # direct callers that assemble metrics themselves.
-    held_out = bool(metrics.get("held_out_eval", bool(source_split.val_paths)))
+    # fit() records what it actually measured. Direct callers that assemble
+    # metrics themselves fall back to the same rule fit() applies: the numbers
+    # are held out only if BOTH corpora kept images back.
+    held_out = bool(metrics.get(
+        "held_out_eval", bool(source_split.val_paths) and bool(target_split.val_paths)
+    ))
     render_contact_sheet(
         source_split.val_paths or source_split.train_paths,
         target_split.val_paths or target_split.train_paths,

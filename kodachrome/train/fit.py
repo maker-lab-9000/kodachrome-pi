@@ -236,6 +236,8 @@ def train(
         "metrics": {k: v for k, v in metrics.items() if k != "hue_bins"},
     }
 
+    # publish() creates out_dir's parent, but mkdtemp needs it to exist first.
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".kodachrome-staging-", dir=out_dir.parent))
     try:
         write_artifact(staging, result.lut, source_normalize, grain or GrainParams(), training)
@@ -306,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    label = "held-out" if metrics.get("held_out_eval", True) else "TRAINING (not held out)"
+    label = "held-out" if metrics["held_out_eval"] else "TRAINING (not held out)"
     print(
         f"{label} distance to Kodachrome: {metrics['swd_before']:.5f} -> "
         f"{metrics['swd_after']:.5f} (seed spread {metrics['swd_seed_spread']:.5f})"

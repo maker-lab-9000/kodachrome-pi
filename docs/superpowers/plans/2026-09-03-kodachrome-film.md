@@ -6984,7 +6984,9 @@ def write_report(
 
     # fit() records what it actually measured; fall back to the paths for
     # direct callers that assemble metrics themselves.
-    held_out = bool(metrics.get("held_out_eval", bool(source_split.val_paths)))
+    held_out = bool(metrics.get(
+        "held_out_eval", bool(source_split.val_paths) and bool(target_split.val_paths)
+    ))
     render_contact_sheet(
         source_split.val_paths or source_split.train_paths,
         target_split.val_paths or target_split.train_paths,
@@ -7106,7 +7108,14 @@ def test_fit_recovers_a_tone_curve_and_a_ten_degree_hue_rotation():
 
 
 def test_a_large_hue_rotation_is_only_partly_recovered():
-    """Pins the documented limit: reweighting damps rotations beyond about one bin."""
+    """Pins the documented limit: a large hue rotation is only partly recovered.
+
+    The damping comes from the transport and the LUT-fit smoothing, NOT from
+    hue reweighting: this fixture is uniform over the cube, so a 90-degree
+    rotation leaves the hue histogram unchanged and `hue_weights` has nothing
+    to correct. Disabling reweighting entirely moves the result from about
+    5 degrees to about 7, both far under the bound below.
+    """
     rng = np.random.default_rng(1)
     src = _pool(rng)
     tgt = np.clip(
@@ -7497,6 +7506,8 @@ def train(
         "metrics": {k: v for k, v in metrics.items() if k != "hue_bins"},
     }
 
+    # publish() creates out_dir's parent, but mkdtemp needs it to exist first.
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".kodachrome-staging-", dir=out_dir.parent))
     try:
         write_artifact(staging, result.lut, source_normalize, grain or GrainParams(), training)
@@ -7567,7 +7578,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    label = "held-out" if metrics.get("held_out_eval", True) else "TRAINING (not held out)"
+    label = "held-out" if metrics["held_out_eval"] else "TRAINING (not held out)"
     print(
         f"{label} distance to Kodachrome: {metrics['swd_before']:.5f} -> "
         f"{metrics['swd_after']:.5f} (seed spread {metrics['swd_seed_spread']:.5f})"

@@ -103,6 +103,16 @@ def test_a_corpus_with_no_held_out_split_says_so_instead_of_claiming_held_out(tm
                  NormalizeParams(), NormalizeParams(white_balance=False), cfg)
     assert "WARNING" not in (ordinary / "summary.txt").read_text()
 
+    # Either side missing a validation split makes the numbers not-held-out.
+    # fit() requires BOTH, so the paths fallback must agree with that rule.
+    src_has_val = _split(tmp_path, "srcv", 2)
+    tgt_no_val = CorpusSplit(paths, [], _pool(3), _pool(4, 1), "def456")
+    lopsided = tmp_path / "lopsided"
+    write_report(lopsided, _darkening_lut(), metrics, check_gates(metrics),
+                 src_has_val, tgt_no_val, NormalizeParams(),
+                 NormalizeParams(white_balance=False), cfg)
+    assert "WARNING" in (lopsided / "summary.txt").read_text()
+
     # The sheet's own labels must track the flag, not be hard-coded: same images
     # and same seed, so any pixel difference is the caption changing.
     sheets = [
