@@ -5908,8 +5908,8 @@ def fit_lut(
     x_srgb: np.ndarray,
     y_srgb: np.ndarray,
     n: int = 33,
-    lambda_smooth: float = 1e-3,
-    lambda_identity: float = 1e-4,
+    lambda_smooth: float = 1e-2,
+    lambda_identity: float = 1.0,
     rtol: float = 1e-8,
     maxiter: int = 5000,
 ) -> LUT3D:
@@ -7336,8 +7336,8 @@ class FitConfig:
     iterations: int = 40
     hue_bins: int = 24
     chroma_floor: float = 0.03
-    lambda_smooth: float = 1e-3
-    lambda_identity: float = 1e-4
+    lambda_smooth: float = 1e-2
+    lambda_identity: float = 1.0
     strength: float = 1.0
     seed: int = 0
 
@@ -7531,8 +7531,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lut-size", type=int, default=33)
     parser.add_argument("--iterations", type=int, default=40)
     parser.add_argument("--hue-bins", type=int, default=24)
-    parser.add_argument("--lambda-smooth", type=float, default=1e-3)
-    parser.add_argument("--lambda-identity", type=float, default=1e-4)
+    parser.add_argument("--lambda-smooth", type=float, default=fd.lambda_smooth)
+    parser.add_argument("--lambda-identity", type=float, default=fd.lambda_identity)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grain-strength", type=float, default=0.025)
@@ -8041,3 +8041,26 @@ revision 2 changes about Task 1 (extras and package data). Revision 1's
 `artifacts/` directory at the repository root remains as the trainer's
 default output location, but it is no longer where the runtime looks by
 default.
+
+---
+
+## Revision 3 addendum (2026-09-04): changes made during Task 21
+
+Task 21's first real training run failed three of its own safety gates. The
+gates were verified correct (six legitimate grades all pass them), so the
+fit was fixed rather than the thresholds. The code now differs from the
+task bodies above in three places, all committed and tested:
+
+1. **`lutfit.enforce_monotone`** — a new function, applied at the end of
+   `fit_lut` under a `monotone: bool = True` parameter. Projects each output
+   channel onto the monotone cone along its own axis by exact 1-D isotonic
+   regression. See the function docstring and `docs/decisions.md`.
+2. **Regularisation defaults** — `lambda_identity` 1e-4 → 1.0,
+   `lambda_smooth` 1e-3 → 1e-2, in both `FitConfig` and `fit_lut`.
+3. **`build_parser`** — extracted from `main`, and every argparse default
+   now derives from `FitConfig()` instead of repeating the literal.
+
+Task 21's step 2 candidate list was also corrected: the usable proxy
+category is `Category:Photographs by the U.S. Department of Agriculture`
+(4,092 files), not the spelled-out "United States" form, which does not
+exist.
