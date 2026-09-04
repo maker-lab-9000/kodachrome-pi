@@ -198,10 +198,10 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
         "2017000001",
     )
     session = FakeSession(_handler, files={"https://upload/1.jpg": _photo_bytes()})
-    path = download(session, info, tmp_path)
-    assert path is not None and path.name == "2017000001.jpg"
+    path, reason = download(session, info, tmp_path)
+    assert path is not None and path.name == "2017000001.jpg" and reason == ""
     calls = len(session.calls)
-    assert download(session, info, tmp_path) == path      # resumed, not re-fetched
+    assert download(session, info, tmp_path) == (path, "")  # resumed, not re-fetched
     assert len(session.calls) == calls
 
     bad = FileInfo(
@@ -215,7 +215,7 @@ def test_download_is_atomic_and_leaves_nothing_on_failure(tmp_path):
         "2017000002",
     )
     failing = FakeSession(_handler, fail_urls={"https://upload/bad.jpg"})
-    assert download(failing, bad, tmp_path, retries=1) is None
+    assert download(failing, bad, tmp_path, retries=1) == (None, "http-500")
     assert list(tmp_path.glob("*.part")) == [], "no partial files may remain"
     assert not (tmp_path / "2017000002.jpg").exists()
 
@@ -232,8 +232,59 @@ def test_download_rejects_undecodable_content(tmp_path):
         "2017000003",
     )
     session = FakeSession(_handler, files={"https://upload/x.jpg": b"garbage"})
-    assert download(session, info, tmp_path) is None
+    path, reason = download(session, info, tmp_path)
+    assert path is None
+    assert reason.startswith("undecodable"), f"the manifest would record {reason!r}"
     assert not (tmp_path / "2017000003.jpg").exists()
+    # Bad content is not retried: it will fail identically every time.
+    assert len(session.calls) == 1
+
+
+def test_a_rejected_photo_records_why_not_just_that_it_failed(tmp_path):
+    """The manifest must distinguish a scanned document from a network error."""
+    info = FileInfo(
+        "File:G LCCN2017000007.jpg",
+        1,
+        2,
+        "https://upload/g.jpg",
+        1200,
+        900,
+        "Public domain",
+        "2017000007",
+    )
+    session = FakeSession(_handler, files={"https://upload/g.jpg": _grey_bytes()})
+    path, reason = download(session, info, tmp_path)
+    assert path is None
+    assert reason == "greyscale", "a document that decodes must not read as 'download-failed'"
+
+
+@pytest.mark.parametrize(
+    "title, expected",
+    [("File:svg.jpg", "mime:image/svg+xml"), ("File:noinfo.jpg", "no-imageinfo")],
+)
+def test_metadata_level_rejections_are_named(title, expected):
+    """Both defensive branches in fetch_imageinfo, which no fixture reached before."""
+
+    def handler(params):
+        if params.get("prop", "").startswith("imageinfo"):
+            page = {"title": title, "pageid": 1, "revisions": [{"revid": 9}]}
+            if "noinfo" not in title:
+                page["imageinfo"] = [
+                    {
+                        "url": "https://upload/x.svg",
+                        "thumburl": "https://upload/x.svg",
+                        "width": 4000,
+                        "height": 3000,
+                        "mime": "image/svg+xml",
+                        "extmetadata": {"LicenseShortName": {"value": "Public domain"}},
+                    }
+                ]
+            return {"query": {"pages": {"0": page}}}
+        raise AssertionError("unexpected params")
+
+    infos, rejected = fetch_imageinfo(FakeSession(handler), [title], 1024)
+    assert infos == []
+    assert rejected == [{"title": title, "reason": expected}]
 
 
 def test_fetch_category_writes_a_manifest_with_hashes_and_rejections(tmp_path):

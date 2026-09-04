@@ -238,29 +238,48 @@ def validate_image(data: bytes) -> tuple[bool, str]:
     return True, ""
 
 
-def download(session: Any, info: FileInfo, out_dir: str | Path, retries: int = 3) -> Path | None:
-    """Download to a temporary file, validate, then rename. Never leaves a partial file."""
+def download(
+    session: Any, info: FileInfo, out_dir: str | Path, retries: int = 3
+) -> tuple[Path | None, str]:
+    """Download to a temporary file, validate, then rename. Never leaves a partial file.
+
+    Returns ``(path, "")`` on success and ``(None, reason)`` on failure. The
+    reason is carried rather than discarded because it lands in the manifest,
+    and "a corpus you cannot audit is a corpus you cannot defend" is this
+    module's whole premise. Collapsing every failure into one generic label
+    would hide the byte-level colour and size check — the very check that
+    catches a scanned document the API described as a photograph.
+
+    Content that decodes but fails validation returns immediately: a greyscale
+    scan will still be a greyscale scan on the third attempt, so retrying only
+    spends the backoff budget. Transport failures do get the retries.
+    """
     out_dir = Path(out_dir)
     final = out_dir / info.filename
     if final.is_file() and final.stat().st_size > 0:
-        return final
+        return final, ""
     tmp = final.with_suffix(final.suffix + ".part")
+    reason = "download-failed"
     for attempt in range(retries):
         try:
             r = session.get(info.url, headers={"User-Agent": USER_AGENT}, timeout=120)
-            if r.status_code == 200 and r.content:
-                ok, _reason = validate_image(r.content)
+            if r.status_code != 200:
+                reason = f"http-{r.status_code}"
+            elif not r.content:
+                reason = "empty-response"
+            else:
+                ok, why = validate_image(r.content)
                 if not ok:
-                    return None
+                    return None, why
                 tmp.write_bytes(r.content)
                 tmp.replace(final)
-                return final
-        except Exception:  # noqa: BLE001
-            pass
+                return final, ""
+        except Exception as exc:  # noqa: BLE001 - every transport failure retries alike
+            reason = f"error:{type(exc).__name__}"
         finally:
             tmp.unlink(missing_ok=True)
         time.sleep(2**attempt)
-    return None
+    return None, reason
 
 
 def corpus_sha1(paths: list[Path]) -> str:
@@ -317,10 +336,10 @@ def fetch_category(
                 say(f"  {info.filename} does not match its recorded hash; refetching")
                 final.unlink()
                 report.repaired += 1
-        path = download(session, info, out_dir)
+        path, reason = download(session, info, out_dir)
         if path is None:
             report.failed += 1
-            rejected.append({"title": info.title, "reason": "download-failed"})
+            rejected.append({"title": info.title, "reason": reason})
             continue
         entry = asdict(info)
         entry["filename"] = info.filename
