@@ -225,3 +225,36 @@ and is a design decision, not a threshold to be quietly loosened —
 `evaluate.py` says the thresholds were "agreed before tuning so the gates
 cannot be quietly relaxed to fit whatever the fit produced", and a failing
 gate on a correct gate means fix the fit.
+
+## 2026-09-04: Resolved — a monotone projection, and defaults that reach the fit
+
+**Decided:** keep the gate thresholds; fix the fit instead. Three changes.
+
+1. `lutfit.enforce_monotone` projects each output channel onto the monotone
+   cone along its own axis. The three constraints touch disjoint variables,
+   so each is an exact 1-D isotonic regression along every fibre and one pass
+   per channel is the optimal least-squares projection. `fit_lut` applies it
+   by default. It costs nothing measurable: on the real fit it moved the
+   held-out distance by less than 0.01%, because the reversals were not
+   contributing to the match in the first place.
+2. `lambda_identity` 1e-4 → 1.0 and `lambda_smooth` 1e-3 → 1e-2. Both were
+   needed and neither alone sufficed: at 1e-4/1e-2 the grey-axis and
+   neutral-tint gates still failed, and at 1.0/1e-3 they also failed. This
+   was established by running the isolating pair rather than reasoning about
+   it, after an earlier attribution turned out to be wrong.
+3. The CLI's argparse defaults now derive from `FitConfig` instead of
+   repeating the numbers. They had been duplicated, so raising the dataclass
+   defaults changed nothing for anyone using `kodachrome-train` — the first
+   run after the change came back byte-identical to the run before it.
+
+**Result:** all five gates pass. Held-out distance 0.02330 → 0.01375, a 41%
+reduction where the gate asks for 0.00161. Trained on 64 proxy-source images
+and 1,140 Library of Congress Kodachrome scans, and promoted to the packaged
+default.
+
+**Caveat worth knowing:** the grade is warmer and richer but also *lifts
+shadows*, which is flatter than Kodachrome's reputation for deep blacks. The
+targets are scans of 70-year-old film, digitised flat; matching their
+distribution reproduces the look of the scan, not of a slide on a light box.
+That is consistent with the aesthetic claim this project already makes, but
+it is a real limit on how "Kodachrome" the output can feel.

@@ -66,8 +66,8 @@ class FitConfig:
     iterations: int = 40
     hue_bins: int = 24
     chroma_floor: float = 0.03
-    lambda_smooth: float = 1e-3
-    lambda_identity: float = 1e-4
+    lambda_smooth: float = 1e-2
+    lambda_identity: float = 1.0
     strength: float = 1.0
     seed: int = 0
 
@@ -252,17 +252,22 @@ def train(
     return metrics, gates
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Split out so the defaults can be asserted against FitConfig directly."""
     parser = argparse.ArgumentParser(prog="kodachrome-train", description="Fit the Kodachrome LUT.")
     parser.add_argument("--source", type=Path, required=True, help="folder of camera photos")
     parser.add_argument("--target", type=Path, default=Path("data/kodachrome"))
     parser.add_argument("--out", type=Path, default=Path("artifacts"))
-    parser.add_argument("--strength", type=float, default=1.0)
-    parser.add_argument("--lut-size", type=int, default=33)
-    parser.add_argument("--iterations", type=int, default=40)
-    parser.add_argument("--hue-bins", type=int, default=24)
-    parser.add_argument("--lambda-smooth", type=float, default=1e-3)
-    parser.add_argument("--lambda-identity", type=float, default=1e-4)
+    # Defaults come from FitConfig so there is ONE source of truth. They were
+    # duplicated here, which silently pinned the CLI to the old values when the
+    # dataclass defaults changed -- every trained artifact used them.
+    fd = FitConfig()
+    parser.add_argument("--strength", type=float, default=fd.strength)
+    parser.add_argument("--lut-size", type=int, default=fd.lut_size)
+    parser.add_argument("--iterations", type=int, default=fd.iterations)
+    parser.add_argument("--hue-bins", type=int, default=fd.hue_bins)
+    parser.add_argument("--lambda-smooth", type=float, default=fd.lambda_smooth)
+    parser.add_argument("--lambda-identity", type=float, default=fd.lambda_identity)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grain-strength", type=float, default=0.025)
@@ -273,7 +278,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="mark the source as stand-in photos, not U20CAM shots")
     parser.add_argument("--allow-small", action="store_true",
                         help="proceed with a corpus below the recommended minimum")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     for label, path in (("source", args.source), ("target", args.target)):
         if not path.is_dir() or not list_images(path):

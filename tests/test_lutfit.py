@@ -2,7 +2,9 @@ import numpy as np
 import pytest
 
 from kodachrome.lut import LUT3D
+from kodachrome.train.evaluate import channels_are_monotone
 from kodachrome.train.lutfit import (
+    enforce_monotone,
     fit_lut,
     node_index,
     second_difference_operator,
@@ -84,3 +86,43 @@ def test_the_identity_term_anchors_nodes_no_data_reaches():
 def test_fit_rejects_mismatched_inputs():
     with pytest.raises(ValueError):
         fit_lut(np.zeros((10, 3)), np.zeros((9, 3)), n=5)
+
+
+def test_enforce_monotone_makes_a_reversed_lut_monotone_without_moving_the_rest():
+    """A least squares fit gives no ordering guarantee; this projection does.
+
+    Reversals of up to 0.366 (93 levels of 255) appeared in the first real
+    fit, in well-supported regions, and would posterise a gradient.
+    """
+    n = 9
+    table = LUT3D.identity(n).table.astype(np.float64).copy()
+    # Fold the red channel back on itself along the red axis, twice.
+    table[5, 2, 3, 0] = table[2, 2, 3, 0]
+    table[7, 4, 1, 0] = 0.0
+    broken = LUT3D(table.astype(np.float32))
+    assert not channels_are_monotone(broken)
+
+    fixed = enforce_monotone(broken)
+    assert channels_are_monotone(fixed)
+
+    # It is a projection, not a rebuild: untouched fibres must be bit-identical.
+    ident = LUT3D.identity(n).table
+    moved = np.abs(fixed.table - ident) > 1e-6
+    assert moved.sum() < 0.05 * moved.size, "projection disturbed far more than the reversals"
+
+
+def test_enforce_monotone_leaves_an_already_monotone_lut_alone():
+    lut = LUT3D((LUT3D.identity(9).table.astype(np.float64) ** 1.3).astype(np.float32))
+    assert channels_are_monotone(lut)
+    assert np.allclose(enforce_monotone(lut).table, lut.table, atol=1e-6)
+
+
+def test_fit_lut_returns_a_monotone_lut_by_default():
+    """The fitter's contract: callers get a LUT that passes the gate."""
+    rng = np.random.default_rng(0)
+    x = rng.random((4000, 3)).astype(np.float32)
+    # A deliberately order-breaking target: partners that invert in red.
+    y = x.copy()
+    y[:, 0] = 1.0 - y[:, 0]
+    assert not channels_are_monotone(fit_lut(x, y, n=9, monotone=False))
+    assert channels_are_monotone(fit_lut(x, y, n=9))

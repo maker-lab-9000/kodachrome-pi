@@ -1,7 +1,7 @@
 {
   "version": 2,
   "lut_file": "kodachrome.cube",
-  "lut_sha1": "0b7924bb51de67e0f7d8bc33a401e34b73a94ee6",
+  "lut_sha1": "3dfa46cafffeae21a7918a8673798116c6aa538c",
   "normalize": {
     "white_balance": true,
     "wb_gain_min": 0.6,
@@ -18,8 +18,8 @@
     "enabled": true
   },
   "training": {
-    "date": "2026-09-04T02:42:13Z",
-    "code_revision": "cff7179",
+    "date": "2026-09-04T03:28:58Z",
+    "code_revision": "5e2d44b",
     "package_version": "0.1.0",
     "dependency_versions": {
       "numpy": "2.5.2",
@@ -70,11 +70,11 @@
       "iterations": 40,
       "hue_bins": 24,
       "chroma_floor": 0.03,
-      "lambda_smooth": 0.001,
-      "lambda_identity": 0.0001,
+      "lambda_smooth": 0.01,
+      "lambda_identity": 1.0,
       "strength": 1.0,
       "seed": 0,
-      "fit_seconds": 14.7
+      "fit_seconds": 14.6
     },
     "sample": {
       "crop_frac": 0.06,
@@ -88,17 +88,17 @@
     },
     "metrics": {
       "swd_before": 0.023298,
-      "swd_after": 0.013463,
+      "swd_after": 0.013749,
       "swd_identity": 0.023298,
-      "swd_seed_spread": 0.000567,
+      "swd_seed_spread": 0.000535,
       "train_swd_before": 0.015748,
-      "train_swd_after": 0.000742,
+      "train_swd_after": 0.003258,
       "transport_gamut_clip_deltaE": 0.000398,
-      "lut_fit_rms_deltaE": 0.001804,
-      "grey_axis_monotone": false,
-      "channel_monotone": false,
-      "neutral_axis_max_chroma": 0.029617,
-      "clipped_volume_fraction": 0.00188,
+      "lut_fit_rms_deltaE": 0.011165,
+      "grey_axis_monotone": true,
+      "channel_monotone": true,
+      "neutral_axis_max_chroma": 0.01862,
+      "clipped_volume_fraction": 0.0,
       "n_val_source_pixels": 36000,
       "n_val_target_pixels": 400000,
       "held_out_eval": true

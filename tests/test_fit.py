@@ -7,7 +7,7 @@ from kodachrome.artifacts import Artifacts
 from kodachrome.color import lch_to_oklab, oklab_to_lch, oklab_to_srgb, srgb_to_oklab
 from kodachrome.imageio import save_jpeg
 from kodachrome.train.dataset import PixelPool, SampleConfig
-from kodachrome.train.fit import FitConfig, fit, main, train
+from kodachrome.train.fit import FitConfig, build_parser, fit, main, train
 
 
 def _curve_and_rotation(lab, gamma=1.15, chroma=1.25, degrees=10.0):
@@ -209,3 +209,18 @@ def test_main_reports_a_failed_gate_with_exit_code_3(tmp_path, monkeypatch, caps
     err = capsys.readouterr().err
     assert "improvement_exceeds_noise" in err
     assert Artifacts.load(tmp_path / "o").lut.size == 9  # written despite the failure
+
+
+def test_cli_defaults_track_fitconfig():
+    """Duplicated defaults silently pinned the CLI to stale values.
+
+    `--lambda-identity` and `--lambda-smooth` were hard-coded in argparse, so
+    raising the dataclass defaults changed nothing for anyone using the CLI --
+    which is everyone who trains an artifact. The first fit run after the
+    change came back byte-identical to the run before it.
+    """
+    defaults = vars(build_parser().parse_args(["--source", "x"]))
+    cfg = FitConfig()
+    for name in ("lambda_identity", "lambda_smooth", "lut_size", "iterations",
+                 "hue_bins", "strength", "seed"):
+        assert defaults[name] == getattr(cfg, name), name

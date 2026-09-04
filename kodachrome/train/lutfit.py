@@ -14,9 +14,15 @@ non-zeros per row), solved once per output channel:
 * ``D`` stacks second-difference operators along the three grid axes. The
   **smoothness term** stops individual nodes chasing noisy partners, which
   would show up as banding or speckle in gradients.
-* ``I`` is the identity LUT. The **identity term** is tiny but decides what
-  happens to nodes no source pixel ever touches (a saturated magenta the
-  camera never saw): they stay where they were instead of drifting.
+* ``I`` is the identity LUT. The **identity term** decides what happens to
+  nodes no source pixel ever touches (a saturated magenta the camera never
+  saw): they stay where they were instead of drifting. On real corpora this
+  matters more than it sounds -- 71% of the cube held no source pixels in the
+  first real fit, and at the original 1e-4 weight those nodes drifted far
+  enough to fail the grey-axis and neutral-tint gates.
+
+Least squares alone cannot promise the result is monotone, so a final
+projection (``enforce_monotone``) enforces it exactly. See that function.
 
 Each term is divided by its own row count so the lambdas are relative
 weights that do not change meaning when the sample count or grid size does.
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse as sp
+from scipy.optimize import isotonic_regression
 from scipy.sparse.linalg import cg
 
 from ..lut import LUT3D
@@ -92,14 +99,43 @@ def second_difference_operator(n: int) -> sp.csr_matrix:
     return sp.vstack(blocks).tocsr()
 
 
+def enforce_monotone(lut: LUT3D) -> LUT3D:
+    """Project each output channel onto the monotone cone along its own axis.
+
+    Least squares fitting gives no ordering guarantee, and neither does the
+    transport that produced its targets: where transport asks a dark pixel to
+    brighten and its slightly lighter neighbour to darken, the LUT obliges.
+    Measured on the first real fit that produced reversals of up to 0.366,
+    which is 93 levels out of 255 -- enough to posterise or invert a gradient.
+
+    ``channels_are_monotone`` requires output channel ``c`` not to fall as
+    input axis ``c`` rises. Those three constraints touch disjoint variables,
+    so each is an exact 1-D isotonic regression along every fibre and a single
+    pass per channel is the optimal least squares projection. It is also
+    nearly free in match quality: on the first real fit it moved the held-out
+    sliced Wasserstein distance by less than 0.01%, because the reversals
+    contributed nothing to the match in the first place.
+    """
+    table = np.array(lut.table, dtype=np.float64)
+    n = lut.size
+    for c in range(3):
+        plane = np.moveaxis(table[..., c], c, 0).copy()
+        fibres = plane.reshape(n, -1)
+        for j in range(fibres.shape[1]):
+            fibres[:, j] = isotonic_regression(fibres[:, j]).x
+        table[..., c] = np.moveaxis(fibres.reshape(plane.shape), 0, c)
+    return LUT3D(np.clip(table, 0.0, 1.0).astype(np.float32))
+
+
 def fit_lut(
     x_srgb: np.ndarray,
     y_srgb: np.ndarray,
     n: int = 33,
-    lambda_smooth: float = 1e-3,
-    lambda_identity: float = 1e-4,
+    lambda_smooth: float = 1e-2,
+    lambda_identity: float = 1.0,
     rtol: float = 1e-8,
     maxiter: int = 5000,
+    monotone: bool = True,
 ) -> LUT3D:
     x = np.asarray(x_srgb, dtype=np.float64)
     y = np.clip(np.asarray(y_srgb, dtype=np.float64), 0.0, 1.0)
@@ -126,4 +162,5 @@ def fit_lut(
                 "raise --lambda-identity or --lambda-smooth slightly"
             )
         table[:, c] = sol
-    return LUT3D(np.clip(table, 0.0, 1.0).reshape(n, n, n, 3).astype(np.float32))
+    lut = LUT3D(np.clip(table, 0.0, 1.0).reshape(n, n, n, 3).astype(np.float32))
+    return enforce_monotone(lut) if monotone else lut
