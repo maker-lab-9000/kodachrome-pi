@@ -42,6 +42,47 @@ number, Commons page and revision ID, licence and SHA-1, plus every
 rejection and why. To use your own scans instead, point `kodachrome-train
 --target` at any folder.
 
+### 2. Collect camera samples
+
+Take 50 or more shots with the U20CAM across varied scenes: indoors and out,
+sky, foliage, skin, neutral walls, mixed lighting. Copy the `*_original.jpg`
+files into one folder, for example `data/source/`.
+
+### 3. Fit the LUT
+
+```bash
+.venv/bin/kodachrome-train --source data/source --target data/kodachrome
+```
+
+Writes `artifacts/` (LUT, `params.json`, `report/`) and prints the held-out
+result plus a pass or fail line per gate. Exit code 3 means the artifact was
+written but a gate failed; read the report before using it.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--strength` | 1.0 | 0 = no change, 1 = full; 0.7 for a lighter touch |
+| `--val-fraction` | 0.2 | share of images held out of training for the metrics |
+| `--lambda-smooth` | 1e-3 | raise if the ramps band or the fit looks noisy |
+| `--lambda-identity` | 1e-4 | raise if colours the camera never produced go strange |
+| `--grain-strength` | 0.025 | grain, in luminance units at mid-grey |
+| `--proxy-source` | off | mark the source as stand-in photos |
+| `--allow-small` | off | proceed with a corpus below the recommended minimum |
+
+### 4. Read the report
+
+`report/summary.txt` is the short version: the held-out distance before and
+after, the seed spread it must beat, and each gate. `contact_sheet.png`
+shows held-out images normalised, graded, and beside real scans.
+`ramps.png` shows the tone curve and hue movement. `diagnostics.png` shows
+how often normalisation clamped. `metrics.json` has everything.
+
+Promote a fit you like to the shipped default by copying it into the
+package:
+
+```bash
+cp artifacts/kodachrome.cube artifacts/params.json kodachrome/data/
+```
+
 ## Pi setup
 
 Written in a later step.
