@@ -6038,6 +6038,39 @@ def test_identity_lut_gives_identical_before_and_after():
     assert after == pytest.approx(before, abs=1e-6)
 
 
+def test_pairing_holds_when_the_pool_is_actually_subsampled():
+    """The production case, which no other test here reaches.
+
+    Every other pool in this file is smaller than ``max_points``, so
+    ``rng.choice(n, n, replace=False)`` returns a full permutation and
+    ``distance`` — which sorts the projections before comparing — gives the
+    same answer whether or not the indices are applied at all. Measured:
+    identical to ten decimal places. So an implementation that ignored
+    ``src_idx`` entirely would pass every other assertion in this file.
+
+    A real run caps pools at 400,000 pixels against a 100,000 sample, so the
+    indices genuinely select a subset. This forces that, and then re-checks
+    the property the whole evaluator exists for.
+    """
+    src, tgt = _pool(11), _pool(12, scale=0.8)
+    weights = np.ones(len(tgt.srgb))
+    ev = Evaluator.build(src, tgt, weights, seed=0, max_points=500)
+
+    assert len(ev.src_idx) == 500, "the sample must be a subset, not the whole pool"
+    assert ev.tgt_points.shape[0] == 500
+    assert ev.distance(src.lab) != Evaluator.build(src, tgt, weights, seed=0).distance(src.lab)
+
+    same = Evaluator.build(src, tgt, weights, seed=0, max_points=500)
+    assert np.array_equal(same.src_idx, ev.src_idx)
+    other = Evaluator.build(src, tgt, weights, seed=1, max_points=500)
+    assert not np.array_equal(other.src_idx, ev.src_idx)
+
+    # And the property the evaluator exists for still holds on a real subset.
+    before = ev.distance(src.lab)
+    after = ev.distance(srgb_to_oklab(LUT3D.identity(33).apply_numpy(src.srgb)))
+    assert after == pytest.approx(before, abs=1e-6)
+
+
 def test_evaluator_is_reusable_and_deterministic():
     src, tgt = _pool(2), _pool(3)
     ev = Evaluator.build(src, tgt, np.ones(len(tgt.srgb)), seed=7)
