@@ -141,21 +141,32 @@ def make_session() -> Any:
     return requests.Session()
 
 
+# Above this, a titles query goes by POST instead of GET. MediaWiki accepts
+# POST for action=query, and 50 long file titles overflow the URL length limit:
+# the Ektachrome category returned HTTP 414 with a GET.
+_MAX_QUERY_CHARS = 1500
+
+
 def api_get(session: Any, params: dict, retries: int = 6, sleep: Any = time.sleep) -> dict:
-    """GET with backoff. 429 honours Retry-After and waits much longer.
+    """Query the API with backoff. 429 honours Retry-After and waits much longer.
 
     Enumerating a 4,000-file category is dozens of paginated calls in quick
     succession, and Commons answers a burst of those with 429. The old
     1-2-4 second retry gave up in seven seconds; two fetches died that way.
     """
     params = {**params, "format": "json"}
+    use_post = sum(len(str(k)) + len(str(v)) for k, v in params.items()) > _MAX_QUERY_CHARS
     last = "no response"
     for attempt in range(retries):
         wait = 2**attempt
         try:
-            r = session.get(API_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=60)
+            kw = {"data": params} if use_post else {"params": params}
+            method = session.post if use_post else session.get
+            r = method(API_URL, headers={"User-Agent": USER_AGENT}, timeout=60, **kw)
             if r.status_code == 200:
                 return r.json()
+            if r.status_code == 414:
+                use_post = True          # retry the same request as a POST
             last = f"HTTP {r.status_code}"
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None

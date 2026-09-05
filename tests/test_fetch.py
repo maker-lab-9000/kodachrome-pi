@@ -404,3 +404,36 @@ def test_api_get_backs_off_much_longer_on_429_and_honours_retry_after():
     with pytest.raises(FetchError, match="HTTP 429"):
         always_429 = type("S2", (), {"get": lambda self, *a, **k: R(429)})()
         api_get(always_429, {}, retries=2, sleep=lambda s: None)
+
+
+def test_a_long_titles_query_goes_by_post_and_414_switches_mid_flight():
+    """50 long file titles overflow the URL length limit; Commons answers 414."""
+    class R:
+        def __init__(self, code):
+            self.status_code, self.headers = code, {}
+        def json(self):
+            return {"ok": True}
+
+    calls = []
+
+    class S:
+        def get(self, url, **kw):
+            calls.append(("get", kw))
+            return R(414)
+
+        def post(self, url, **kw):
+            calls.append(("post", kw))
+            return R(200)
+
+    # Short query: GET is fine, and a 414 flips it to POST for the retry.
+    short = {"action": "query", "titles": "File:A.jpg"}
+    assert api_get(S(), short, sleep=lambda s: None) == {"ok": True}
+    assert [c[0] for c in calls] == ["get", "post"]
+    assert "data" in calls[1][1] and "params" not in calls[1][1]
+
+    # Long query: POST from the first attempt, no 414 round trip needed.
+    calls.clear()
+    long_titles = "|".join(f"File:{'x' * 60}_{i}.jpg" for i in range(50))
+    long_q = {"action": "query", "titles": long_titles}
+    assert api_get(S(), long_q, sleep=lambda s: None) == {"ok": True}
+    assert [c[0] for c in calls] == ["post"]
