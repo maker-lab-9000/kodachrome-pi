@@ -179,7 +179,7 @@ def test_preview_loop_survives_a_frame_error(tmp_path, pipeline, monkeypatch, ca
     monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
     monkeypatch.setattr(cv2, "imshow", lambda *a, **k: None)
     keys = iter([ord("q")])
-    monkeypatch.setattr(cv2, "waitKey", lambda _n: next(keys))
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay == 50 else next(keys))
 
     session = _session(tmp_path, pipeline)
     calls = {"n": 0}
@@ -201,6 +201,7 @@ def capture_gui(monkeypatch):
 
     shown = []
     monkeypatch.setattr(cv2, "namedWindow", Mock())
+    monkeypatch.setattr(cv2, "resizeWindow", Mock())
     monkeypatch.setattr(cv2, "setWindowProperty", Mock())
     monkeypatch.setattr(cv2, "getWindowProperty", lambda name, prop: cv2.WINDOW_FREERATIO)
     monkeypatch.setattr(cv2, "getWindowImageRect", lambda name: (0, 0, 640, 360))
@@ -240,6 +241,8 @@ def test_capture_display_changes_only_after_snapshot(
         return key
 
     def wait_key(delay):
+        if delay == 50:
+            return -1
         if delay == 1:
             repaints.append(capture_gui[-1].copy())
             return -1
@@ -287,7 +290,7 @@ def test_capture_display_keeps_last_photo_after_failed_capture(
     events = iter([(32, 1), (32, 3), (-1, 5), (32, 5), (ord("q"), 7)])
 
     def next_key(delay):
-        if delay == 1:
+        if delay in (1, 50):
             return -1
         key, updates = next(events)
         assert len(capture_gui) == updates
@@ -308,7 +311,7 @@ def test_capture_display_preserves_portrait_aspect_ratio(
 
     session = _session(tmp_path, pipeline, FakeCamera([synthetic_frame(160, 90)]))
     keys = iter([32, ord("q")])
-    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay == 1 else next(keys))
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay in (1, 50) else next(keys))
     assert run_preview_loop(session, captures_only=True)
     assert capture_gui[-1].shape == (360, 640, 3)
     assert not capture_gui[-1][:, :219].any()
@@ -334,7 +337,7 @@ def test_fullscreen_capture_fits_display_resolution(
     monkeypatch.setattr(cv2, "getWindowImageRect", lambda name: (0, 0, *size))
     session = _session(tmp_path, pipeline, FakeCamera([synthetic_frame(120, 160)]))
     keys = iter([32, ord("q")])
-    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay == 1 else next(keys))
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay in (1, 50) else next(keys))
     assert run_preview_loop(session, captures_only=True)
     cv2.namedWindow.assert_called_once_with(
         cv2.namedWindow.call_args.args[0], cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO,
@@ -342,10 +345,10 @@ def test_fullscreen_capture_fits_display_resolution(
     cv2.setWindowProperty.assert_called_once_with(
         cv2.namedWindow.call_args.args[0], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN,
     )
-    assert len(capture_gui) == 3  # prompt, loading bars, saved photo
-    for frame in capture_gui:
+    assert len(capture_gui) == 4  # initial drawable, fullscreen prompt, loading bars, photo
+    for frame in capture_gui[1:]:
         assert frame.shape == (size[1], size[0], 3)
-    assert len(np.unique(capture_gui[1][0], axis=0)) == 7
+    assert len(np.unique(capture_gui[2][0], axis=0)) == 7
 
     left, top, width, height = image_rect
     saved, = (tmp_path / "shots").rglob("*_kodachrome.jpg")
@@ -370,7 +373,7 @@ def test_resolution_change_redraws_full_resolution_photo_without_recapture(
     keys = iter([32, -1, ord("q")])
 
     def wait_key(delay):
-        if delay == 1:
+        if delay in (1, 50):
             return -1
         key = next(keys)
         if key == -1:
@@ -401,7 +404,7 @@ def test_fullscreen_live_preview_preserves_camera_aspect_ratio(
     assert capture_gui[-1][:, 240:1680].any()
 
 
-@pytest.mark.parametrize("geometry", [(0, 0, 0, 0), (0, 0, -1, -1), None])
+@pytest.mark.parametrize("geometry", [(0, 0, 0, 0), (0, 0, -1, -1), (0, 0, 1, 1), None])
 def test_fullscreen_tolerates_unavailable_geometry(
     tmp_path, pipeline, monkeypatch, capture_gui, geometry,
 ):
@@ -436,9 +439,43 @@ def test_gtk_geometry_includes_borders_outside_the_image(
     assert _window_size("capture", (640, 360)) == display_size
 
 
+def test_gtk_first_image_allocation_does_not_shrink_fullscreen_drawable(
+    tmp_path, pipeline, monkeypatch, capture_gui,
+):
+    """GTK's first-image allocation overrides fullscreen if it hasn't been painted yet."""
+    import cv2
+
+    state = {"painted": False, "fullscreen": False, "stuck": False, "size": (1, 1)}
+
+    def fullscreen(name, prop, value):
+        if prop == cv2.WND_PROP_FULLSCREEN:
+            state["fullscreen"] = True
+            state["stuck"] = not state["painted"]
+
+    keys = iter([32, ord("q")])
+
+    def wait_key(delay):
+        if capture_gui and not state["painted"]:
+            state["painted"] = True
+            state["size"] = capture_gui[0].shape[1::-1]
+        if state["fullscreen"] and not state["stuck"]:
+            state["size"] = (1920, 1080)
+        return -1 if delay in (1, 50) else next(keys)
+
+    monkeypatch.setattr(cv2, "setWindowProperty", fullscreen)
+    monkeypatch.setattr(cv2, "waitKey", wait_key)
+    monkeypatch.setattr(cv2, "getWindowImageRect", lambda name: (0, 0, *state["size"]))
+    assert run_preview_loop(_session(tmp_path, pipeline), captures_only=True)
+    assert not state["stuck"]
+    assert capture_gui[-2].shape == (1080, 1920, 3)  # loading bars
+    assert capture_gui[-1].shape == (1080, 1920, 3)  # saved photo
+    cv2.resizeWindow.assert_any_call(cv2.namedWindow.call_args.args[0], 1920, 1080)
+
+
 @pytest.mark.parametrize(
     "failure_at",
-    ["namedWindow", "setWindowProperty", "imshow", "waitKey", "loading_image", "saved_image"],
+    ["namedWindow", "resizeWindow", "setWindowProperty", "imshow", "waitKey",
+     "loading_image", "saved_image"],
 )
 def test_capture_display_gui_failure_cleans_up_and_allows_fallback(
     tmp_path, pipeline, monkeypatch, capture_gui, failure_at,

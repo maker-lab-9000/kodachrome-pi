@@ -204,7 +204,7 @@ def _fit_display(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 def _window_size(window_name: str, previous: tuple[int, int]) -> tuple[int, int]:
     try:
         _, _, width, height = cv2.getWindowImageRect(window_name)
-        if width > 0 and height > 0:
+        if width > 1 and height > 1:
             # GTK reports the fitted image rectangle, but exposes the entire widget's
             # width/height ratio through this property. Qt returns a ratio-mode enum.
             try:
@@ -272,17 +272,24 @@ def run_preview_loop(
     graded = True
     try:
         try:
+            # GTK's first imshow resets the drawable to the image's size. Let that
+            # allocation finish BEFORE fullscreen, or it can leave a tiny drawable
+            # inside a fullscreen (white) outer window. Do not read geometry yet.
+            display_size = (640, 360)
+            displayed_frame = _capture_prompt(display_size)
+            cv2.resizeWindow(window_name, *display_size)
+            cv2.imshow(window_name, displayed_frame)
+            cv2.waitKey(50)
             cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            display_size = _window_size(window_name, (640, 360))
+            cv2.waitKey(50)
             captured_frame = None  # Keep the full-resolution photo for subsequent display resizes.
-            if captures_only:
-                displayed_frame = _capture_prompt(display_size)
-                cv2.imshow(window_name, displayed_frame)
         except cv2.error:
             return False
         while True:
             try:
                 size = _window_size(window_name, display_size)
+                if size != display_size:
+                    cv2.resizeWindow(window_name, *size)
                 if captures_only and size != display_size:
                     displayed_frame = (
                         _capture_prompt(size) if captured_frame is None
