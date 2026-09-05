@@ -143,7 +143,7 @@ class CaptureSession:
         return CaptureResult(original, kodachrome, record)
 
     def preview_frame(self, graded: bool = True, size: tuple[int, int] = (640, 360)) -> np.ndarray:
-        small = cv2.resize(self.camera.read().rgb, size, interpolation=cv2.INTER_AREA)
+        small = _resize_to_fit(self.camera.read().rgb, size)
         if graded:
             small, _ = self.pipeline.process(small, grain=False)
         return small
@@ -183,6 +183,59 @@ def run_headless_loop(
             return count
 
 
+def _resize_to_fit(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    height, width = frame.shape[:2]
+    scale = min(size[0] / width, size[1] / height)
+    fitted = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(frame, fitted, interpolation=cv2.INTER_AREA)
+
+
+def _fit_display(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Fit an image into the display, using black borders instead of cropping/stretching."""
+    width, height = size
+    fitted = _resize_to_fit(frame, size)
+    image_height, image_width = fitted.shape[:2]
+    left, top = (width - image_width) // 2, (height - image_height) // 2
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[top:top + image_height, left:left + image_width] = fitted
+    return canvas
+
+
+def _window_size(window_name: str, previous: tuple[int, int]) -> tuple[int, int]:
+    try:
+        _, _, width, height = cv2.getWindowImageRect(window_name)
+        if width > 0 and height > 0:
+            # GTK reports the fitted image rectangle, but exposes the entire widget's
+            # width/height ratio through this property. Qt returns a ratio-mode enum.
+            try:
+                ratio = cv2.getWindowProperty(window_name, cv2.WND_PROP_ASPECT_RATIO)
+                if np.isfinite(ratio) and ratio > 0 and ratio != cv2.WINDOW_FREERATIO:
+                    if width / height < ratio:
+                        width = round(height * ratio)
+                    else:
+                        height = round(width / ratio)
+            except cv2.error:
+                pass
+            return width, height
+    except cv2.error:
+        # Some backends cannot report geometry; let the window preserve image proportions.
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
+    return previous
+
+
+def _capture_prompt(size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    screen = np.zeros((height, width, 3), dtype=np.uint8)
+    label = "SPACE to capture"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(width / 640, height / 360)
+    thickness = max(1, round(scale * 2))
+    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, thickness)
+    position = ((width - text_width) // 2, (height + text_height) // 2)
+    cv2.putText(screen, label, position, font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return screen
+
+
 def _capture_loading_screen(size: tuple[int, int]) -> np.ndarray:
     """Draw TV-style colour bars in OpenCV's BGR order."""
     width, height = size
@@ -197,9 +250,10 @@ def _capture_loading_screen(size: tuple[int, int]) -> np.ndarray:
     label = "Processing photo..."
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = min(width / 640, height / 360) * 0.7
-    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, 1)
+    thickness = max(1, round(scale))
+    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, thickness)
     position = ((width - text_width) // 2, (height * 7 // 8) + text_height // 2)
-    cv2.putText(screen, label, position, font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(screen, label, position, font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return screen
 
 
@@ -212,25 +266,35 @@ def run_preview_loop(
 ) -> bool:
     """Run the windowed loop. Returns False if this build cannot show a window."""
     try:
-        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
     except cv2.error:
         return False
     graded = True
     try:
-        if captures_only:
-            try:
-                placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(placeholder, "SPACE to capture", (175, 185),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                displayed_frame = placeholder
+        try:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            display_size = _window_size(window_name, (640, 360))
+            captured_frame = None  # Keep the full-resolution photo for subsequent display resizes.
+            if captures_only:
+                displayed_frame = _capture_prompt(display_size)
                 cv2.imshow(window_name, displayed_frame)
-            except cv2.error:
-                return False
+        except cv2.error:
+            return False
         while True:
             try:
+                size = _window_size(window_name, display_size)
+                if captures_only and size != display_size:
+                    displayed_frame = (
+                        _capture_prompt(size) if captured_frame is None
+                        else _fit_display(captured_frame, size)
+                    )
+                    cv2.imshow(window_name, displayed_frame)
+                display_size = size
                 if not captures_only:
                     frame = session.preview_frame(graded)
-                    cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    cv2.imshow(window_name, _fit_display(
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), display_size,
+                    ))
                 key = cv2.waitKey(30 if captures_only else 1) & 0xFF
             except CameraError as exc:
                 print(f"error: {exc}")
@@ -244,8 +308,7 @@ def run_preview_loop(
             if key == ord(" "):
                 try:
                     if captures_only:
-                        height, width = displayed_frame.shape[:2]
-                        cv2.imshow(window_name, _capture_loading_screen((width, height)))
+                        cv2.imshow(window_name, _capture_loading_screen(display_size))
                         # imshow queues a repaint; pump GUI events before blocking on capture.
                         cv2.waitKey(1)
                     try:
@@ -253,11 +316,8 @@ def run_preview_loop(
                         _announce(result, print)
                         if captures_only:
                             frame, _ = load_rgb(result.kodachrome)
-                            height, width = frame.shape[:2]
-                            scale = min(640 / width, 360 / height)
-                            size = (max(1, round(width * scale)), max(1, round(height * scale)))
-                            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-                            displayed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            captured_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            displayed_frame = _fit_display(captured_frame, display_size)
                     except (CameraError, OSError) as exc:
                         print(f"error: {exc}")
                     if captures_only:

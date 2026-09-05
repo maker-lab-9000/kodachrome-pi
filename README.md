@@ -170,12 +170,16 @@ kodachrome-capture --fake          # no hardware, synthetic frames
 
 Keys: `SPACE` capture, `P` toggle graded/original preview, `Q` quit. SPACE
 takes a fresh frame; it does not save the frame currently displayed.
+The preview and capture display open fullscreen; Q or Escape exits. Images fit
+the current display resolution without cropping or stretching, with black borders
+where the aspect ratios differ. The display adapts if its resolution changes.
 
 With `--show-captures`, the window initially shows a capture prompt, then displays
-the saved graded JPEG (including grain), scaled to fit within 640 × 360 while
+the saved graded JPEG (including grain), scaled from the full-resolution image while
 preserving its aspect ratio. The image stays unchanged until the next successful
 snapshot, with a TV colour-bar loading screen shown while each photo is captured
-and processed. If capture fails, the previous image is restored. There is no live
+and processed. The prompt and colour bars also fit the display resolution.
+If capture fails, the previous image is restored. There is no live
 preview or continuous grading. SPACE and Q work from
 either the terminal or the image window. P has no effect in this mode.
 `--show-captures` also disables live preview when used on its own. A display and
