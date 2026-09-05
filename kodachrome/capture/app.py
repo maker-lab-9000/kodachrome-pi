@@ -7,7 +7,8 @@ knows how to take one capture or produce one preview frame. Two thin loops
 drive it, both taking injectable key sources so the whole flow is testable
 with ``FakeCamera``:
 
-* ``run_preview_loop`` draws the graded feed in an OpenCV window. Every GUI
+* ``run_preview_loop`` draws the graded feed, or only saved captures, in an OpenCV window.
+  Capture display mode reads the camera only when SPACE is pressed. Every GUI
   call is inside the guard, because a build without GUI support can fail at
   ``imshow`` rather than at ``namedWindow``, and a failure there must fall
   back to headless rather than end the session.
@@ -59,7 +60,7 @@ import numpy as np
 from .. import __version__
 from .._cv2 import require_cv2
 from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
-from ..imageio import save_jpeg
+from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
 from .camera import Camera, CameraError, FakeCamera, V4L2Camera
 
@@ -67,6 +68,7 @@ cv2 = require_cv2()
 
 DEFAULT_OUT = Path("~/Pictures/kodachrome")
 WINDOW_NAME = "Kodachrome  [SPACE capture | P toggle grade | Q quit]"
+CAPTURE_WINDOW_NAME = "Kodachrome captures  [SPACE capture | Q quit]"
 
 
 @dataclass
@@ -181,7 +183,33 @@ def run_headless_loop(
             return count
 
 
-def run_preview_loop(session: CaptureSession, window_name: str = WINDOW_NAME) -> bool:
+def _capture_loading_screen(size: tuple[int, int]) -> np.ndarray:
+    """Draw TV-style colour bars in OpenCV's BGR order."""
+    width, height = size
+    screen = np.zeros((height, width, 3), dtype=np.uint8)
+    colours = [
+        (191, 191, 191), (0, 191, 191), (191, 191, 0), (0, 191, 0),
+        (191, 0, 191), (0, 0, 191), (191, 0, 0),
+    ]
+    for index, colour in enumerate(colours):
+        left, right = index * width // 7, (index + 1) * width // 7
+        screen[:height * 3 // 4, left:right] = colour
+    label = "Processing photo..."
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(width / 640, height / 360) * 0.7
+    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, 1)
+    position = ((width - text_width) // 2, (height * 7 // 8) + text_height // 2)
+    cv2.putText(screen, label, position, font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    return screen
+
+
+def run_preview_loop(
+    session: CaptureSession,
+    window_name: str = WINDOW_NAME,
+    *,
+    captures_only: bool = False,
+    read_key: Callable[[], str | None] | None = None,
+) -> bool:
     """Run the windowed loop. Returns False if this build cannot show a window."""
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
@@ -189,22 +217,54 @@ def run_preview_loop(session: CaptureSession, window_name: str = WINDOW_NAME) ->
         return False
     graded = True
     try:
+        if captures_only:
+            try:
+                placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(placeholder, "SPACE to capture", (175, 185),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                displayed_frame = placeholder
+                cv2.imshow(window_name, displayed_frame)
+            except cv2.error:
+                return False
         while True:
             try:
-                frame = session.preview_frame(graded)
-                cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                key = cv2.waitKey(1) & 0xFF
+                if not captures_only:
+                    frame = session.preview_frame(graded)
+                    cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                key = cv2.waitKey(30 if captures_only else 1) & 0xFF
             except CameraError as exc:
                 print(f"error: {exc}")
                 continue
             except cv2.error:
                 return False
+            if read_key is not None:
+                terminal_key = read_key()
+                if terminal_key:
+                    key = ord(terminal_key)
             if key == ord(" "):
                 try:
-                    _announce(session.capture(), print)
-                except (CameraError, OSError) as exc:
-                    print(f"error: {exc}")
-            elif key in (ord("p"), ord("P")):
+                    if captures_only:
+                        height, width = displayed_frame.shape[:2]
+                        cv2.imshow(window_name, _capture_loading_screen((width, height)))
+                        # imshow queues a repaint; pump GUI events before blocking on capture.
+                        cv2.waitKey(1)
+                    try:
+                        result = session.capture()
+                        _announce(result, print)
+                        if captures_only:
+                            frame, _ = load_rgb(result.kodachrome)
+                            height, width = frame.shape[:2]
+                            scale = min(640 / width, 360 / height)
+                            size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+                            displayed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    except (CameraError, OSError) as exc:
+                        print(f"error: {exc}")
+                    if captures_only:
+                        cv2.imshow(window_name, displayed_frame)
+                except cv2.error:
+                    return False
+            elif not captures_only and key in (ord("p"), ord("P")):
                 graded = not graded
             elif key in (ord("q"), ord("Q"), 27):
                 return True
@@ -248,7 +308,11 @@ def main(argv: list[str] | None = None) -> int:
         "--artifacts", type=Path, default=None, help="artifact dir (default: bundled)"
     )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--no-preview", action="store_true", help="never open a window")
+    parser.add_argument("--no-preview", action="store_true", help="disable the live preview")
+    parser.add_argument(
+        "--show-captures", action="store_true",
+        help="display each saved graded photo until the next capture (disables live preview)",
+    )
     parser.add_argument("--fake", action="store_true", help="synthetic camera, no hardware")
     parser.add_argument("--seed", type=int, default=None, help="seed the grain seed generator")
     args = parser.parse_args(argv)
@@ -271,7 +335,21 @@ def main(argv: list[str] | None = None) -> int:
         seed_rng=np.random.default_rng(args.seed),
     )
     try:
-        if not args.no_preview and has_display():
+        if args.show_captures and has_display():
+            if sys.stdin.isatty():
+                with TerminalKeys() as keys:
+                    displayed = run_preview_loop(
+                        session, CAPTURE_WINDOW_NAME, captures_only=True,
+                        read_key=lambda: keys.read(timeout=0),
+                    )
+            else:
+                displayed = run_preview_loop(session, CAPTURE_WINDOW_NAME, captures_only=True)
+            if displayed:
+                return 0
+            print("Capture display unavailable; falling back to headless mode.")
+        elif args.show_captures:
+            print("No display attached; falling back to headless mode.")
+        elif not args.no_preview and has_display():
             if run_preview_loop(session):
                 return 0
             print("Preview unavailable (OpenCV built without GUI); falling back to headless mode.")

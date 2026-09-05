@@ -1,6 +1,7 @@
 import io
 import json
 from datetime import datetime
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from kodachrome.artifacts import Artifacts, write_artifact
 from kodachrome.capture.app import CaptureSession, main, run_headless_loop, run_preview_loop
 from kodachrome.capture.camera import CameraError, FakeCamera, Frame, StreamInfo, synthetic_frame
 from kodachrome.grain import GrainParams
+from kodachrome.imageio import load_rgb
 from kodachrome.lut import LUT3D
 from kodachrome.normalize import NormalizeParams
 from kodachrome.pipeline import Pipeline
@@ -191,6 +193,193 @@ def test_preview_loop_survives_a_frame_error(tmp_path, pipeline, monkeypatch):
 
     monkeypatch.setattr(session, "preview_frame", flaky)
     assert run_preview_loop(session) is True  # a dropped frame must not end the session
+
+
+@pytest.fixture
+def capture_gui(monkeypatch):
+    import cv2
+
+    shown = []
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda: None)
+    monkeypatch.setattr(cv2, "imshow", lambda name, frame: shown.append(frame.copy()))
+    return shown
+
+
+@pytest.mark.parametrize("terminal_controls", [False, True])
+def test_capture_display_changes_only_after_snapshot(
+    tmp_path, pipeline, monkeypatch, capture_gui, terminal_controls,
+):
+    import cv2
+
+    camera = FakeCamera([synthetic_frame(90, 160), 255 - synthetic_frame(90, 160)])
+    camera.read = Mock(wraps=camera.read)
+    pipeline.process = Mock(wraps=pipeline.process)
+    session = _session(tmp_path, pipeline, camera)
+    capture = session.capture
+    repaints = []
+
+    def capture_after_loading_screen():
+        assert len(repaints) == camera.read.call_count + 1
+        assert np.array_equal(repaints[-1], capture_gui[-1])
+        # Seven distinct TV colour bars, already painted before camera acquisition/grading.
+        assert len(np.unique(repaints[-1][0], axis=0)) == 7
+        return capture()
+
+    monkeypatch.setattr(session, "capture", capture_after_loading_screen)
+    events = iter([(-1, 0), (32, 0), (-1, 1), (ord("p"), 1), (32, 1), (-1, 2), (ord("Q"), 2)])
+
+    def next_key():
+        key, captures = next(events)
+        assert len(capture_gui) == captures * 2 + 1  # prompt, then loading screen and photo
+        assert camera.read.call_count == captures
+        assert pipeline.process.call_count == captures
+        return key
+
+    def wait_key(delay):
+        if delay == 1:
+            repaints.append(capture_gui[-1].copy())
+            return -1
+        return -1 if terminal_controls else next_key()
+
+    monkeypatch.setattr(cv2, "waitKey", wait_key)
+    if terminal_controls:
+
+        def read_key():
+            key = next_key()
+            return chr(key) if key >= 0 else None
+    else:
+        read_key = None
+    assert run_preview_loop(session, captures_only=True, read_key=read_key)
+
+    files = sorted(
+        (tmp_path / "shots").rglob("*_kodachrome.jpg"), key=lambda p: p.stat().st_mtime_ns,
+    )
+    assert len(files) == 2
+    for displayed, saved in zip(capture_gui[2::2], files, strict=True):
+        rgb, _ = load_rgb(saved)
+        expected = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)
+        assert np.array_equal(displayed, expected[:, :, ::-1])
+    assert not np.array_equal(capture_gui[2], capture_gui[4])
+
+
+@pytest.mark.parametrize("failed_attempt", [1, 2])
+def test_capture_display_keeps_last_photo_after_failed_capture(
+    tmp_path, pipeline, monkeypatch, capture_gui, capsys, failed_attempt,
+):
+    import cv2
+
+    session = _session(tmp_path, pipeline)
+    capture = session.capture
+    attempts = 0
+
+    def flaky_capture():
+        nonlocal attempts
+        attempts += 1
+        if attempts == failed_attempt:
+            raise CameraError("dropped snapshot")
+        return capture()
+
+    monkeypatch.setattr(session, "capture", flaky_capture)
+    events = iter([(32, 1), (32, 3), (-1, 5), (32, 5), (ord("q"), 7)])
+
+    def next_key(delay):
+        if delay == 1:
+            return -1
+        key, updates = next(events)
+        assert len(capture_gui) == updates
+        return key
+
+    monkeypatch.setattr(cv2, "waitKey", next_key)
+    assert run_preview_loop(session, captures_only=True)
+    assert "dropped snapshot" in capsys.readouterr().out
+    before_failure = capture_gui[(failed_attempt - 1) * 2]
+    after_failure = capture_gui[failed_attempt * 2]
+    assert np.array_equal(after_failure, before_failure)
+
+
+def test_capture_display_preserves_portrait_aspect_ratio(
+    tmp_path, pipeline, monkeypatch, capture_gui,
+):
+    import cv2
+
+    session = _session(tmp_path, pipeline, FakeCamera([synthetic_frame(160, 90)]))
+    keys = iter([32, ord("q")])
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay == 1 else next(keys))
+    assert run_preview_loop(session, captures_only=True)
+    assert capture_gui[-1].shape == (360, 202, 3)
+
+
+@pytest.mark.parametrize(
+    "failure_at", ["namedWindow", "imshow", "waitKey", "loading_image", "saved_image"],
+)
+def test_capture_display_gui_failure_cleans_up_and_allows_fallback(
+    tmp_path, pipeline, monkeypatch, capture_gui, failure_at,
+):
+    import cv2
+
+    cleanup = Mock()
+    monkeypatch.setattr(cv2, "destroyAllWindows", cleanup)
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: 32)
+
+    def boom(*args, **kwargs):
+        raise cv2.error("no GUI")
+
+    if failure_at in ("loading_image", "saved_image"):
+        def show(name, frame):
+            if len(capture_gui) == (1 if failure_at == "loading_image" else 2):
+                boom()
+            capture_gui.append(frame.copy())
+        monkeypatch.setattr(cv2, "imshow", show)
+    else:
+        monkeypatch.setattr(cv2, failure_at, boom)
+    assert run_preview_loop(_session(tmp_path, pipeline), captures_only=True) is False
+    assert cleanup.call_count == (0 if failure_at == "namedWindow" else 1)
+    if failure_at == "saved_image":
+        assert len(list((tmp_path / "shots").rglob("*_kodachrome.jpg"))) == 1
+
+
+@pytest.mark.parametrize("no_preview", [False, True])
+@pytest.mark.parametrize("has_terminal", [False, True])
+def test_main_show_captures_selects_snapshot_mode(
+    tmp_path, monkeypatch, no_preview, has_terminal,
+):
+    from kodachrome.capture import app
+
+    monkeypatch.setattr(app, "has_display", lambda: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: has_terminal)
+    terminal = Mock()
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    window = Mock(return_value=True)
+    monkeypatch.setattr(app, "run_preview_loop", window)
+    args = ["--fake", "--show-captures", "--out", str(tmp_path)]
+    if no_preview:
+        args.append("--no-preview")
+    assert main(args) == 0
+    assert window.call_args.kwargs["captures_only"] is True
+    if has_terminal:
+        window.call_args.kwargs["read_key"]()
+        terminal.read.assert_called_once_with(timeout=0)
+        terminal.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("display_available", [False, True])
+def test_main_show_captures_falls_back_to_terminal(tmp_path, monkeypatch, display_available):
+    from kodachrome.capture import app
+
+    monkeypatch.setattr(app, "has_display", lambda: display_available)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    terminal = Mock()
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr(app, "run_preview_loop", Mock(return_value=False))
+    headless = Mock()
+    monkeypatch.setattr(app, "run_headless_loop", headless)
+    assert main(["--fake", "--no-preview", "--show-captures", "--out", str(tmp_path)]) == 0
+    headless.assert_called_once()
 
 
 def test_main_headless_without_tty_exits_2(tmp_path, capsys, monkeypatch):
