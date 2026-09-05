@@ -183,6 +183,26 @@ def run_headless_loop(
             return count
 
 
+def _capture_loading_screen(size: tuple[int, int]) -> np.ndarray:
+    """Draw TV-style colour bars in OpenCV's BGR order."""
+    width, height = size
+    screen = np.zeros((height, width, 3), dtype=np.uint8)
+    colours = [
+        (191, 191, 191), (0, 191, 191), (191, 191, 0), (0, 191, 0),
+        (191, 0, 191), (0, 0, 191), (191, 0, 0),
+    ]
+    for index, colour in enumerate(colours):
+        left, right = index * width // 7, (index + 1) * width // 7
+        screen[:height * 3 // 4, left:right] = colour
+    label = "Processing photo..."
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(width / 640, height / 360) * 0.7
+    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, 1)
+    position = ((width - text_width) // 2, (height * 7 // 8) + text_height // 2)
+    cv2.putText(screen, label, position, font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    return screen
+
+
 def run_preview_loop(
     session: CaptureSession,
     window_name: str = WINDOW_NAME,
@@ -202,7 +222,8 @@ def run_preview_loop(
                 placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
                 cv2.putText(placeholder, "SPACE to capture", (175, 185),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                cv2.imshow(window_name, placeholder)
+                displayed_frame = placeholder
+                cv2.imshow(window_name, displayed_frame)
             except cv2.error:
                 return False
         while True:
@@ -222,17 +243,25 @@ def run_preview_loop(
                     key = ord(terminal_key)
             if key == ord(" "):
                 try:
-                    result = session.capture()
-                    _announce(result, print)
                     if captures_only:
-                        frame, _ = load_rgb(result.kodachrome)
-                        height, width = frame.shape[:2]
-                        scale = min(640 / width, 360 / height)
-                        size = (max(1, round(width * scale)), max(1, round(height * scale)))
-                        frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-                        cv2.imshow(window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                except (CameraError, OSError) as exc:
-                    print(f"error: {exc}")
+                        height, width = displayed_frame.shape[:2]
+                        cv2.imshow(window_name, _capture_loading_screen((width, height)))
+                        # imshow queues a repaint; pump GUI events before blocking on capture.
+                        cv2.waitKey(1)
+                    try:
+                        result = session.capture()
+                        _announce(result, print)
+                        if captures_only:
+                            frame, _ = load_rgb(result.kodachrome)
+                            height, width = frame.shape[:2]
+                            scale = min(640 / width, 360 / height)
+                            size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+                            displayed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    except (CameraError, OSError) as exc:
+                        print(f"error: {exc}")
+                    if captures_only:
+                        cv2.imshow(window_name, displayed_frame)
                 except cv2.error:
                     return False
             elif not captures_only and key in (ord("p"), ord("P")):

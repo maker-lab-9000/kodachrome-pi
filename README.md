@@ -174,7 +174,9 @@ takes a fresh frame; it does not save the frame currently displayed.
 With `--show-captures`, the window initially shows a capture prompt, then displays
 the saved graded JPEG (including grain), scaled to fit within 640 × 360 while
 preserving its aspect ratio. The image stays unchanged until the next successful
-snapshot; there is no live preview or continuous grading. SPACE and Q work from
+snapshot, with a TV colour-bar loading screen shown while each photo is captured
+and processed. If capture fails, the previous image is restored. There is no live
+preview or continuous grading. SPACE and Q work from
 either the terminal or the image window. P has no effect in this mode.
 `--show-captures` also disables live preview when used on its own. A display and
 OpenCV GUI support are required; if unavailable, capture falls back to terminal

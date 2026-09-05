@@ -216,23 +216,39 @@ def test_capture_display_changes_only_after_snapshot(
     camera.read = Mock(wraps=camera.read)
     pipeline.process = Mock(wraps=pipeline.process)
     session = _session(tmp_path, pipeline, camera)
+    capture = session.capture
+    repaints = []
+
+    def capture_after_loading_screen():
+        assert len(repaints) == camera.read.call_count + 1
+        assert np.array_equal(repaints[-1], capture_gui[-1])
+        # Seven distinct TV colour bars, already painted before camera acquisition/grading.
+        assert len(np.unique(repaints[-1][0], axis=0)) == 7
+        return capture()
+
+    monkeypatch.setattr(session, "capture", capture_after_loading_screen)
     events = iter([(-1, 0), (32, 0), (-1, 1), (ord("p"), 1), (32, 1), (-1, 2), (ord("Q"), 2)])
 
     def next_key():
         key, captures = next(events)
-        assert len(capture_gui) == captures + 1  # prompt, then one update per capture
+        assert len(capture_gui) == captures * 2 + 1  # prompt, then loading screen and photo
         assert camera.read.call_count == captures
         assert pipeline.process.call_count == captures
         return key
 
+    def wait_key(delay):
+        if delay == 1:
+            repaints.append(capture_gui[-1].copy())
+            return -1
+        return -1 if terminal_controls else next_key()
+
+    monkeypatch.setattr(cv2, "waitKey", wait_key)
     if terminal_controls:
-        monkeypatch.setattr(cv2, "waitKey", lambda delay: -1)
 
         def read_key():
             key = next_key()
             return chr(key) if key >= 0 else None
     else:
-        monkeypatch.setattr(cv2, "waitKey", lambda delay: next_key())
         read_key = None
     assert run_preview_loop(session, captures_only=True, read_key=read_key)
 
@@ -240,15 +256,16 @@ def test_capture_display_changes_only_after_snapshot(
         (tmp_path / "shots").rglob("*_kodachrome.jpg"), key=lambda p: p.stat().st_mtime_ns,
     )
     assert len(files) == 2
-    for displayed, saved in zip(capture_gui[1:], files, strict=True):
+    for displayed, saved in zip(capture_gui[2::2], files, strict=True):
         rgb, _ = load_rgb(saved)
         expected = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)
         assert np.array_equal(displayed, expected[:, :, ::-1])
-    assert not np.array_equal(capture_gui[1], capture_gui[2])
+    assert not np.array_equal(capture_gui[2], capture_gui[4])
 
 
+@pytest.mark.parametrize("failed_attempt", [1, 2])
 def test_capture_display_keeps_last_photo_after_failed_capture(
-    tmp_path, pipeline, monkeypatch, capture_gui, capsys,
+    tmp_path, pipeline, monkeypatch, capture_gui, capsys, failed_attempt,
 ):
     import cv2
 
@@ -259,14 +276,16 @@ def test_capture_display_keeps_last_photo_after_failed_capture(
     def flaky_capture():
         nonlocal attempts
         attempts += 1
-        if attempts == 2:
+        if attempts == failed_attempt:
             raise CameraError("dropped snapshot")
         return capture()
 
     monkeypatch.setattr(session, "capture", flaky_capture)
-    events = iter([(32, 1), (32, 2), (-1, 2), (32, 2), (ord("q"), 3)])
+    events = iter([(32, 1), (32, 3), (-1, 5), (32, 5), (ord("q"), 7)])
 
     def next_key(delay):
+        if delay == 1:
+            return -1
         key, updates = next(events)
         assert len(capture_gui) == updates
         return key
@@ -274,6 +293,9 @@ def test_capture_display_keeps_last_photo_after_failed_capture(
     monkeypatch.setattr(cv2, "waitKey", next_key)
     assert run_preview_loop(session, captures_only=True)
     assert "dropped snapshot" in capsys.readouterr().out
+    before_failure = capture_gui[(failed_attempt - 1) * 2]
+    after_failure = capture_gui[failed_attempt * 2]
+    assert np.array_equal(after_failure, before_failure)
 
 
 def test_capture_display_preserves_portrait_aspect_ratio(
@@ -283,12 +305,14 @@ def test_capture_display_preserves_portrait_aspect_ratio(
 
     session = _session(tmp_path, pipeline, FakeCamera([synthetic_frame(160, 90)]))
     keys = iter([32, ord("q")])
-    monkeypatch.setattr(cv2, "waitKey", lambda delay: next(keys))
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: -1 if delay == 1 else next(keys))
     assert run_preview_loop(session, captures_only=True)
     assert capture_gui[-1].shape == (360, 202, 3)
 
 
-@pytest.mark.parametrize("failure_at", ["namedWindow", "imshow", "waitKey", "saved_image"])
+@pytest.mark.parametrize(
+    "failure_at", ["namedWindow", "imshow", "waitKey", "loading_image", "saved_image"],
+)
 def test_capture_display_gui_failure_cleans_up_and_allows_fallback(
     tmp_path, pipeline, monkeypatch, capture_gui, failure_at,
 ):
@@ -301,9 +325,9 @@ def test_capture_display_gui_failure_cleans_up_and_allows_fallback(
     def boom(*args, **kwargs):
         raise cv2.error("no GUI")
 
-    if failure_at == "saved_image":
+    if failure_at in ("loading_image", "saved_image"):
         def show(name, frame):
-            if capture_gui:
+            if len(capture_gui) == (1 if failure_at == "loading_image" else 2):
                 boom()
             capture_gui.append(frame.copy())
         monkeypatch.setattr(cv2, "imshow", show)
